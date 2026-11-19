@@ -9,6 +9,10 @@
 //! with the current one and does the work before it lets go, so a change can never fall
 //! between the check and the work.
 //!
+//! A session the server ends (a refresh answers 401, in any command or background refresh)
+//! tells a watcher the app starts for each session it installs. The watcher makes the same
+//! change as a sign-out at once, so no command has to notice the end itself.
+//!
 //! Lock order, outermost first. A thread that holds one of these locks may take a later one,
 //! never an earlier one:
 //!
@@ -17,7 +21,8 @@
 //! 3. the app state lock (`Core::inner`), held only for short reads and writes;
 //! 4. a session's own lock (`auth`), which makes "check that the session is alive, then save
 //!    or clear its tokens" one step;
-//! 5. the stores themselves (keychain entries, files, in-memory test stores).
+//! 5. the stores themselves (keychain entries, files, in-memory test stores) and a session's
+//!    end signal, which only wakes the watcher task and never runs it in place.
 //!
 //! A refresh holds its session's token lock across the network call and then takes 4; nothing
 //! that holds 2, 3 or 4 waits for that token lock. Locks 2 and 3 are never held across an

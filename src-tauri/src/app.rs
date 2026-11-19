@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::agents::{self, Agent};
@@ -510,7 +511,7 @@ impl Inner {
     }
 
     /// Shows a failed save of the current session's rotated tokens. A session the server
-    /// ended is an account change, which `Core::reap` makes.
+    /// ended is an account change, which `Core::end_session` makes.
     fn session_flags(&mut self) {
         if let Some(e) = self.session.as_ref().and_then(|s| s.store_error()) {
             self.state.error = Some(ErrorView::other(format!(
@@ -833,34 +834,59 @@ impl Core {
 
     /// Puts the session the last run saved in place, unless the account changed since
     /// `since` (a device sign-in finished while the keychain was read).
-    pub fn install_session(&self, session: Session, since: u64) -> bool {
-        self.transition(Some(since), Next::Saved(session)).is_some()
+    pub fn install_session(self: &Arc<Self>, session: Session, since: u64) -> bool {
+        let ended = session.ended();
+        let Some(c) = self.transition(Some(since), Next::Saved(session)) else {
+            return false;
+        };
+        self.watch_session(ended, c.account);
+        true
     }
 
     /// Puts a device sign-in's session in place and saves its tokens, unless the account
     /// changed since the sign-in began under `since`. Returns the new account count.
-    fn install_signed_in(&self, session: Session, since: u64) -> Res<u64> {
+    fn install_signed_in(self: &Arc<Self>, session: Session, since: u64) -> Res<u64> {
+        let ended = session.ended();
         let c = self
             .transition(Some(since), Next::SignedIn(session))
             .ok_or_else(account_changed)?;
-        if c.signed_in {
-            Ok(c.account)
-        } else {
-            Err(ErrorView::other(c.error.unwrap_or_default()))
+        if !c.signed_in {
+            return Err(ErrorView::other(c.error.unwrap_or_default()));
         }
+        self.watch_session(ended, c.account);
+        Ok(c.account)
     }
 
-    /// When the server ended the current session (a refresh got 401), the account ends
-    /// here too: the same change as a sign-out, without the logout call.
-    fn reap(&self) {
-        let ended = {
-            let i = self.lock();
-            i.session
-                .as_ref()
-                .filter(|s| s.is_signed_out())
-                .map(|_| i.account)
+    /// Waits, in the background, for the session installed as `account` to end, then ends
+    /// the account with it. Whatever ends the session (a refresh 401 inside any command or
+    /// refresh, a sign-out, a replacement), this runs once, and only the server's end of a
+    /// session still in place changes anything.
+    fn watch_session(self: &Arc<Self>, ended: Option<watch::Receiver<bool>>, account: u64) {
+        let (Some(mut ended), Ok(rt)) = (ended, tokio::runtime::Handle::try_current()) else {
+            return;
         };
-        if let Some(account) = ended {
+        let core = Arc::downgrade(self);
+        rt.spawn(async move {
+            // An error means the session is gone without an end: nothing to do.
+            let over = ended.wait_for(|e| *e).await.is_ok();
+            if over && let Some(core) = core.upgrade() {
+                core.end_session(account);
+            }
+        });
+    }
+
+    /// When the session installed as `account` is still in place and ended on the server
+    /// (a refresh got 401), the account ends here too: the same change as a sign-out,
+    /// without the logout call. After a sign-out or a replacement the count has moved on
+    /// and this does nothing.
+    fn end_session(&self, account: u64) {
+        self.step("session ended");
+        let ended = self
+            .read_in(account, |i| {
+                i.session.as_ref().is_some_and(|s| s.is_signed_out())
+            })
+            .unwrap_or(false);
+        if ended {
             self.transition(Some(account), Next::Nobody);
         }
     }
@@ -880,9 +906,8 @@ impl Core {
 
     /// Runs the result of a user action on the current screen through the error rules: a
     /// failure shows in `state.error`, the next success clears it. Not for a result that
-    /// comes after an await: that is `settle_in`. Synchronous commands run on the main
-    /// thread, so this never waits for the account lock; a session the server ended is
-    /// found by the API calls of async flows, which end the account through `settle_in`.
+    /// comes after an await: that is `settle_in`. It never waits for the account lock, so the
+    /// synchronous commands on the main thread never block on it.
     pub fn settle<T>(&self, r: Res<T>) -> Res<T> {
         self.update(|i| {
             match &r {
@@ -906,7 +931,6 @@ impl Core {
             }
             i.session_flags();
         });
-        self.reap();
         r
     }
 
@@ -1002,7 +1026,6 @@ impl Core {
             i.session_flags();
             job
         });
-        self.reap();
         job.flatten()
     }
 
@@ -1558,7 +1581,6 @@ impl Core {
         };
         if r.is_err() {
             self.update(Inner::session_flags);
-            self.reap();
         }
         r
     }
@@ -2107,7 +2129,7 @@ mod tests {
         (server, base)
     }
 
-    fn sign_in_as(core: &Core, base: &Url, user_id: i64) {
+    fn sign_in_as(core: &Arc<Core>, base: &Url, user_id: i64) {
         let session = Session::load_from(
             base,
             Some("ibk_test".into()),
@@ -2439,7 +2461,7 @@ mod tests {
         connected.add(7, "a", &crate::gate::Open).unwrap();
         let emitted = Arc::new(Mutex::new(Vec::<AppState>::new()));
         let sink = emitted.clone();
-        let core = Core::new(
+        let core = Arc::new(Core::new(
             base.clone(),
             keys.clone(),
             ssh.clone(),
@@ -2447,7 +2469,7 @@ mod tests {
             Arc::new(|_| Ok(())),
             Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
             PathBuf::from("/nonexistent"),
-        );
+        ));
         let session = Session::load_from(&base, None, store.clone()).expect("session");
         assert!(core.install_session(session, core.account()));
         core.update(|i| {
@@ -2502,34 +2524,41 @@ mod tests {
         sign_out_with_logout(500).await;
     }
 
-    /// A core signed in with `tok` against `server`, plus its token and key stores.
-    fn core_with_session(
-        server_uri: &str,
-        tok: Tokens,
-    ) -> (
-        Core,
+    type WithSession = (
+        Arc<Core>,
         Arc<MemoryStore>,
         Arc<MemoryKeyStore>,
         Arc<MemorySshStore>,
-    ) {
+        Arc<tokio::sync::Notify>,
+    );
+
+    /// A core signed in with `tok` against `server`, its token, key and SSH stores, and a
+    /// signal that fires when the state shows the sign-in screen.
+    fn core_with_session(server_uri: &str, tok: Tokens) -> WithSession {
         let base = Url::parse(server_uri).unwrap();
         let store = Arc::new(MemoryStore::with(tok));
         let keys = Arc::new(MemoryKeyStore::default());
         keys.save("ibk_secret").unwrap();
         let ssh = Arc::new(MemorySshStore::default());
         ssh.save("a", &ssh_token()).unwrap();
-        let core = Core::new(
+        let signed_out = Arc::new(tokio::sync::Notify::new());
+        let signal = signed_out.clone();
+        let core = Arc::new(Core::new(
             base.clone(),
             keys.clone(),
             ssh.clone(),
             Arc::new(MemoryConnectedStore::default()),
             Arc::new(|_| Ok(())),
-            Arc::new(|_| {}),
+            Arc::new(move |s: &AppState| {
+                if !s.signed_in {
+                    signal.notify_one();
+                }
+            }),
             PathBuf::from("/nonexistent"),
-        );
+        ));
         let session = Session::load_from(&base, None, store.clone()).expect("session");
         assert!(core.install_session(session, core.account()));
-        (core, store, keys, ssh)
+        (core, store, keys, ssh, signed_out)
     }
 
     #[tokio::test]
@@ -2542,7 +2571,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(10)))
             .mount(&server)
             .await;
-        let (core, store, keys, ssh) = core_with_session(&server.uri(), tokens());
+        let (core, store, keys, ssh, _) = core_with_session(&server.uri(), tokens());
         let started = std::time::Instant::now();
         core.sign_out().await.unwrap();
         assert!(
@@ -2575,7 +2604,7 @@ mod tests {
         // The access token is about to expire: bearer() would refresh it.
         let mut tok = tokens();
         tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
-        let (core, store, _keys, _ssh) = core_with_session(&server.uri(), tok);
+        let (core, store, _keys, _ssh, _) = core_with_session(&server.uri(), tok);
         core.sign_out().await.unwrap();
         assert_eq!(store.load().unwrap(), None);
         for _ in 0..50 {
@@ -2671,7 +2700,7 @@ mod tests {
             .await;
         let mut tok = tokens();
         tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
-        let (core, store, _keys, _ssh) = core_with_session(&server.uri(), tok);
+        let (core, store, _keys, _ssh, _) = core_with_session(&server.uri(), tok);
         // An API call already in flight (a poll), holding the old session: it refreshes.
         let s = core.lock().session.clone().unwrap();
         let call = tokio::spawn(async move { s.bearer().await });
@@ -3480,8 +3509,118 @@ mod tests {
         assert_eq!(store.load().unwrap().unwrap().access_token, "iba_a");
     }
 
+    /// Waits for the sign-in screen, then checks that the account ended in full: a new
+    /// account count and no tokens, MCP key or SSH token left.
+    async fn assert_account_ended(
+        core: &Core,
+        before: u64,
+        stores: (&MemoryStore, &MemoryKeyStore, &MemorySshStore),
+        signed_out: &tokio::sync::Notify,
+    ) {
+        let (store, keys, ssh) = stores;
+        let wait = tokio::time::timeout(Duration::from_secs(3), signed_out.notified());
+        let mut c = Checks::default();
+        c.check(wait.await.is_ok(), "the sign-in screen was never shown");
+        c.check(!core.state().signed_in, "still signed in");
+        c.check(core.account() != before, "the account count did not move");
+        c.check(store.load().unwrap().is_none(), "tokens kept");
+        c.check(keys.load().unwrap().is_none(), "its MCP key is still there");
+        c.check(
+            ssh.load("a").unwrap().is_none(),
+            "its SSH token is still there",
+        );
+        c.done();
+    }
+
     #[tokio::test]
-    async fn a_session_the_server_ended_is_an_account_change() {
+    async fn a_refresh_401_during_agent_status_ends_the_account_on_its_own() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(machine_json()))
+            .mount(&server)
+            .await;
+        // The status exec gets 401, and so does the refresh it triggers.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh, signed_out) = core_with_session(&server.uri(), tokens());
+        let before = core.account();
+        // The command turns the failed exec into "not signed in" and settles nothing.
+        assert_eq!(core.agent_status("m1", Agent::Codex).await, Ok(false));
+        assert_account_ended(&core, before, (&store, &keys, &ssh), &signed_out).await;
+    }
+
+    #[tokio::test]
+    async fn a_replaced_sessions_late_401_leaves_the_new_session_alone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (go, held) = std::sync::mpsc::channel();
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(HeldRefresh {
+                arrived: arrived.clone(),
+                go: Mutex::new(held),
+                reply: ResponseTemplate::new(401),
+            })
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh, signed_out) =
+            core_with_session(&server.uri(), tokens_of("iba_a", 5));
+        let watcher_ran = Arc::new(tokio::sync::Notify::new());
+        let w = watcher_ran.clone();
+        at_step(&core, "session ended", move |_| w.notify_one());
+        // A call of account A refreshes; the server holds the answer.
+        let a = core.lock().session.clone().unwrap();
+        let call = tokio::spawn(async move { a.bearer().await });
+        arrived.notified().await;
+        // Account B signs in, then gets its own MCP key and SSH token.
+        let b = device_session(store.clone(), "iba_b").await;
+        let after_b = core.install_signed_in(b, core.account()).unwrap();
+        keys.save("ibk_b").unwrap();
+        ssh.save("b1", &ssh_token()).unwrap();
+        // A's watcher saw A end with the replacement.
+        let ran = tokio::time::timeout(Duration::from_secs(3), watcher_ran.notified()).await;
+        assert!(ran.is_ok(), "A's watcher never ran");
+        // A's refresh gets its 401 only now.
+        go.send(()).unwrap();
+        assert!(call.await.unwrap().is_err());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let shown = tokio::time::timeout(Duration::from_millis(200), signed_out.notified()).await;
+        let token = core.lock().session.clone().unwrap().current_access_token();
+        let saved = store.load().unwrap().map(|t| t.access_token);
+        let mut c = Checks::default();
+        c.check(shown.is_err(), "the sign-in screen was shown");
+        c.check(core.state().signed_in, "B was signed out");
+        c.check(core.account() == after_b, "the account count moved");
+        c.check(
+            token.as_deref() == Some("iba_b"),
+            format!("session has {token:?}"),
+        );
+        c.check(
+            saved.as_deref() == Some("iba_b"),
+            format!("store holds {saved:?}"),
+        );
+        c.check(keys.load().unwrap().is_some(), "B's MCP key is gone");
+        c.check(ssh.load("b1").unwrap().is_some(), "B's SSH token is gone");
+        c.done();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_401_during_a_background_refresh_ends_the_account_on_its_own() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -3490,22 +3629,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
-        // The token is about to expire: the refresh's first call refreshes and gets 401.
+        // The token is about to expire: the machines read refreshes first and gets 401.
         let mut tok = tokens();
         tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
-        let (core, store, keys, ssh) = core_with_session(&server.uri(), tok);
-        let core = Arc::new(core);
+        let (core, store, keys, ssh, signed_out) = core_with_session(&server.uri(), tok);
         let before = core.account();
+        // What the refresh loop runs; no command is running.
         core.refresh(false).await;
-        let mut c = Checks::default();
-        c.check(!core.state().signed_in, "still signed in");
-        c.check(core.account() != before, "the account count did not move");
-        c.check(store.load().unwrap().is_none(), "tokens kept");
-        c.check(keys.load().unwrap().is_none(), "its MCP key is still there");
-        c.check(
-            ssh.load("a").unwrap().is_none(),
-            "its SSH tokens are still there",
-        );
-        c.done();
+        assert_account_ended(&core, before, (&store, &keys, &ssh), &signed_out).await;
     }
 }

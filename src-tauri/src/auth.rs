@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use url::Url;
 
 use crate::api::{self, ApiErrorBody, Credentials, DeviceStart, Tokens};
@@ -145,8 +145,11 @@ struct Stored {
     gate: StdMutex<()>,
     /// Counts completed refreshes; lets a waiting caller see that another refreshed.
     generation: AtomicU64,
-    /// Set when the session ends: the user signed out, or a refresh answered 401.
+    /// Set when the session ends: the user signed out, another session replaced it, or a
+    /// refresh answered 401.
     dead: AtomicBool,
+    /// Turns true when `dead` is set, so the app learns of an end it did not cause.
+    ended: watch::Sender<bool>,
     /// The last failure to save rotated tokens; the running session still works.
     save_error: StdMutex<Option<String>>,
 }
@@ -313,6 +316,7 @@ impl Session {
                 tokens: Mutex::new(tokens),
                 generation: AtomicU64::new(0),
                 dead: AtomicBool::new(false),
+                ended: watch::channel(false).0,
                 save_error: StdMutex::new(None),
             })),
         }
@@ -349,6 +353,15 @@ impl Session {
         match &self.kind {
             Kind::ApiKey(_) => false,
             Kind::Tokens(s) => s.dead.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Turns true when the session ends, for whatever reason. None for an API key, which
+    /// never ends.
+    pub fn ended(&self) -> Option<watch::Receiver<bool>> {
+        match &self.kind {
+            Kind::ApiKey(_) => None,
+            Kind::Tokens(s) => Some(s.ended.subscribe()),
         }
     }
 
@@ -398,7 +411,7 @@ impl Session {
     pub fn retire(&self) {
         if let Kind::Tokens(s) = &self.kind {
             let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
-            s.dead.store(true, Ordering::SeqCst);
+            s.end();
         }
     }
 
@@ -409,7 +422,7 @@ impl Session {
             Kind::Tokens(s) => {
                 // End the session first: a refresh still running must not save again.
                 let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
-                s.dead.store(true, Ordering::SeqCst);
+                s.end();
                 s.store.clear().map_err(Error::Store)
             }
         }
@@ -431,6 +444,14 @@ pub async fn logout_with(base: &Url, token: &str) {
 }
 
 impl Stored {
+    /// Marks the session ended and tells whoever watches it. The caller holds `gate`.
+    /// True when this call ended it.
+    fn end(&self) -> bool {
+        let first = !self.dead.swap(true, Ordering::SeqCst);
+        self.ended.send_replace(true);
+        first
+    }
+
     /// Refreshes while the caller holds the token lock. Rotated tokens go to the store.
     async fn refresh_locked(&self, cur: &mut Tokens) -> api::Result<String> {
         if self.dead.load(Ordering::SeqCst) {
@@ -457,7 +478,7 @@ impl Stored {
                     // The session is over: never send this refresh token again. After a
                     // sign-out the store may belong to a newer account: leave it alone.
                     let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-                    if !self.dead.swap(true, Ordering::SeqCst) {
+                    if self.end() {
                         let _ = self.store.clear();
                     }
                 }
@@ -898,6 +919,37 @@ mod tests {
         store.save(&tokens("iba_new", "ibr_new", 3600)).unwrap();
         assert!(call.await.unwrap().is_err());
         assert_eq!(store.load().unwrap().unwrap().access_token, "iba_new");
+    }
+
+    #[tokio::test]
+    async fn every_end_of_a_session_tells_its_watchers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let session = |secs| {
+            let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", secs)));
+            Session::load_from(&base, None, store).unwrap()
+        };
+        // The server ends it: a refresh answers 401.
+        let s = session(5);
+        let ended = s.ended().unwrap();
+        assert!(!*ended.borrow());
+        assert!(s.bearer().await.is_err());
+        assert!(*ended.borrow(), "a refresh 401");
+        let s = session(3600);
+        let ended = s.ended().unwrap();
+        s.retire();
+        assert!(*ended.borrow(), "replaced");
+        let s = session(3600);
+        let ended = s.ended().unwrap();
+        s.sign_out().unwrap();
+        assert!(*ended.borrow(), "signed out");
+        let key = Session::load_from(&base, Some("ibk".into()), Arc::new(MemoryStore::default()));
+        assert!(key.unwrap().ended().is_none(), "an API key never ends");
     }
 
     #[tokio::test]
