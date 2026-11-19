@@ -876,11 +876,11 @@ impl Core {
         Ok(())
     }
 
-    /// An account boundary: forgets the sign-in tokens, the
-    /// MCP key and every SSH token, and clears the account state, the user's connected set
-    /// included (it stays on disk for that user). Then it ends the session on the server in
-    /// the background, with the token it had, and never refreshes for that. The state clears even when a store fails;
-    /// the first failure is returned and shown.
+    /// An account boundary: forgets the sign-in tokens, the MCP key and every SSH token,
+    /// and clears the account state, the user's connected set included (it stays on disk
+    /// for that user). Then it ends the session on the server in the background, with the
+    /// token it had, and never refreshes for that. The state clears even when a store
+    /// fails; the first failure is returned and shown.
     pub async fn sign_out(&self) -> Res<()> {
         let session = self.update(|i| {
             let s = i.session.take();
@@ -998,14 +998,20 @@ impl Core {
     /// Makes a new pairing link for a connected sandbox and opens it.
     pub async fn pair_again(self: &Arc<Self>, id: &str) -> Res<()> {
         let client = self.client()?;
+        let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
             let link = connect::pair_again(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
-            self.remember(id).await;
+            linked.store(true, std::sync::atomic::Ordering::SeqCst);
             (self.open)(&link).map_err(ErrorView::other)
         };
-        self.act(r).await
+        let out = self.act(r).await;
+        if linked.load(std::sync::atomic::Ordering::SeqCst) {
+            // After `act`, which clears the error: a failed save stays visible.
+            self.remember(id).await;
+        }
+        out
     }
 
     /// Adds the sandbox to the set the user connected from this computer, on disk and in
@@ -1101,9 +1107,10 @@ impl Core {
                     }
                     i.rebuild();
                 });
-                self.remember(&c.machine_id).await;
                 let opened = (self.open)(&c.link).map_err(ErrorView::other);
                 let out = self.settle(opened);
+                // After `settle`, which clears the error: a failed save stays visible.
+                self.remember(&c.machine_id).await;
                 self.refresh_and_sync(false).await;
                 out
             }
@@ -2311,5 +2318,87 @@ mod tests {
         assert_eq!(core.state().error, Some(ErrorView::other("boom")));
         core.settle(Ok(())).unwrap();
         assert_eq!(core.state().error, None);
+    }
+
+    #[tokio::test]
+    async fn sign_out_during_a_refresh_keeps_the_store_empty_and_logs_out() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let rotated = Tokens {
+            access_token: "iba_new".into(),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            refresh_token: "ibr_new".into(),
+            refresh_expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(&rotated).unwrap())
+                    .set_delay(Duration::from_millis(800)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut tok = tokens();
+        tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
+        let (core, store, _keys, _ssh) = core_with_session(&server.uri(), tok);
+        // An API call already in flight (a poll), holding the old session: it refreshes.
+        let s = core.lock().session.clone().unwrap();
+        let call = tokio::spawn(async move { s.bearer().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        assert_eq!(store.load().unwrap(), None, "cleared right after sign_out");
+        let got = call.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let logouts = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/v1/auth/logout")
+            .count();
+        assert!(
+            got.is_err(),
+            "the late refresh reports a signed-out session"
+        );
+        assert_eq!(logouts, 1, "the logout was sent with the token it had");
+        assert_eq!(
+            store.load().unwrap(),
+            None,
+            "rotated tokens saved back after sign_out"
+        );
+    }
+
+    struct FailingConnected;
+    impl ConnectedStore for FailingConnected {
+        fn load(&self, _: i64) -> std::collections::HashSet<String> {
+            Default::default()
+        }
+        fn add(&self, _: i64, _: &str) -> Result<(), String> {
+            Err("disk full".into())
+        }
+        fn remove(&self, _: i64, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_connected_list_save_stays_visible_after_connect() {
+        let core = core_with(Arc::new(FailingConnected));
+        core.update(|i| {
+            i.data.machines = vec![machine("t", "org-me", "agent-browser", "running", true)];
+            i.data.me = Some(me());
+            i.data.orgs = data().orgs;
+            i.rebuild();
+        });
+        core.finish_connect(Ok(connected_result("t", "0.1.11")), "0.1.11")
+            .await
+            .unwrap();
+        let e = core.state().error.expect("error shown");
+        assert!(e.message.contains("disk full"), "{e:?}");
     }
 }
