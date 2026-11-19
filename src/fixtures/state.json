@@ -1,0 +1,140 @@
+{
+  "signedIn": true,
+  "login": "alex",
+  "signInCode": null,
+  "orgs": [
+    {
+      "id": "org-me",
+      "name": "org-me",
+      "tier": "free",
+      "personal": true
+    },
+    {
+      "id": "org-team",
+      "name": "org-team",
+      "tier": "pro",
+      "personal": false
+    }
+  ],
+  "orgId": "org-me",
+  "tier": "free",
+  "t3": "0.1.10",
+  "sandboxes": [
+    {
+      "id": "a",
+      "name": "name-a",
+      "state": "running",
+      "size": "4 vCPU / 8 GB",
+      "connected": true,
+      "t3Version": "0.1.10",
+      "free": true,
+      "autoSleep": {
+        "seconds": 1800,
+        "label": "After 30 min"
+      },
+      "runLeftMinutes": 100,
+      "cooldownMinutes": null,
+      "t3CodeConnected": true,
+      "updatePending": false,
+      "desktopBehind": false
+    },
+    {
+      "id": "e",
+      "name": "name-e",
+      "state": "paused",
+      "size": "4 vCPU / 8 GB",
+      "connected": true,
+      "t3Version": null,
+      "free": false,
+      "autoSleep": {
+        "seconds": 900,
+        "label": "After 15 min"
+      },
+      "runLeftMinutes": null,
+      "cooldownMinutes": null,
+      "t3CodeConnected": false,
+      "updatePending": true,
+      "desktopBehind": false
+    },
+    {
+      "id": "f",
+      "name": "name-f",
+      "state": "running",
+      "size": "4 vCPU / 8 GB",
+      "connected": false,
+      "t3Version": null,
+      "free": false,
+      "autoSleep": {
+        "seconds": 900,
+        "label": "After 15 min"
+      },
+      "runLeftMinutes": null,
+      "cooldownMinutes": null,
+      "t3CodeConnected": false,
+      "updatePending": false,
+      "desktopBehind": false
+    },
+    {
+      "id": "g",
+      "name": "name-g",
+      "state": "running",
+      "size": "4 vCPU / 8 GB",
+      "connected": false,
+      "t3Version": null,
+      "free": false,
+      "autoSleep": {
+        "seconds": 900,
+        "label": "After 15 min"
+      },
+      "runLeftMinutes": null,
+      "cooldownMinutes": null,
+      "t3CodeConnected": false,
+      "updatePending": false,
+      "desktopBehind": true
+    }
+  ],
+  "sizes": [
+    {
+      "vcpus": 2,
+      "memMiB": 4096,
+      "label": "2 vCPU / 4 GB"
+    },
+    {
+      "vcpus": 4,
+      "memMiB": 8192,
+      "label": "4 vCPU / 8 GB"
+    }
+  ],
+  "sleepChoices": [
+    {
+      "seconds": 1800,
+      "label": "After 30 min"
+    }
+  ],
+  "snapshots": [
+    {
+      "id": "s1",
+      "name": "snap-s1"
+    }
+  ],
+  "mcp": {
+    "claudeCode": true,
+    "codex": false
+  },
+  "progress": {
+    "kind": "create",
+    "step": "installing",
+    "machineId": "a",
+    "error": null
+  },
+  "error": {
+    "kind": "cooldown",
+    "message": "Cooling down, ready in about 12 min",
+    "minutes": 12
+  },
+  "startAtLogin": true,
+  "update": {
+    "version": "0.2.0",
+    "url": "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0"
+  }
+}

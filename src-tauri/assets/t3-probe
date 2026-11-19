@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# instabox activity probe for T3 Code (the instabox idle-suspend contract). instabox-guest-agent
+# runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
+#   {"busy": bool, "seq": <last orchestration event>, "reason": "..."}
+# A failure, a timeout or anything else on stdout counts as busy.
+#
+# It reads the T3 server's own database read-only instead of running
+# `t3 thread list`: that command covers one project per call (T3 0.1.2 has no
+# `project list`), takes over a second each, and leaves a revoked auth session
+# row in the database on every call. The tables and statuses are T3 0.1.2's
+# (T3 database layout as of 0.1.x); if a later T3 changes them, the query
+# fails, and a failed probe counts as idle on the server.
+import json
+import os
+import re
+import sqlite3
+import sys
+
+# Runs in these statuses are done or wait on a person. "waiting" is idle like
+# herdr's "blocked": a run waiting on an approval or an answer keeps its place
+# across a memory-snapshot suspend, and counting it busy would keep a forgotten
+# question's machine up forever. Every other status ("preparing", "queued",
+# "starting", "running", and any new one) is busy.
+IDLE_STATUSES = ("completed", "waiting", "interrupted", "failed", "cancelled", "rolled_back")
+
+
+def say(busy, reason, seq=None):
+    out = {"busy": busy, "reason": reason}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
+
+
+def base_dir():
+    # The launcher's base directory (the layout of the instabox t3 template).
+    override = os.environ.get("INSTABOX_T3_BASE_DIR")  # tests only
+    if override:
+        return override
+    with open("/etc/machine-id") as f:
+        identity = f.read().strip()
+    if not re.fullmatch(r"[a-f0-9]+", identity):
+        raise SystemExit("bad /etc/machine-id")
+    return os.path.join(os.environ["HOME"], ".t3-instabox", identity)
+
+
+def server_running(userdata):
+    # T3 writes server-runtime.json with its pid at every start. Without a live
+    # server, runs left "running" by a crash would keep the machine up; T3
+    # recovers them when it starts again.
+    try:
+        with open(os.path.join(userdata, "server-runtime.json")) as f:
+            pid = int(json.load(f)["pid"])
+    except FileNotFoundError:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def main():
+    userdata = os.path.join(base_dir(), "userdata")
+    db = os.path.join(userdata, "statev2.sqlite")
+    if not os.path.exists(db) or not server_running(userdata):
+        say(False, "no t3 server")
+        return
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    try:
+        marks = ",".join("?" * len(IDLE_STATUSES))
+        busy = con.execute(
+            "SELECT r.status, count(*) FROM orchestration_v2_projection_runs r"
+            " LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id"
+            f" WHERE r.status NOT IN ({marks}) AND t.deleted_at IS NULL"
+            " GROUP BY r.status ORDER BY r.status",
+            IDLE_STATUSES,
+        ).fetchall()
+        # The shared event log's AUTOINCREMENT counter: every change appends an
+        # event, so a run that starts and ends between two readings still
+        # changes it. Compaction deletes events, never this counter.
+        row = con.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'orchestration_events'"
+        ).fetchone()
+    finally:
+        con.close()
+    seq = row[0] if row else 0
+    n = sum(c for _, c in busy)
+    if n == 0:
+        say(False, "no active runs", seq)
+    else:
+        say(True, f"{n} runs active ({','.join(s for s, _ in busy)})", seq)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001: any failure is the probe's failure
+        print(f"t3 probe: {e}", file=sys.stderr)
+        sys.exit(1)
