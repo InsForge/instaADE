@@ -664,6 +664,15 @@ impl Core {
         r
     }
 
+    /// `settle` for a flow that began under `account`: when the account changed since,
+    /// the result or error belongs to nobody on screen and is only returned.
+    fn settle_in<T>(&self, account: u64, r: Res<T>) -> Res<T> {
+        if self.account() != account {
+            return r;
+        }
+        self.settle(r)
+    }
+
     // ---- launch and refresh ----
 
     pub async fn start(self: &Arc<Self>) {
@@ -1064,8 +1073,12 @@ impl Core {
     }
 
     /// Removes the sandbox from the set the user connected from this computer.
-    async fn forget(&self, id: &str) {
+    /// Does nothing when the account changed since `account` was read.
+    async fn forget(&self, id: &str, account: u64) {
         let user = self.update(|i| {
+            if i.account != account {
+                return None;
+            }
             i.data.connected.remove(id);
             i.rebuild();
             i.data.user()
@@ -1167,9 +1180,12 @@ impl Core {
 
     /// Runs a sandbox action, then refreshes machines.
     async fn act<T>(self: &Arc<Self>, f: impl std::future::Future<Output = Res<T>>) -> Res<T> {
+        let account = self.account();
         let r = f.await;
-        let out = self.settle(r);
-        self.refresh_and_sync(false).await;
+        let out = self.settle_in(account, r);
+        if self.account() == account {
+            self.refresh_and_sync(false).await;
+        }
         out
     }
 
@@ -1212,6 +1228,7 @@ impl Core {
     }
 
     pub async fn delete(self: &Arc<Self>, id: &str) -> Res<()> {
+        let account = self.account();
         let client = self.client()?;
         let r = self
             .act(async {
@@ -1222,6 +1239,9 @@ impl Core {
             .await;
         if r.is_ok() {
             self.update(|i| {
+                if i.account != account {
+                    return;
+                }
                 i.data.t3_versions.remove(id);
                 i.data.update_pending.remove(id);
                 i.data.desktop_behind.remove(id);
@@ -1232,7 +1252,7 @@ impl Core {
                 }
                 i.rebuild();
             });
-            self.forget(id).await;
+            self.forget(id, account).await;
         }
         r
     }
@@ -1313,14 +1333,16 @@ impl Core {
     }
 
     pub async fn open_ssh(&self, id: &str) -> Res<()> {
+        let account = self.account();
         let r = async {
             let cmd = self.login_command(id).await?;
             ssh::open_in_terminal(&cmd).map_err(ErrorView::other)
         };
-        self.settle(r.await)
+        self.settle_in(account, r.await)
     }
 
     pub async fn add_mcp(&self, which: McpClient) -> Res<()> {
+        let account = self.account();
         let client = self.client()?;
         let r = mcp::add(
             &client,
@@ -1331,7 +1353,7 @@ impl Core {
         )
         .await
         .map_err(|e| anyhow_view(&e));
-        let out = self.settle(r);
+        let out = self.settle_in(account, r);
         self.refresh_mcp().await;
         out
     }
@@ -1794,7 +1816,7 @@ mod tests {
         assert!(s.sandboxes[0].connected);
         assert_eq!(s.sandboxes[0].t3_version.as_deref(), Some("0.1.11"));
         assert!(!s.sandboxes[0].desktop_behind);
-        core.forget("t").await;
+        core.forget("t", core.account()).await;
         assert!(store.load(7).is_empty(), "removed");
         assert!(!core.state().sandboxes[0].connected);
     }
@@ -2607,5 +2629,76 @@ mod tests {
         );
         assert!(core.lock().data.connected.is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[tokio::test]
+    async fn a_pair_again_that_fails_after_sign_out_leaves_no_error_for_the_next_account() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"error": {
+                        "code": "boom", "message": "failed", "retryable": false}}))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        assert!(call.await.unwrap().is_err(), "the caller still sees it");
+        assert_eq!(core.state().error, None, "the new account shows no error");
+    }
+
+    #[tokio::test]
+    async fn a_delete_finishing_after_an_account_switch_leaves_the_new_list_alone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({
+                        "id": "op1", "machineId": "m1", "type": "delete",
+                        "state": "succeeded", "error": null, "machine": null
+                    }))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"machines": [], "nextCursor": null})),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryConnectedStore::default());
+        store.add(8, "m1").unwrap();
+        let core = core_on(base.clone(), store.clone());
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.delete("m1").await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        core.update(|i| {
+            i.data.connected_user = Some(8);
+            i.data.connected.insert("m1".into());
+        });
+        let _ = call.await.unwrap();
+        assert!(store.load(8).contains("m1"), "user 8's list is untouched");
+        assert!(core.lock().data.connected.contains("m1"));
     }
 }

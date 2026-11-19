@@ -901,4 +901,33 @@ mod tests {
         assert_eq!(err.code, "unauthenticated", "no token for the retry");
         assert_eq!(store.load().unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn a_client_request_that_got_401_is_not_retried_after_sign_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_millis(300)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let client = api::Client::new(base.clone(), session.clone());
+        let call = tokio::spawn(async move { client.me().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Kind::Tokens(s) = &session.kind else {
+            unreachable!()
+        };
+        // A refresh in progress holds the token lock while the 401 comes back.
+        let held = s.tokens.lock().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.generation.fetch_add(1, Ordering::SeqCst);
+        session.sign_out().unwrap();
+        drop(held);
+        let err = call.await.unwrap().unwrap_err();
+        assert_eq!(err.code, "unauthenticated");
+        // Dropping the server checks the request was sent once, never retried.
+    }
 }
