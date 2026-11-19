@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::agents::{self, Agent};
@@ -19,6 +20,7 @@ use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, T
 use crate::auth::{self, Provider, Session};
 use crate::connected::ConnectedStore;
 use crate::errors::ErrorView;
+use crate::gate::{Gate, guarded};
 use crate::mcp::{self, KeyStore, McpClient};
 use crate::sandbox::connect::{Connected, NewSandbox, Source, Step};
 use crate::sandbox::sync::{Decision, SyncOutcome};
@@ -43,6 +45,9 @@ pub const FULL_REFRESH: Duration = Duration::from_secs(300);
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
 /// Opens a URL in the default handler (browser, or T3 Code for `t3code://`).
 pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Test only: called with the name of a step a flow reached.
+#[cfg(test)]
+type Hook = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -469,6 +474,10 @@ struct Inner {
     data: Data,
     session: Option<Arc<Session>>,
     client: Option<Client>,
+    /// Counts account changes (sign-out, a new session, a session the server ended). Only
+    /// `Core::transition` moves it, under the account lock. A flow that started under an
+    /// older count must not act or write.
+    account: u64,
 }
 
 impl Inner {
@@ -485,6 +494,7 @@ impl Inner {
             .map(|v| SyncJob {
                 version: v,
                 ids: sync_targets(&self.data),
+                account: self.account,
             });
         self.state.t3 = t3;
         job
@@ -500,17 +510,10 @@ impl Inner {
         }
     }
 
-    /// Mirrors the session's own flags into the state.
+    /// Shows a failed save of the current session's rotated tokens. A session the server
+    /// ended is an account change, which `Core::end_session` makes.
     fn session_flags(&mut self) {
-        let Some(s) = &self.session else { return };
-        if s.is_signed_out() {
-            self.session = None;
-            self.client = None;
-            self.state = self.state.signed_out();
-            self.data = Data::default();
-            return;
-        }
-        if let Some(e) = s.store_error() {
+        if let Some(e) = self.session.as_ref().and_then(|s| s.store_error()) {
             self.state.error = Some(ErrorView::other(format!(
                 "Could not save your sign-in to the keychain: {e}"
             )));
@@ -522,6 +525,8 @@ impl Inner {
 pub struct SyncJob {
     pub version: String,
     pub ids: Vec<String>,
+    /// The account count when the job was made; a job for an older account is dropped.
+    account: u64,
 }
 
 pub struct CreateArgs {
@@ -530,6 +535,26 @@ pub struct CreateArgs {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub auto_suspend_after_seconds: Option<i64>,
+}
+
+/// What an account change puts in place of the current account.
+enum Next {
+    /// No account: a sign-out, or a session the server ended.
+    Nobody,
+    /// The session the last run saved. It never replaces another session.
+    Saved(Session),
+    /// The session of a device sign-in; its tokens are saved as part of the change.
+    SignedIn(Session),
+}
+
+/// An account change that happened.
+struct Changed {
+    /// The account count after the change.
+    account: u64,
+    /// The new session is in place.
+    signed_in: bool,
+    /// The first store failure; the error line shows it too.
+    error: Option<String>,
 }
 
 pub struct Core {
@@ -541,6 +566,33 @@ pub struct Core {
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
+    /// The account lock (see `gate` for the lock order). Every account change holds it from
+    /// start to end; every gated side effect holds it while it checks the account and acts.
+    side_effects: Mutex<()>,
+    /// Test only: called at named steps of a flow, so a test can change the account there.
+    #[cfg(test)]
+    hook: Mutex<Option<Hook>>,
+}
+
+/// A flow's gate: open only while the account it began under is current.
+struct FlowGate {
+    core: Arc<Core>,
+    account: u64,
+}
+
+impl Gate for FlowGate {
+    fn run(&self, f: &mut dyn FnMut()) -> bool {
+        let _account_lock = self
+            .core
+            .side_effects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.core.lock().account != self.account {
+            return false;
+        }
+        f();
+        true
+    }
 }
 
 async fn detect_t3() -> Option<String> {
@@ -555,6 +607,19 @@ async fn detect_t3() -> Option<String> {
 
 fn anyhow_view(e: &anyhow::Error) -> ErrorView {
     ErrorView::other(format!("{e:#}"))
+}
+
+fn account_changed() -> ErrorView {
+    ErrorView::other("The account changed. Nothing was done.")
+}
+
+fn not_signed_in() -> ErrorView {
+    ErrorView {
+        kind: crate::errors::ErrorKind::SignedOut,
+        message: "You are not signed in".to_string(),
+        minutes: None,
+        code: None,
+    }
 }
 
 type Res<T> = Result<T, ErrorView>;
@@ -578,11 +643,15 @@ impl Core {
             open,
             emit,
             home,
+            side_effects: Mutex::new(()),
+            #[cfg(test)]
+            hook: Mutex::new(None),
             inner: Mutex::new(Inner {
                 state: AppState::default(),
                 data: Data::default(),
                 session: None,
                 client: None,
+                account: 0,
             }),
         }
     }
@@ -591,7 +660,8 @@ impl Core {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Changes the state, then emits it. The lock is not held while emitting.
+    /// Changes the state, then emits it. The lock is not held while emitting. For changes
+    /// that belong to no account flow: desktop facts, settings, a user action on the screen.
     fn update<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         let (r, state) = {
             let mut g = self.lock();
@@ -602,30 +672,223 @@ impl Core {
         r
     }
 
+    /// Changes the state for a flow that began under `account`: `f` runs only while that
+    /// account is current, and the check and the change are one step. None when it changed.
+    fn update_in<R>(&self, account: u64, f: impl FnOnce(&mut Inner) -> R) -> Option<R> {
+        let (r, state) = {
+            let mut g = self.lock();
+            if g.account != account {
+                return None;
+            }
+            let r = f(&mut g);
+            (r, g.state.clone())
+        };
+        (self.emit)(&state);
+        Some(r)
+    }
+
+    /// Reads the state for a flow that began under `account`; None when it changed.
+    fn read_in<R>(&self, account: u64, f: impl FnOnce(&Inner) -> R) -> Option<R> {
+        let g = self.lock();
+        (g.account == account).then(|| f(&g))
+    }
+
     pub fn state(&self) -> AppState {
         self.lock().state.clone()
     }
 
+    /// The current account count.
+    fn account(&self) -> u64 {
+        self.lock().account
+    }
+
+    /// What a flow captures when it starts, read in one step: the client, the account count
+    /// it belongs to, and whatever `f` reads from the state.
+    fn signed_in_with<R>(&self, f: impl FnOnce(&Inner) -> R) -> Res<(Client, u64, R)> {
+        let g = self.lock();
+        let client = g.client.clone().ok_or_else(not_signed_in)?;
+        Ok((client, g.account, f(&g)))
+    }
+
+    fn signed_in(&self) -> Res<(Client, u64)> {
+        self.signed_in_with(|_| ()).map(|(c, a, ())| (c, a))
+    }
+
     fn client(&self) -> Res<Client> {
-        self.lock().client.clone().ok_or_else(|| ErrorView {
-            kind: crate::errors::ErrorKind::SignedOut,
-            message: "You are not signed in".to_string(),
-            minutes: None,
-            code: None,
+        self.signed_in().map(|(c, _)| c)
+    }
+
+    fn gate(self: &Arc<Self>, account: u64) -> FlowGate {
+        FlowGate {
+            core: self.clone(),
+            account,
+        }
+    }
+
+    /// Opens `url` only while the flow's account is current.
+    fn open_for(self: &Arc<Self>, account: u64, url: &str) -> Res<()> {
+        guarded(&self.gate(account), || {
+            (self.open)(url).map_err(ErrorView::other)
+        })
+        .unwrap_or_else(|| Err(account_changed()))
+    }
+
+    /// A step of a flow after it last read the account and before it writes. Tests change
+    /// the account here; in the app it does nothing.
+    fn step(&self, _name: &str) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(h) = hook {
+                h(_name);
+            }
+        }
+    }
+
+    // ---- account changes ----
+
+    /// The one way the account changes. Under the account lock, and only when the account
+    /// count is still `since` (when given): ends the current session first, so a refresh of
+    /// it can neither save nor clear tokens from then on (a sign-out also clears its tokens);
+    /// saves a signed-in session's tokens; clears the MCP key and the SSH tokens unless the
+    /// session saved by the last run comes in; then puts the new session, client and an empty
+    /// account state in place and moves the count on, in one step. Emits and starts the
+    /// logout of the ended session once the locks are released.
+    fn transition(&self, since: Option<u64>, next: Next) -> Option<Changed> {
+        let account_lock = self
+            .side_effects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = {
+            let i = self.lock();
+            if since.is_some_and(|s| s != i.account) {
+                return None;
+            }
+            if matches!(next, Next::Saved(_)) && i.session.is_some() {
+                return None;
+            }
+            i.session.clone()
+        };
+        // Read before the session ends: an ended session has no token.
+        let token = old.as_ref().and_then(|s| s.current_access_token());
+        let saved = matches!(next, Next::Saved(_));
+        let mut errors: Vec<String> = Vec::new();
+        if let Some(s) = &old {
+            match next {
+                Next::Nobody => errors.extend(s.sign_out().err().map(|e| e.to_string())),
+                _ => s.retire(),
+            }
+        }
+        let session = match next {
+            Next::Nobody => None,
+            Next::Saved(s) => Some(s),
+            Next::SignedIn(s) => match s.save() {
+                Ok(()) => Some(s),
+                Err(e) => {
+                    errors.push(e.to_string());
+                    // The ended session's tokens must not stay behind either.
+                    if let Some(o) = &old {
+                        errors.extend(o.sign_out().err().map(|e| e.to_string()));
+                    }
+                    None
+                }
+            },
+        };
+        if !saved {
+            errors.extend(self.keys.clear().err());
+            errors.extend(self.ssh.clear_all().err());
+        }
+        let error = errors.into_iter().next();
+        let signed_in = session.is_some();
+        let (account, state) = {
+            let mut i = self.lock();
+            i.account += 1;
+            i.state = i.state.signed_out();
+            i.data = Data::default();
+            i.session = session.map(Arc::new);
+            i.client = i.session.clone().map(|s| {
+                let creds: Arc<dyn Credentials> = s;
+                Client::new(self.base.clone(), creds)
+            });
+            i.state.signed_in = signed_in;
+            i.state.error = error.clone().map(ErrorView::other);
+            (i.account, i.state.clone())
+        };
+        drop(account_lock);
+        (self.emit)(&state);
+        if let (Some(token), Ok(rt)) = (token, tokio::runtime::Handle::try_current()) {
+            // Best effort, in the background: the local change never waits for the server.
+            let base = self.base.clone();
+            rt.spawn(async move { auth::logout_with(&base, &token).await });
+        }
+        Some(Changed {
+            account,
+            signed_in,
+            error,
         })
     }
 
-    pub fn install_session(&self, session: Session) {
-        let session = Arc::new(session);
-        let creds: Arc<dyn Credentials> = session.clone();
-        let client = Client::new(self.base.clone(), creds);
-        self.update(|i| {
-            i.session = Some(session);
-            i.client = Some(client);
-            i.state.signed_in = true;
-            i.state.error = None;
-            i.state.sign_in_code = None;
+    /// Puts the session the last run saved in place, unless the account changed since
+    /// `since` (a device sign-in finished while the keychain was read).
+    pub fn install_session(self: &Arc<Self>, session: Session, since: u64) -> bool {
+        let ended = session.ended();
+        let Some(c) = self.transition(Some(since), Next::Saved(session)) else {
+            return false;
+        };
+        self.watch_session(ended, c.account);
+        true
+    }
+
+    /// Puts a device sign-in's session in place and saves its tokens, unless the account
+    /// changed since the sign-in began under `since`. Returns the new account count.
+    fn install_signed_in(self: &Arc<Self>, session: Session, since: u64) -> Res<u64> {
+        let ended = session.ended();
+        let c = self
+            .transition(Some(since), Next::SignedIn(session))
+            .ok_or_else(account_changed)?;
+        if !c.signed_in {
+            return Err(ErrorView::other(c.error.unwrap_or_default()));
+        }
+        self.watch_session(ended, c.account);
+        Ok(c.account)
+    }
+
+    /// Waits, in the background, for the session installed as `account` to end, then ends
+    /// the account with it. Whatever ends the session (a refresh 401 inside any command or
+    /// refresh, a sign-out, a replacement), this runs once, and only the server's end of a
+    /// session still in place changes anything.
+    fn watch_session(self: &Arc<Self>, ended: Option<watch::Receiver<bool>>, account: u64) {
+        let (Some(mut ended), Ok(rt)) = (ended, tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let core = Arc::downgrade(self);
+        rt.spawn(async move {
+            // An error means the session is gone without an end: nothing to do.
+            let over = ended.wait_for(|e| *e).await.is_ok();
+            if over && let Some(core) = core.upgrade() {
+                core.end_session(account);
+            }
         });
+    }
+
+    /// When the session installed as `account` is still in place and ended on the server
+    /// (a refresh got 401), the account ends here too: the same change as a sign-out,
+    /// without the logout call. After a sign-out or a replacement the count has moved on
+    /// and this does nothing.
+    fn end_session(&self, account: u64) {
+        self.step("session ended");
+        let ended = self
+            .read_in(account, |i| {
+                i.session.as_ref().is_some_and(|s| s.is_signed_out())
+            })
+            .unwrap_or(false);
+        if ended {
+            self.transition(Some(account), Next::Nobody);
+        }
     }
 
     pub fn set_start_at_login(&self, on: bool) {
@@ -641,10 +904,27 @@ impl Core {
         self.settle(r)
     }
 
-    /// Runs an action's result through the error rules: a failure shows in `state.error`,
-    /// the next success clears it. Also checks whether the session ended.
+    /// Runs the result of a user action on the current screen through the error rules: a
+    /// failure shows in `state.error`, the next success clears it. Not for a result that
+    /// comes after an await: that is `settle_in`. It never waits for the account lock, so the
+    /// synchronous commands on the main thread never block on it.
     pub fn settle<T>(&self, r: Res<T>) -> Res<T> {
         self.update(|i| {
+            match &r {
+                Ok(_) => i.state.error = None,
+                Err(e) => i.state.error = Some(e.clone()),
+            }
+            i.session_flags();
+        });
+        r
+    }
+
+    /// `settle` for a flow that began under `account`: when the account changed since, the
+    /// result or error belongs to nobody on screen and is only returned. The check is part
+    /// of the state change.
+    fn settle_in<T>(&self, account: u64, r: Res<T>) -> Res<T> {
+        self.step("settle");
+        self.update_in(account, |i| {
             match &r {
                 Ok(_) => i.state.error = None,
                 Err(e) => i.state.error = Some(e.clone()),
@@ -659,13 +939,15 @@ impl Core {
     pub async fn start(self: &Arc<Self>) {
         let t3 = detect_t3().await;
         self.update(|i| i.state.t3 = t3);
+        let since = self.account();
         let base = self.base.clone();
         let session = tokio::task::spawn_blocking(move || Session::load(&base))
             .await
             .ok()
             .flatten();
-        if let Some(s) = session {
-            self.install_session(s);
+        if let Some(s) = session
+            && self.install_session(s, since)
+        {
             self.refresh_and_sync(true).await;
             self.refresh_mcp().await;
         }
@@ -674,14 +956,14 @@ impl Core {
 
     /// Reads machines, and with `full` also the account, templates, snapshots and the
     /// desktop T3 version. Lists only; nothing here runs a command on a sandbox.
-    pub async fn refresh(&self, full: bool) -> Option<SyncJob> {
-        let client = self.lock().client.clone()?;
+    pub async fn refresh(self: &Arc<Self>, full: bool) -> Option<SyncJob> {
+        let (client, account, no_me) = self.signed_in_with(|i| i.data.me.is_none()).ok()?;
         let running = tokio::task::spawn_blocking(desktop::running)
             .await
             .unwrap_or(false);
-        let full = full || self.lock().data.me.is_none();
+        let full = full || no_me;
         let machines = client.machines().await;
-        let account = if full {
+        let account_reads = if full {
             let (me, orgs, templates, snapshots) = tokio::join!(
                 client.me(),
                 client.orgs(),
@@ -692,19 +974,24 @@ impl Core {
         } else {
             None
         };
-        let was_full = account.is_some();
-        let user = match &account {
+        let was_full = account_reads.is_some();
+        let user = match &account_reads {
             Some((Ok(me), ..)) => Some(me.user_id),
-            _ => self.lock().data.me.as_ref().map(|m| m.user_id),
+            _ => self
+                .read_in(account, |i| i.data.me.as_ref().map(|m| m.user_id))
+                .flatten(),
         };
-        let connected = self.load_connected(user).await;
-        self.update(|i| {
-            // Signed out while the reads were in flight: drop them.
-            i.client.as_ref()?;
+        let connected = self.load_connected(user, account).await;
+        // When the account changed while the reads were in flight, they are not its data.
+        let job = self.update_in(account, |i| {
             let mut failure: Option<ErrorView> = None;
             i.data.desktop_running = running;
-            if let Some((user, set)) = connected {
+            if let Some((user, set, problem)) = connected {
                 i.data.use_connected(user, set);
+                if let Some(e) = problem {
+                    // Shown once: the list is loaded again only for another user.
+                    i.state.error = Some(ErrorView::other(e));
+                }
             }
             match machines {
                 Ok(m) => {
@@ -714,7 +1001,7 @@ impl Core {
                 Err(e) => failure = Some(e.into()),
             }
             let mut version = None;
-            if let Some((me, orgs, templates, snapshots, t3)) = account {
+            if let Some((me, orgs, templates, snapshots, t3)) = account_reads {
                 match me {
                     Ok(v) => i.data.me = Some(v),
                     Err(e) => failure = Some(e.into()),
@@ -738,17 +1025,27 @@ impl Core {
             let job = version.and_then(|t3| i.set_desktop_version(t3));
             i.session_flags();
             job
-        })
+        });
+        job.flatten()
     }
 
     /// The connected set of `user` from disk, when it is not the one in use.
-    async fn load_connected(&self, user: Option<i64>) -> Option<(i64, HashSet<String>)> {
+    /// A list that cannot be read comes back empty, with the reason.
+    async fn load_connected(
+        self: &Arc<Self>,
+        user: Option<i64>,
+        account: u64,
+    ) -> Option<(i64, HashSet<String>, Option<String>)> {
         let user = user.filter(|u| self.lock().data.connected_user != Some(*u))?;
         let store = self.connected.clone();
-        let set = tokio::task::spawn_blocking(move || store.load(user))
+        let core = self.clone();
+        let r = tokio::task::spawn_blocking(move || store.load_checked(user, &core.gate(account)))
             .await
             .ok()?;
-        Some((user, set))
+        Some(match r {
+            Ok(set) => (user, set, None),
+            Err(e) => (user, HashSet::new(), Some(e)),
+        })
     }
 
     /// Looks for T3 Code on this computer now (the "Check again" button), instead of
@@ -778,22 +1075,24 @@ impl Core {
     /// One sync per running connected sandbox. This exec follows a version change; it is
     /// not a timer. A sandbox that cannot be updated shows `updatePending`; nothing retries.
     async fn sync_all(&self, job: SyncJob) {
-        let Ok(client) = self.client() else { return };
+        let Some(client) = self.read_in(job.account, |i| i.client.clone()).flatten() else {
+            return;
+        };
         for id in &job.ids {
             let r = sandbox::sync::sync(&client, id, &job.version).await;
-            self.record_sync(id, &job.version, r.as_ref().ok());
+            self.record_sync(id, &job.version, r.as_ref().ok(), job.account);
         }
     }
 
-    fn record_sync(&self, id: &str, desktop: &str, outcome: Option<&SyncOutcome>) {
-        self.update(|i| {
+    fn record_sync(&self, id: &str, desktop: &str, outcome: Option<&SyncOutcome>, account: u64) {
+        self.update_in(account, |i| {
             i.data.record_sync(id, desktop, outcome);
             i.rebuild();
         });
     }
 
-    fn record_version(&self, id: &str, version: &str) {
-        self.update(|i| {
+    fn record_version(&self, id: &str, version: &str, account: u64) {
+        self.update_in(account, |i| {
             i.data.set_version(id, version);
             i.rebuild();
         });
@@ -854,50 +1153,48 @@ impl Core {
 
     // ---- account ----
 
+    /// A device sign-in. It is a flow of the account it began under (usually none): when
+    /// another account change happens first, it shows nothing, opens nothing and installs
+    /// nothing.
     pub async fn sign_in(self: &Arc<Self>, provider: Provider) -> Res<()> {
-        let r = self.sign_in_inner(provider).await;
-        self.update(|i| i.state.sign_in_code = None);
-        self.settle(r)?;
-        self.refresh_and_sync(true).await;
-        self.refresh_mcp().await;
-        Ok(())
+        let since = self.account();
+        match self.sign_in_inner(provider, since).await {
+            Ok(_) => {
+                self.refresh_and_sync(true).await;
+                self.refresh_mcp().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.update_in(since, |i| i.state.sign_in_code = None);
+                self.settle_in(since, Err(e))
+            }
+        }
     }
 
-    async fn sign_in_inner(&self, provider: Provider) -> Res<()> {
+    async fn sign_in_inner(self: &Arc<Self>, provider: Provider, since: u64) -> Res<u64> {
         let start = auth::start(&self.base, provider)
             .await
             .map_err(|e| ErrorView::from_auth(&e))?;
-        self.update(|i| i.state.sign_in_code = Some(start.user_code.clone()));
-        (self.open)(start.browser_url()).map_err(ErrorView::other)?;
+        let code = start.user_code.clone();
+        self.update_in(since, |i| i.state.sign_in_code = Some(code))
+            .ok_or_else(account_changed)?;
+        self.open_for(since, start.browser_url())?;
         let session = auth::poll(&self.base, &start)
             .await
             .map_err(|e| ErrorView::from_auth(&e))?;
-        self.install_session(session);
-        Ok(())
+        self.install_signed_in(session, since)
     }
 
-    /// An account boundary: ends the session on the server, forgets the sign-in tokens, the
-    /// MCP key and every SSH token, and clears the account state, the user's connected set
-    /// included (it stays on disk for that user). The state clears even when a store fails;
-    /// the first failure is returned and shown.
+    /// An account boundary: forgets the sign-in tokens, the MCP key and every SSH token,
+    /// and clears the account state, the user's connected set included (it stays on disk
+    /// for that user). Then it ends the session on the server in the background, with the
+    /// token it had, and never refreshes for that. The state clears even when a store
+    /// fails; the first failure is returned and shown.
     pub async fn sign_out(&self) -> Res<()> {
-        let session = self.update(|i| {
-            let s = i.session.take();
-            i.client = None;
-            i.state = i.state.signed_out();
-            i.data = Data::default();
-            s
-        });
-        if let Some(s) = &session {
-            s.logout().await;
+        match self.transition(None, Next::Nobody) {
+            Some(Changed { error: Some(e), .. }) => Err(ErrorView::other(e)),
+            _ => Ok(()),
         }
-        let tokens = match session {
-            Some(s) => s.sign_out().map_err(|e| e.to_string()),
-            None => Ok(()),
-        };
-        let key = self.keys.clear();
-        let ssh = self.ssh.clear_all();
-        self.settle(tokens.and(key).and(ssh).map_err(ErrorView::other))
     }
 
     pub fn switch_org(&self, org_id: &str) -> Res<()> {
@@ -931,11 +1228,14 @@ impl Core {
     }
 
     pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<()> {
-        let (client, version) = match self.prepare().await {
+        let (client, account, org_id) = match self.signed_in_with(|i| i.state.org_id.clone()) {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let org_id = self.lock().state.org_id.clone();
+        let version = match self.desktop_version().await {
+            Ok(v) => v,
+            Err(e) => return self.settle_in(account, Err(e)),
+        };
         let req = NewSandbox {
             name: a.name,
             source: a.snapshot_id.map_or(Source::Standard, Source::Snapshot),
@@ -946,111 +1246,118 @@ impl Core {
             auto_suspend_after_seconds: a.auto_suspend_after_seconds,
             org_id,
         };
-        self.begin_progress("create", "creating", None);
-        let r = connect::create_and_connect(&client, &req, &version, self.progress_cb()).await;
-        self.finish_connect(r, &version).await
+        self.begin_progress("create", "creating", None, account);
+        let r =
+            connect::create_and_connect(&client, &req, &version, self.progress_cb(account)).await;
+        self.finish_connect(r, &version, account).await
     }
 
     /// Connects an existing sandbox: wakes it, installs T3 (never an older one), pairs,
     /// then opens T3 Code with the pairing link.
     pub async fn connect_sandbox(self: &Arc<Self>, id: &str) -> Res<()> {
-        let (client, version) = match self.prepare().await {
+        let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        self.begin_progress("connect", "connecting", Some(id.to_string()));
-        let r = connect::connect_existing(&client, id, &version, self.progress_cb()).await;
-        self.finish_connect(r, &version).await
+        let version = match self.desktop_version().await {
+            Ok(v) => v,
+            Err(e) => return self.settle_in(account, Err(e)),
+        };
+        self.begin_progress("connect", "connecting", Some(id.to_string()), account);
+        let r = connect::connect_existing(&client, id, &version, self.progress_cb(account)).await;
+        self.finish_connect(r, &version, account).await
     }
 
     /// Open in T3 Code. A connected sandbox: wake it, sync its T3, open the app (no setup,
     /// no new pairing). An unconnected one goes through the connect flow.
     pub async fn open_in_t3(self: &Arc<Self>, id: &str) -> Res<()> {
-        let connected = self
-            .lock()
-            .state
-            .sandboxes
-            .iter()
-            .any(|s| s.id == id && s.connected);
-        if !connected {
-            return self.connect_sandbox(id).await;
-        }
-        let client = self.client()?;
-        let version = self.lock().state.t3.clone();
+        let snapshot = self.signed_in_with(|i| {
+            let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
+            (connected, i.state.t3.clone())
+        });
+        let (client, account, version) = match snapshot {
+            Ok((client, account, (true, version))) => (client, account, version),
+            _ => return self.connect_sandbox(id).await,
+        };
         let r = async {
             sandbox::ensure_running(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
             if let Some(v) = &version {
                 let out = sandbox::sync::sync(&client, id, v).await;
-                self.record_sync(id, v, out.as_ref().ok());
+                self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            (self.open)(T3_APP_URL).map_err(ErrorView::other)
+            self.open_for(account, T3_APP_URL)
         };
-        self.act(r).await
+        self.act(account, r).await
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
     pub async fn pair_again(self: &Arc<Self>, id: &str) -> Res<()> {
-        let client = self.client()?;
+        let (client, account) = self.signed_in()?;
+        let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
             let link = connect::pair_again(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
-            self.remember(id).await;
-            (self.open)(&link).map_err(ErrorView::other)
+            linked.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.open_for(account, &link)
         };
-        self.act(r).await
+        let out = self.act(account, r).await;
+        if linked.load(std::sync::atomic::Ordering::SeqCst) {
+            // After `act`, which clears the error: a failed save stays visible.
+            self.remember(id, account).await;
+        }
+        out
     }
 
     /// Adds the sandbox to the set the user connected from this computer, on disk and in
     /// the state. Without a known user it stays in memory until the account loads.
-    async fn remember(&self, id: &str) {
-        let user = self.update(|i| {
+    /// Nothing changes, in memory or on disk, once the account changed since `account`.
+    async fn remember(self: &Arc<Self>, id: &str, account: u64) {
+        let user = self.update_in(account, |i| {
             i.data.connected.insert(id.to_string());
             i.rebuild();
             i.data.user()
         });
-        let Some(user) = user else { return };
-        let store = self.connected.clone();
-        let id = id.to_string();
-        let r = tokio::task::spawn_blocking(move || store.add(user, &id)).await;
-        self.report_store(r);
+        let Some(Some(user)) = user else { return };
+        let (store, core, id) = (self.connected.clone(), self.clone(), id.to_string());
+        let r =
+            tokio::task::spawn_blocking(move || store.add(user, &id, &core.gate(account))).await;
+        self.report_store(r, account);
     }
 
     /// Removes the sandbox from the set the user connected from this computer.
-    async fn forget(&self, id: &str) {
-        let user = self.update(|i| {
+    /// Nothing changes, in memory or on disk, once the account changed since `account`.
+    async fn forget(self: &Arc<Self>, id: &str, account: u64) {
+        let user = self.update_in(account, |i| {
             i.data.connected.remove(id);
             i.rebuild();
             i.data.user()
         });
-        let Some(user) = user else { return };
-        let store = self.connected.clone();
-        let id = id.to_string();
-        let r = tokio::task::spawn_blocking(move || store.remove(user, &id)).await;
-        self.report_store(r);
+        let Some(Some(user)) = user else { return };
+        let (store, core, id) = (self.connected.clone(), self.clone(), id.to_string());
+        let r =
+            tokio::task::spawn_blocking(move || store.remove(user, &id, &core.gate(account))).await;
+        self.report_store(r, account);
     }
 
-    fn report_store(&self, r: Result<Result<(), String>, tokio::task::JoinError>) {
+    /// Shows a failed connected-list change, only to the account it was made for.
+    fn report_store(&self, r: Result<Result<(), String>, tokio::task::JoinError>, account: u64) {
         let err = match r {
             Ok(Ok(())) => return,
             Ok(Err(e)) => e,
             Err(e) => e.to_string(),
         };
-        self.update(|i| {
+        self.update_in(account, |i| {
             i.state.error = Some(ErrorView::other(format!(
                 "Could not save the sandboxes connected from this computer: {err}"
             )));
         });
     }
 
-    async fn prepare(&self) -> Res<(Client, String)> {
-        Ok((self.client()?, self.desktop_version().await?))
-    }
-
-    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>) {
-        self.update(|i| {
+    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>, account: u64) {
+        self.update_in(account, |i| {
             i.state.error = None;
             i.state.progress = Some(ProgressView {
                 kind: kind.to_string(),
@@ -1062,9 +1369,9 @@ impl Core {
     }
 
     /// Moves the progress on. A progress that was dismissed or pruned stays gone.
-    fn progress_cb(&self) -> impl Fn(Step) + '_ {
+    fn progress_cb(&self, account: u64) -> impl Fn(Step) + '_ {
         move |step| {
-            self.update(|i| {
+            self.update_in(account, |i| {
                 if let Some(p) = &i.state.progress {
                     i.state.progress = Some(progress_after(p, &step));
                 }
@@ -1077,16 +1384,24 @@ impl Core {
         self.update(Inner::clear_progress);
     }
 
+    /// Shows the result of a create or connect that began under `account`. Every write
+    /// checks the account as part of the write, so a change at any point drops the rest.
     async fn finish_connect(
         self: &Arc<Self>,
         r: Result<Connected, SandboxError>,
         version: &str,
+        account: u64,
     ) -> Res<()> {
-        match r {
+        if self.account() != account {
+            // Signed out or switched account while this ran: drop the result.
+            return Ok(());
+        }
+        self.step("finish");
+        let out = match r {
             Ok(c) => {
                 // A sandbox that kept a newer T3 is not moved to the desktop's: the desktop is
                 // behind. One that kept an older T3 because T3 was busy offers the update.
-                self.update(|i| {
+                self.update_in(account, |i| {
                     i.state.progress = None;
                     i.data.set_version(&c.machine_id, &c.t3_version);
                     if c.update_pending {
@@ -1096,50 +1411,58 @@ impl Core {
                     }
                     i.rebuild();
                 });
-                self.remember(&c.machine_id).await;
-                let opened = (self.open)(&c.link).map_err(ErrorView::other);
-                let out = self.settle(opened);
-                self.refresh_and_sync(false).await;
+                let opened = self.open_for(account, &c.link);
+                let out = self.settle_in(account, opened);
+                // After `settle_in`, which clears the error: a failed save stays visible.
+                self.remember(&c.machine_id, account).await;
                 out
             }
             Err(e) => {
                 let view = ErrorView::from(e);
-                self.update(|i| {
+                self.update_in(account, |i| {
                     i.state.progress = fail_progress(i.state.progress.as_ref(), &view);
                 });
-                let out = self.settle(Err(view));
-                self.refresh_and_sync(false).await;
-                out
+                self.settle_in(account, Err(view))
             }
+        };
+        if self.account() == account {
+            self.refresh_and_sync(false).await;
         }
+        out
     }
 
-    /// Runs a sandbox action, then refreshes machines.
-    async fn act<T>(self: &Arc<Self>, f: impl std::future::Future<Output = Res<T>>) -> Res<T> {
+    /// Runs a sandbox action of `account`, then refreshes machines.
+    async fn act<T>(
+        self: &Arc<Self>,
+        account: u64,
+        f: impl std::future::Future<Output = Res<T>>,
+    ) -> Res<T> {
         let r = f.await;
-        let out = self.settle(r);
-        self.refresh_and_sync(false).await;
+        let out = self.settle_in(account, r);
+        if self.account() == account {
+            self.refresh_and_sync(false).await;
+        }
         out
     }
 
     pub async fn pause(self: &Arc<Self>, id: &str) -> Res<()> {
-        let client = self.client()?;
-        self.act(async { lifecycle::pause(&client, id).await.map_err(ErrorView::from) })
-            .await
+        let (client, account) = self.signed_in()?;
+        self.act(account, async {
+            lifecycle::pause(&client, id).await.map_err(ErrorView::from)
+        })
+        .await
     }
 
     /// Wakes the sandbox. A connected one also gets its T3 brought in step with the desktop.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
-        let client = self.client()?;
         // Only a sandbox connected from this computer gets its T3 synced after a resume.
-        let version = {
-            let g = self.lock();
-            g.data
+        let (client, account, version) = self.signed_in_with(|i| {
+            i.data
                 .connected
                 .contains(id)
-                .then(|| g.state.t3.clone())
+                .then(|| i.state.t3.clone())
                 .flatten()
-        };
+        })?;
         let r = async {
             match &version {
                 Some(v) => {
@@ -1147,7 +1470,7 @@ impl Core {
                         .await
                         .map_err(ErrorView::from)?;
                     if let Some(o) = o {
-                        self.record_sync(id, v, Some(&o));
+                        self.record_sync(id, v, Some(&o), account);
                     }
                     Ok(())
                 }
@@ -1157,20 +1480,20 @@ impl Core {
                     .map_err(ErrorView::from),
             }
         };
-        self.act(r).await
+        self.act(account, r).await
     }
 
     pub async fn delete(self: &Arc<Self>, id: &str) -> Res<()> {
-        let client = self.client()?;
+        let (client, account) = self.signed_in()?;
         let r = self
-            .act(async {
+            .act(account, async {
                 lifecycle::delete(&client, id)
                     .await
                     .map_err(ErrorView::from)
             })
             .await;
         if r.is_ok() {
-            self.update(|i| {
+            self.update_in(account, |i| {
                 i.data.t3_versions.remove(id);
                 i.data.update_pending.remove(id);
                 i.data.desktop_behind.remove(id);
@@ -1181,14 +1504,14 @@ impl Core {
                 }
                 i.rebuild();
             });
-            self.forget(id).await;
+            self.forget(id, account).await;
         }
         r
     }
 
     pub async fn resize(self: &Arc<Self>, id: &str, vcpus: u32, mem_mib: u32) -> Res<()> {
-        let client = self.client()?;
-        self.act(async {
+        let (client, account) = self.signed_in()?;
+        self.act(account, async {
             lifecycle::resize(&client, id, vcpus, mem_mib)
                 .await
                 .map_err(ErrorView::from)
@@ -1197,8 +1520,8 @@ impl Core {
     }
 
     pub async fn set_auto_sleep(self: &Arc<Self>, id: &str, seconds: i64) -> Res<()> {
-        let client = self.client()?;
-        self.act(async {
+        let (client, account) = self.signed_in()?;
+        self.act(account, async {
             lifecycle::set_auto_sleep(&client, id, seconds)
                 .await
                 .map_err(ErrorView::from)
@@ -1207,29 +1530,35 @@ impl Core {
     }
 
     pub async fn reinstall_t3(self: &Arc<Self>, id: &str) -> Res<()> {
-        let client = self.client()?;
+        let (client, account) = self.signed_in()?;
         let r = async {
             let v = self.desktop_version().await?;
             lifecycle::reinstall(&client, id, &v)
                 .await
                 .map_err(ErrorView::from)?;
-            self.record_version(id, &v);
+            self.record_version(id, &v, account);
             Ok(())
         };
-        self.act(r).await
+        self.act(account, r).await
     }
 
     pub async fn agent_sign_in(self: &Arc<Self>, id: &str, agent: Agent) -> Res<()> {
-        let client = self.client()?;
+        let (client, account) = self.signed_in()?;
         let open = self.open.clone();
+        let gate = self.gate(account);
         let r = async {
-            agents::sign_in(&client, &*self.ssh, id, agent, move |u| {
-                open(u).map_err(anyhow::Error::msg)
-            })
+            agents::sign_in(
+                &client,
+                &*self.ssh,
+                id,
+                agent,
+                move |u| open(u).map_err(anyhow::Error::msg),
+                &gate,
+            )
             .await
             .map_err(|e| anyhow_view(&e))
         };
-        self.act(r).await
+        self.act(account, r).await
     }
 
     /// Whether `agent` is signed in on the sandbox. One status exec, and only when the
@@ -1245,42 +1574,56 @@ impl Core {
 
     /// The SSH login command to show and copy. The details view shows a failure next to
     /// the SSH row, so this leaves `state.error` alone.
-    pub async fn ssh_command(&self, id: &str) -> Res<String> {
-        let r = self.login_command(id).await;
+    pub async fn ssh_command(self: &Arc<Self>, id: &str) -> Res<String> {
+        let r = match self.signed_in() {
+            Ok((client, account)) => self.login_command(&client, id, account).await,
+            Err(e) => Err(e),
+        };
         if r.is_err() {
             self.update(Inner::session_flags);
         }
         r
     }
 
-    async fn login_command(&self, id: &str) -> Res<String> {
-        let client = self.client()?;
-        let t = ssh::token(&client, &*self.ssh, id)
+    async fn login_command(
+        self: &Arc<Self>,
+        client: &Client,
+        id: &str,
+        account: u64,
+    ) -> Res<String> {
+        let t = ssh::token(client, &*self.ssh, id, &self.gate(account))
             .await
             .map_err(ErrorView::from)?;
         Ok(ssh::display_command(&t))
     }
 
-    pub async fn open_ssh(&self, id: &str) -> Res<()> {
-        let r = async {
-            let cmd = self.login_command(id).await?;
-            ssh::open_in_terminal(&cmd).map_err(ErrorView::other)
+    pub async fn open_ssh(self: &Arc<Self>, id: &str) -> Res<()> {
+        let (client, account) = match self.signed_in() {
+            Ok(v) => v,
+            Err(e) => return self.settle(Err(e)),
         };
-        self.settle(r.await)
+        let r = async {
+            let cmd = self.login_command(&client, id, account).await?;
+            guarded(&self.gate(account), || ssh::open_in_terminal(&cmd))
+                .ok_or_else(account_changed)?
+                .map_err(ErrorView::other)
+        };
+        self.settle_in(account, r.await)
     }
 
-    pub async fn add_mcp(&self, which: McpClient) -> Res<()> {
-        let client = self.client()?;
+    pub async fn add_mcp(self: &Arc<Self>, which: McpClient) -> Res<()> {
+        let (client, account) = self.signed_in()?;
         let r = mcp::add(
             &client,
             &mcp::mcp_url(&self.base),
             &self.home,
             which,
             self.keys.clone(),
+            Arc::new(self.gate(account)),
         )
         .await
         .map_err(|e| anyhow_view(&e));
-        let out = self.settle(r);
+        let out = self.settle_in(account, r);
         self.refresh_mcp().await;
         out
     }
@@ -1672,9 +2015,14 @@ mod tests {
         assert!(sync_targets(&d).contains(&"t".to_string()));
     }
 
+    // A closed local port: a test that reaches the network fails here, never at the real API.
     fn core_with(store: Arc<dyn ConnectedStore>) -> Arc<Core> {
+        core_on(Url::parse("http://127.0.0.1:9/").unwrap(), store)
+    }
+
+    fn core_on(base: Url, store: Arc<dyn ConnectedStore>) -> Arc<Core> {
         Arc::new(Core::new(
-            api_base(None),
+            base,
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             store,
@@ -1706,7 +2054,9 @@ mod tests {
             update_pending: true,
             ..connected_result("t", "0.1.9")
         };
-        core.finish_connect(Ok(c), "0.1.11").await.unwrap();
+        core.finish_connect(Ok(c), "0.1.11", core.account())
+            .await
+            .unwrap();
         let v = &core.state().sandboxes[0];
         assert!(v.connected && v.update_pending && !v.desktop_behind);
         assert_eq!(v.t3_version.as_deref(), Some("0.1.9"));
@@ -1724,15 +2074,19 @@ mod tests {
             i.rebuild();
         });
         assert!(!core.state().sandboxes[0].connected);
-        core.finish_connect(Ok(connected_result("t", "0.1.11")), "0.1.11")
-            .await
-            .unwrap();
+        core.finish_connect(
+            Ok(connected_result("t", "0.1.11")),
+            "0.1.11",
+            core.account(),
+        )
+        .await
+        .unwrap();
         assert!(store.load(7).contains("t"), "saved for the signed-in user");
         let s = core.state();
         assert!(s.sandboxes[0].connected);
         assert_eq!(s.sandboxes[0].t3_version.as_deref(), Some("0.1.11"));
         assert!(!s.sandboxes[0].desktop_behind);
-        core.forget("t").await;
+        core.forget("t", core.account()).await;
         assert!(store.load(7).is_empty(), "removed");
         assert!(!core.state().sandboxes[0].connected);
     }
@@ -1746,9 +2100,13 @@ mod tests {
             i.data.orgs = data().orgs;
             i.rebuild();
         });
-        core.finish_connect(Ok(connected_result("t", "0.1.12")), "0.1.11")
-            .await
-            .unwrap();
+        core.finish_connect(
+            Ok(connected_result("t", "0.1.12")),
+            "0.1.11",
+            core.account(),
+        )
+        .await
+        .unwrap();
         let v = &core.state().sandboxes[0];
         assert!(v.desktop_behind && !v.update_pending);
         assert_eq!(v.t3_version.as_deref(), Some("0.1.12"));
@@ -1771,14 +2129,14 @@ mod tests {
         (server, base)
     }
 
-    fn sign_in_as(core: &Core, base: &Url, user_id: i64) {
+    fn sign_in_as(core: &Arc<Core>, base: &Url, user_id: i64) {
         let session = Session::load_from(
             base,
             Some("ibk_test".into()),
             Arc::new(MemoryStore::default()),
         )
         .unwrap();
-        core.install_session(session);
+        core.install_signed_in(session, core.account()).unwrap();
         core.update(|i| i.data.me = Some(Me { user_id, ..me() }));
     }
 
@@ -1789,7 +2147,7 @@ mod tests {
         let (_server, base) = listing_server().await;
         let first = core_with(Arc::new(FileConnectedStore::new(path.clone())));
         first.update(|i| i.data.me = Some(me()));
-        first.remember("m1").await;
+        first.remember("m1", first.account()).await;
 
         // A restart: nothing is loaded until the account is known.
         let again = Arc::new(Core::new(
@@ -1922,7 +2280,7 @@ mod tests {
             Arc::new(MemoryStore::default()),
         )
         .unwrap();
-        core.install_session(session);
+        assert!(core.install_session(session, core.account()));
         core.update(|i| {
             i.data.me = Some(me());
             i.state.progress = Some(failed_progress("m1"));
@@ -1976,7 +2334,7 @@ mod tests {
         let ssh = Arc::new(MemorySshStore::default());
         ssh.save("m1", &ssh_token()).unwrap();
         let base = api_base(None);
-        let core = Core::new(
+        let core = Arc::new(Core::new(
             base.clone(),
             Arc::new(MemoryKeyStore::default()),
             ssh,
@@ -1984,7 +2342,7 @@ mod tests {
             Arc::new(|_| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
-        );
+        ));
         let boom = Some(ErrorView::other("boom"));
         core.update(|i| i.state.error = boom.clone());
         assert!(core.ssh_command("m1").await.is_err(), "signed out");
@@ -1996,7 +2354,7 @@ mod tests {
             Arc::new(MemoryStore::default()),
         )
         .unwrap();
-        core.install_session(session);
+        assert!(core.install_session(session, core.account()));
         core.update(|i| i.state.error = boom.clone());
         assert_eq!(
             core.ssh_command("m1").await.unwrap(),
@@ -2100,10 +2458,10 @@ mod tests {
         ssh.save("a", &ssh_token()).unwrap();
         ssh.save("e", &ssh_token()).unwrap();
         let connected = Arc::new(MemoryConnectedStore::default());
-        connected.add(7, "a").unwrap();
+        connected.add(7, "a", &crate::gate::Open).unwrap();
         let emitted = Arc::new(Mutex::new(Vec::<AppState>::new()));
         let sink = emitted.clone();
-        let core = Core::new(
+        let core = Arc::new(Core::new(
             base.clone(),
             keys.clone(),
             ssh.clone(),
@@ -2111,9 +2469,9 @@ mod tests {
             Arc::new(|_| Ok(())),
             Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
             PathBuf::from("/nonexistent"),
-        );
+        ));
         let session = Session::load_from(&base, None, store.clone()).expect("session");
-        core.install_session(session);
+        assert!(core.install_session(session, core.account()));
         core.update(|i| {
             i.data = data();
             i.data.connected_user = Some(7);
@@ -2142,6 +2500,17 @@ mod tests {
             "state emitted"
         );
         assert!(core.client().is_err(), "no client after sign-out");
+        for _ in 0..50 {
+            if !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         // Dropping the server checks the one logout call.
     }
 
@@ -2153,6 +2522,99 @@ mod tests {
     #[tokio::test]
     async fn sign_out_goes_on_when_the_logout_call_fails() {
         sign_out_with_logout(500).await;
+    }
+
+    type WithSession = (
+        Arc<Core>,
+        Arc<MemoryStore>,
+        Arc<MemoryKeyStore>,
+        Arc<MemorySshStore>,
+        Arc<tokio::sync::Notify>,
+    );
+
+    /// A core signed in with `tok` against `server`, its token, key and SSH stores, and a
+    /// signal that fires when the state shows the sign-in screen.
+    fn core_with_session(server_uri: &str, tok: Tokens) -> WithSession {
+        let base = Url::parse(server_uri).unwrap();
+        let store = Arc::new(MemoryStore::with(tok));
+        let keys = Arc::new(MemoryKeyStore::default());
+        keys.save("ibk_secret").unwrap();
+        let ssh = Arc::new(MemorySshStore::default());
+        ssh.save("a", &ssh_token()).unwrap();
+        let signed_out = Arc::new(tokio::sync::Notify::new());
+        let signal = signed_out.clone();
+        let core = Arc::new(Core::new(
+            base.clone(),
+            keys.clone(),
+            ssh.clone(),
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(|_| Ok(())),
+            Arc::new(move |s: &AppState| {
+                if !s.signed_in {
+                    signal.notify_one();
+                }
+            }),
+            PathBuf::from("/nonexistent"),
+        ));
+        let session = Session::load_from(&base, None, store.clone()).expect("session");
+        assert!(core.install_session(session, core.account()));
+        (core, store, keys, ssh, signed_out)
+    }
+
+    #[tokio::test]
+    async fn sign_out_clears_secrets_without_waiting_for_the_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh, _) = core_with_session(&server.uri(), tokens());
+        let started = std::time::Instant::now();
+        core.sign_out().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "sign_out waited for the server"
+        );
+        assert_eq!(store.load().unwrap(), None, "tokens cleared");
+        assert_eq!(keys.load().unwrap(), None, "MCP key cleared");
+        assert_eq!(ssh.load("a").unwrap(), None, "SSH tokens cleared");
+    }
+
+    #[tokio::test]
+    async fn sign_out_never_refreshes_and_logs_out_with_the_captured_token() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .and(header("authorization", "Bearer iba_a"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The access token is about to expire: bearer() would refresh it.
+        let mut tok = tokens();
+        tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
+        let (core, store, _keys, _ssh, _) = core_with_session(&server.uri(), tok);
+        core.sign_out().await.unwrap();
+        assert_eq!(store.load().unwrap(), None);
+        for _ in 0..50 {
+            let n = server.received_requests().await.unwrap_or_default().len();
+            if n > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Dropping the server checks: one logout with the old token, no refresh.
     }
 
     #[tokio::test]
@@ -2209,5 +2671,971 @@ mod tests {
         assert_eq!(core.state().error, Some(ErrorView::other("boom")));
         core.settle(Ok(())).unwrap();
         assert_eq!(core.state().error, None);
+    }
+
+    #[tokio::test]
+    async fn sign_out_during_a_refresh_keeps_the_store_empty_and_logs_out() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let rotated = Tokens {
+            access_token: "iba_new".into(),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            refresh_token: "ibr_new".into(),
+            refresh_expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(&rotated).unwrap())
+                    .set_delay(Duration::from_millis(800)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut tok = tokens();
+        tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
+        let (core, store, _keys, _ssh, _) = core_with_session(&server.uri(), tok);
+        // An API call already in flight (a poll), holding the old session: it refreshes.
+        let s = core.lock().session.clone().unwrap();
+        let call = tokio::spawn(async move { s.bearer().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        assert_eq!(store.load().unwrap(), None, "cleared right after sign_out");
+        let got = call.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let logouts = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/v1/auth/logout")
+            .count();
+        assert!(
+            got.is_err(),
+            "the late refresh reports a signed-out session"
+        );
+        assert_eq!(logouts, 1, "the logout was sent with the token it had");
+        assert_eq!(
+            store.load().unwrap(),
+            None,
+            "rotated tokens saved back after sign_out"
+        );
+    }
+
+    struct FailingConnected;
+    impl ConnectedStore for FailingConnected {
+        fn load(&self, _: i64) -> std::collections::HashSet<String> {
+            Default::default()
+        }
+        fn add(&self, _: i64, _: &str, _: &dyn Gate) -> Result<(), String> {
+            Err("disk full".into())
+        }
+        fn remove(&self, _: i64, _: &str, _: &dyn Gate) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_connected_list_save_stays_visible_after_connect() {
+        let core = core_with(Arc::new(FailingConnected));
+        core.update(|i| {
+            i.data.machines = vec![machine("t", "org-me", "agent-browser", "running", true)];
+            i.data.me = Some(me());
+            i.data.orgs = data().orgs;
+            i.rebuild();
+        });
+        core.finish_connect(
+            Ok(connected_result("t", "0.1.11")),
+            "0.1.11",
+            core.account(),
+        )
+        .await
+        .unwrap();
+        let e = core.state().error.expect("error shown");
+        assert!(e.message.contains("disk full"), "{e:?}");
+    }
+
+    fn machine_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "m1", "name": "n", "state": "running", "revision": 1,
+            "template": {"id": "agent-browser", "version": 1, "digest": "d"},
+            "spec": {"vcpus": 2, "memMiB": 4096, "persistentDiskGiB": 10},
+            "runtime": {"ready": true}, "autoSuspendAfterSeconds": 1800,
+            "maxRunMinutes": -1, "runStartedAt": null, "cooldownUntil": null,
+            "metadata": {}, "orgId": "o1", "free": false, "operationId": null
+        })
+    }
+
+    /// A mock API for one running sandbox `m1` that can pair; `delay` slows the pairing.
+    async fn pairing_server(delay: Duration) -> (wiremock::MockServer, Url) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(machine_json()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"machines": [], "nextCursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("t3 pair"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!(
+                        {"stdout": "Token: abc123\n", "stderr": "", "exitCode": 0}
+                    ))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": "https://m1.example.test", "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        (server, base)
+    }
+
+    #[tokio::test]
+    async fn a_failed_connected_list_save_stays_visible_after_pair_again() {
+        let (_server, base) = pairing_server(Duration::ZERO).await;
+        let core = core_on(base.clone(), Arc::new(FailingConnected));
+        sign_in_as(&core, &base, 7);
+        core.pair_again("m1").await.unwrap();
+        let e = core.state().error.expect("error shown");
+        assert!(e.message.contains("disk full"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn pair_again_in_flight_during_sign_out_remembers_nothing() {
+        let (_server, base) = pairing_server(Duration::from_millis(600)).await;
+        let store = Arc::new(MemoryConnectedStore::default());
+        let core = core_on(base.clone(), store.clone());
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        let _ = call.await.unwrap();
+        // Another account signs in meanwhile.
+        sign_in_as(&core, &base, 8);
+        assert!(store.load(7).is_empty() && store.load(8).is_empty());
+        assert!(core.lock().data.connected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connect_result_after_sign_out_is_dropped() {
+        let store = Arc::new(MemoryConnectedStore::default());
+        let core = core_with(store.clone());
+        core.update(|i| i.data.me = Some(me()));
+        let started = core.account();
+        core.sign_out().await.unwrap();
+        // The same user signs in again: still a new account count.
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        sign_in_as(&core, &base, 7);
+        let before = core.state();
+        core.finish_connect(Ok(connected_result("t", "0.1.11")), "0.1.11", started)
+            .await
+            .unwrap();
+        assert!(store.load(7).is_empty(), "nothing remembered");
+        assert!(core.lock().data.connected.is_empty());
+        assert_eq!(core.state().error, before.error);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_started_for_one_account_does_not_fill_the_next() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "machines": [machine_json()], "nextCursor": null
+                    }))
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.refresh(false).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        call.await.unwrap();
+        assert!(core.lock().data.machines.is_empty(), "A's machines dropped");
+        assert_ne!(core.lock().data.connected_user, Some(7));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_connected_list_is_reported_once_and_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let (_server, base) = listing_server().await;
+        let core = core_on(
+            base.clone(),
+            Arc::new(FileConnectedStore::new(path.clone())),
+        );
+        sign_in_as(&core, &base, 7);
+        core.refresh(false).await;
+        let e = core.state().error.expect("error shown");
+        assert!(
+            e.message
+                .contains("Could not read the list of connected sandboxes"),
+            "{e:?}"
+        );
+        assert!(core.lock().data.connected.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[tokio::test]
+    async fn a_pair_again_that_fails_after_sign_out_leaves_no_error_for_the_next_account() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"error": {
+                        "code": "boom", "message": "failed", "retryable": false}}))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        assert!(call.await.unwrap().is_err(), "the caller still sees it");
+        assert_eq!(core.state().error, None, "the new account shows no error");
+    }
+
+    #[tokio::test]
+    async fn a_delete_finishing_after_an_account_switch_leaves_the_new_list_alone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({
+                        "id": "op1", "machineId": "m1", "type": "delete",
+                        "state": "succeeded", "error": null, "machine": null
+                    }))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"machines": [], "nextCursor": null})),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryConnectedStore::default());
+        store.add(8, "m1", &crate::gate::Open).unwrap();
+        let core = core_on(base.clone(), store.clone());
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.delete("m1").await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        core.update(|i| {
+            i.data.connected_user = Some(8);
+            i.data.connected.insert("m1".into());
+        });
+        let _ = call.await.unwrap();
+        assert!(store.load(8).contains("m1"), "user 8's list is untouched");
+        assert!(core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn progress_from_a_flow_of_an_old_account_is_dropped() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let old = core.account();
+        let stale = core.progress_cb(old);
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        // The old flow starts and moves its progress after the switch: nothing shows.
+        core.begin_progress("create", "creating", None, old);
+        stale(Step::Pairing);
+        assert_eq!(core.state().progress, None);
+        // The new account's own progress is not moved by the old flow's callback.
+        core.begin_progress("connect", "connecting", Some("m2".into()), core.account());
+        let before = core.state().progress;
+        stale(Step::Pairing);
+        assert_eq!(core.state().progress, before);
+    }
+
+    /// A core on `base` with a recording opener and the given stores and home.
+    fn core_full(
+        base: Url,
+        keys: Arc<MemoryKeyStore>,
+        ssh: Arc<MemorySshStore>,
+        home: PathBuf,
+    ) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
+        let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        let core = Arc::new(Core::new(
+            base,
+            keys,
+            ssh,
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(move |u| {
+                sink.lock().unwrap().push(u.to_string());
+                Ok(())
+            }),
+            Arc::new(|_| {}),
+            home,
+        ));
+        (core, opened)
+    }
+
+    #[tokio::test]
+    async fn pair_again_after_an_account_switch_opens_nothing() {
+        let (_server, base) = pairing_server(Duration::from_millis(600)).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        let _ = call.await.unwrap();
+        assert!(opened.lock().unwrap().is_empty(), "no pairing link opened");
+    }
+
+    #[tokio::test]
+    async fn sign_out_during_mcp_key_creation_saves_no_key_and_writes_no_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/keys"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"key": "ibk_new"}))
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"machines": [], "nextCursor": null})),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyStore::default());
+        let (core, _) = core_full(
+            base.clone(),
+            keys.clone(),
+            Arc::new(MemorySshStore::default()),
+            home.path().to_path_buf(),
+        );
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        let call = tokio::spawn(async move { c.add_mcp(McpClient::Codex).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        let _ = call.await.unwrap();
+        assert_eq!(keys.load().unwrap(), None, "no key saved");
+        assert!(
+            !home.path().join(".codex").exists(),
+            "no client config written"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_out_during_ssh_token_creation_saves_no_token_and_opens_no_terminal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!(
+                        {"id":"i","name":"n","host":"ssh.example.test","port":2222,
+                         "token":"ibssh_x","command":"ssh","expiresAt":"2099-01-01T00:00:00Z"}
+                    ))
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let ssh = Arc::new(MemorySshStore::default());
+        let (core, _) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            ssh.clone(),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        let c = core.clone();
+        // The token step fails before any Terminal launch, so this opens nothing.
+        let call = tokio::spawn(async move { c.open_ssh("m1").await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        core.sign_out().await.unwrap();
+        assert!(call.await.unwrap().is_err());
+        assert_eq!(ssh.load("m1").unwrap(), None, "no token saved");
+    }
+
+    // ---- account boundary: forced interleavings ----
+
+    /// The failed checks of a test with several cases, so one run reports them all.
+    #[derive(Default)]
+    struct Checks(Vec<String>);
+
+    impl Checks {
+        fn check(&mut self, ok: bool, what: impl Into<String>) {
+            if !ok {
+                self.0.push(what.into());
+            }
+        }
+
+        fn done(self) {
+            assert!(self.0.is_empty(), "failed checks:\n{}", self.0.join("\n"));
+        }
+    }
+
+    /// Runs `f` once, the first time a flow of `core` reaches the step `name`.
+    fn at_step(
+        core: &Arc<Core>,
+        name: &'static str,
+        f: impl Fn(&Arc<Core>) + Send + Sync + 'static,
+    ) {
+        let weak = Arc::downgrade(core);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        *core.hook.lock().unwrap() = Some(Arc::new(move |step: &str| {
+            if step == name
+                && !done.swap(true, std::sync::atomic::Ordering::SeqCst)
+                && let Some(c) = weak.upgrade()
+            {
+                f(&c);
+            }
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_account_switch_right_before_settle_leaves_the_new_account_alone() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        // A failure of the old account's flow is not shown to the new one.
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let old = core.account();
+        let b = base.clone();
+        at_step(&core, "settle", move |c| sign_in_as(c, &b, 8));
+        let mut c = Checks::default();
+        c.check(
+            core.settle_in::<()>(old, Err(ErrorView::other("boom")))
+                .is_err(),
+            "the caller gets its error",
+        );
+        c.check(core.account() != old, "the switch happened in between");
+        c.check(
+            core.state().error.is_none(),
+            format!("the new account shows {:?}", core.state().error),
+        );
+
+        // A success of the old account's flow does not clear the new account's error.
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let old = core.account();
+        let b = base.clone();
+        at_step(&core, "settle", move |c| {
+            sign_in_as(c, &b, 8);
+            c.update(|i| i.state.error = Some(ErrorView::other("the new account's")));
+        });
+        c.check(core.settle_in(old, Ok(())).is_ok(), "the caller gets Ok");
+        c.check(
+            core.state().error == Some(ErrorView::other("the new account's")),
+            format!("the new account's error became {:?}", core.state().error),
+        );
+        c.done();
+    }
+
+    #[tokio::test]
+    async fn an_account_switch_inside_finish_connect_leaves_the_new_account_alone() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        let mut c = Checks::default();
+        for ok in [true, false] {
+            let store = Arc::new(MemoryConnectedStore::default());
+            let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+            let sink = opened.clone();
+            let core = Arc::new(Core::new(
+                base.clone(),
+                Arc::new(MemoryKeyStore::default()),
+                Arc::new(MemorySshStore::default()),
+                store.clone(),
+                Arc::new(move |u| {
+                    sink.lock().unwrap().push(u.to_string());
+                    Ok(())
+                }),
+                Arc::new(|_| {}),
+                PathBuf::from("/nonexistent"),
+            ));
+            sign_in_as(&core, &base, 7);
+            let old = core.account();
+            core.begin_progress("connect", "pairing", Some("t".into()), old);
+            let new_progress = ProgressView {
+                kind: "create".into(),
+                step: "creating".into(),
+                machine_id: None,
+                error: None,
+            };
+            let b = base.clone();
+            let p = new_progress.clone();
+            // The switch lands after finish_connect checked the account, before it writes.
+            at_step(&core, "finish", move |c| {
+                sign_in_as(c, &b, 8);
+                c.update(|i| {
+                    i.data.machines =
+                        vec![machine("t", "org-me", "agent-browser", "running", true)];
+                    i.data.connected_user = Some(8);
+                    i.state.progress = Some(p.clone());
+                    i.rebuild();
+                });
+            });
+            let r = if ok {
+                Ok(connected_result("t", "0.1.11"))
+            } else {
+                Err(SandboxError::Timeout)
+            };
+            let _ = core.finish_connect(r, "0.1.11", old).await;
+            c.check(core.account() != old, format!("ok={ok}: no switch"));
+            let s = core.state();
+            c.check(
+                s.progress == Some(new_progress),
+                format!(
+                    "ok={ok}: the new account's progress became {:?}",
+                    s.progress
+                ),
+            );
+            c.check(
+                s.error.is_none(),
+                format!("ok={ok}: the new account shows {:?}", s.error),
+            );
+            let d = core.lock().data.clone();
+            c.check(
+                !d.t3_versions.contains_key("t"),
+                format!("ok={ok}: a T3 version was recorded"),
+            );
+            c.check(
+                !d.connected.contains("t"),
+                format!("ok={ok}: marked connected"),
+            );
+            c.check(
+                opened.lock().unwrap().is_empty(),
+                format!("ok={ok}: a link was opened"),
+            );
+            c.check(
+                store.load(7).is_empty() && store.load(8).is_empty(),
+                format!("ok={ok}: saved to the connected list"),
+            );
+        }
+        c.done();
+    }
+
+    /// A connected list whose add and remove wait for the test, then write or fail.
+    struct HeldConnected {
+        started: tokio::sync::Notify,
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+        fail: bool,
+        written: Mutex<Vec<(i64, String)>>,
+    }
+
+    impl HeldConnected {
+        fn new(fail: bool) -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let store = Arc::new(HeldConnected {
+                started: tokio::sync::Notify::new(),
+                go: Mutex::new(rx),
+                fail,
+                written: Mutex::new(Vec::new()),
+            });
+            (store, tx)
+        }
+
+        /// Like a file store: reads (here: waits), then writes through the gate.
+        fn op(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+            self.started.notify_one();
+            let _ = self.go.lock().unwrap().recv();
+            if self.fail {
+                return Err("disk full".into());
+            }
+            guarded(gate, || {
+                self.written.lock().unwrap().push((user, id.to_string()))
+            });
+            Ok(())
+        }
+    }
+
+    impl ConnectedStore for HeldConnected {
+        fn load(&self, _: i64) -> HashSet<String> {
+            HashSet::new()
+        }
+        fn add(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+            self.op(user, id, gate)
+        }
+        fn remove(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+            self.op(user, id, gate)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connected_list_change_held_up_across_an_account_switch_does_not_land() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        let mut c = Checks::default();
+        for (add, fail) in [(true, false), (false, false), (true, true), (false, true)] {
+            let (store, go) = HeldConnected::new(fail);
+            let core = core_on(base.clone(), store.clone());
+            sign_in_as(&core, &base, 7);
+            let old = core.account();
+            let flow = core.clone();
+            let task = tokio::spawn(async move {
+                if add {
+                    flow.remember("m1", old).await
+                } else {
+                    flow.forget("m1", old).await
+                }
+            });
+            // The store operation is under way; now another account signs in.
+            store.started.notified().await;
+            sign_in_as(&core, &base, 8);
+            go.send(()).unwrap();
+            task.await.unwrap();
+            let case = format!("add={add} fail={fail}");
+            let written = store.written.lock().unwrap().clone();
+            c.check(written.is_empty(), format!("{case}: landed {written:?}"));
+            let error = core.state().error;
+            c.check(error.is_none(), format!("{case}: banner {error:?}"));
+            c.check(
+                !core.lock().data.connected.contains("m1"),
+                format!("{case}: in the new account's connected set"),
+            );
+        }
+        c.done();
+    }
+
+    /// Holds a refresh call until the test lets it answer.
+    struct HeldRefresh {
+        arrived: Arc<tokio::sync::Notify>,
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+        reply: wiremock::ResponseTemplate,
+    }
+
+    impl wiremock::Respond for HeldRefresh {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.arrived.notify_one();
+            let _ = self.go.lock().unwrap().recv();
+            self.reply.clone()
+        }
+    }
+
+    fn tokens_of(access: &str, secs: i64) -> Tokens {
+        Tokens {
+            access_token: access.into(),
+            access_expires_at: Utc::now() + chrono::Duration::seconds(secs),
+            refresh_token: format!("ibr_{access}"),
+            refresh_expires_at: Utc::now() + chrono::Duration::days(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_old_sessions_refresh_after_another_sign_in_neither_saves_nor_clears() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mut c = Checks::default();
+        for status in [200u16, 401] {
+            let server = MockServer::start().await;
+            let arrived = Arc::new(tokio::sync::Notify::new());
+            let (go, held) = std::sync::mpsc::channel();
+            let reply = if status == 200 {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(tokens_of("iba_a2", 3600)).unwrap())
+            } else {
+                ResponseTemplate::new(401)
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/auth/refresh"))
+                .respond_with(HeldRefresh {
+                    arrived: arrived.clone(),
+                    go: Mutex::new(held),
+                    reply,
+                })
+                .mount(&server)
+                .await;
+            let base = Url::parse(&server.uri()).unwrap();
+            // Account A, from the last run, with an MCP key and an SSH token.
+            let store = Arc::new(MemoryStore::with(tokens_of("iba_a", 5)));
+            let keys = Arc::new(MemoryKeyStore::default());
+            keys.save("ibk_a").unwrap();
+            let ssh = Arc::new(MemorySshStore::default());
+            ssh.save("m1", &ssh_token()).unwrap();
+            let core = Arc::new(Core::new(
+                base.clone(),
+                keys.clone(),
+                ssh.clone(),
+                Arc::new(MemoryConnectedStore::default()),
+                Arc::new(|_| Ok(())),
+                Arc::new(|_| {}),
+                PathBuf::from("/nonexistent"),
+            ));
+            let a = Session::load_from(&base, None, store.clone()).unwrap();
+            assert!(core.install_session(a, core.account()));
+            // A call of account A refreshes; the server holds the answer.
+            let a = core.lock().session.clone().unwrap();
+            let call = tokio::spawn(async move { a.bearer().await });
+            arrived.notified().await;
+            // Meanwhile a device sign-in started under account A finishes for account B
+            // (the sign-in screen shows while a call reports a signed-out error).
+            let b = device_session(store.clone(), "iba_b").await;
+            core.install_signed_in(b, core.account()).unwrap();
+            // A's refresh answers only now.
+            go.send(()).unwrap();
+            let got = call.await.unwrap();
+            let saved = store.load().unwrap().map(|t| t.access_token);
+            c.check(
+                saved.as_deref() == Some("iba_b"),
+                format!("{status}: the store holds {saved:?}, not B's tokens"),
+            );
+            c.check(got.is_err(), format!("{status}: A's call got {got:?}"));
+            let current = core.lock().session.clone().unwrap();
+            let token = current.current_access_token();
+            c.check(
+                token.as_deref() == Some("iba_b"),
+                format!("{status}: the current session has {token:?}"),
+            );
+            c.check(
+                keys.load().unwrap().is_none(),
+                format!("{status}: A's MCP key is still there"),
+            );
+            c.check(
+                ssh.load("m1").unwrap().is_none(),
+                format!("{status}: A's SSH token is still there"),
+            );
+        }
+        c.done();
+    }
+
+    /// A device sign-in that finishes with `access`; its session saves into `store`.
+    async fn device_session(store: Arc<MemoryStore>, access: &str) -> Session {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/device/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::to_value(tokens_of(access, 3600)).unwrap()),
+            )
+            .mount(&server)
+            .await;
+        let start = crate::api::DeviceStart {
+            device_code: "ibd".into(),
+            user_code: "ABCD".into(),
+            verification_uri: "https://x/device".into(),
+            verification_uri_complete: None,
+            interval: 1,
+            expires_in: 900,
+        };
+        let base = Url::parse(&server.uri()).unwrap();
+        auth::poll_with(&base, &start, store, |_| std::future::ready(()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_from_before_another_account_change_is_not_installed() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        let store = Arc::new(MemoryStore::default());
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        let since = core.account();
+        let a = device_session(store.clone(), "iba_a").await;
+        let b = device_session(store.clone(), "iba_b").await;
+        assert_eq!(store.load().unwrap(), None, "a poll saves nothing");
+        core.install_signed_in(a, since).unwrap();
+        // B's sign-in began before A's finished: it changes nothing.
+        assert_eq!(core.install_signed_in(b, since), Err(account_changed()));
+        let current = || core.lock().session.clone().unwrap().current_access_token();
+        assert_eq!(store.load().unwrap().unwrap().access_token, "iba_a");
+        assert_eq!(current().as_deref(), Some("iba_a"));
+        // Nor does the session the last run saved, read while A signed in.
+        let saved = Arc::new(MemoryStore::with(tokens_of("iba_old", 3600)));
+        let old = Session::load_from(&base, None, saved).unwrap();
+        assert!(!core.install_session(old, since));
+        assert_eq!(current().as_deref(), Some("iba_a"));
+        assert_eq!(store.load().unwrap().unwrap().access_token, "iba_a");
+    }
+
+    /// Waits for the sign-in screen, then checks that the account ended in full: a new
+    /// account count and no tokens, MCP key or SSH token left.
+    async fn assert_account_ended(
+        core: &Core,
+        before: u64,
+        stores: (&MemoryStore, &MemoryKeyStore, &MemorySshStore),
+        signed_out: &tokio::sync::Notify,
+    ) {
+        let (store, keys, ssh) = stores;
+        let wait = tokio::time::timeout(Duration::from_secs(3), signed_out.notified());
+        let mut c = Checks::default();
+        c.check(wait.await.is_ok(), "the sign-in screen was never shown");
+        c.check(!core.state().signed_in, "still signed in");
+        c.check(core.account() != before, "the account count did not move");
+        c.check(store.load().unwrap().is_none(), "tokens kept");
+        c.check(keys.load().unwrap().is_none(), "its MCP key is still there");
+        c.check(
+            ssh.load("a").unwrap().is_none(),
+            "its SSH token is still there",
+        );
+        c.done();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_401_during_agent_status_ends_the_account_on_its_own() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(machine_json()))
+            .mount(&server)
+            .await;
+        // The status exec gets 401, and so does the refresh it triggers.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh, signed_out) = core_with_session(&server.uri(), tokens());
+        let before = core.account();
+        // The command turns the failed exec into "not signed in" and settles nothing.
+        assert_eq!(core.agent_status("m1", Agent::Codex).await, Ok(false));
+        assert_account_ended(&core, before, (&store, &keys, &ssh), &signed_out).await;
+    }
+
+    #[tokio::test]
+    async fn a_replaced_sessions_late_401_leaves_the_new_session_alone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (go, held) = std::sync::mpsc::channel();
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(HeldRefresh {
+                arrived: arrived.clone(),
+                go: Mutex::new(held),
+                reply: ResponseTemplate::new(401),
+            })
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh, signed_out) =
+            core_with_session(&server.uri(), tokens_of("iba_a", 5));
+        let watcher_ran = Arc::new(tokio::sync::Notify::new());
+        let w = watcher_ran.clone();
+        at_step(&core, "session ended", move |_| w.notify_one());
+        // A call of account A refreshes; the server holds the answer.
+        let a = core.lock().session.clone().unwrap();
+        let call = tokio::spawn(async move { a.bearer().await });
+        arrived.notified().await;
+        // Account B signs in, then gets its own MCP key and SSH token.
+        let b = device_session(store.clone(), "iba_b").await;
+        let after_b = core.install_signed_in(b, core.account()).unwrap();
+        keys.save("ibk_b").unwrap();
+        ssh.save("b1", &ssh_token()).unwrap();
+        // A's watcher saw A end with the replacement.
+        let ran = tokio::time::timeout(Duration::from_secs(3), watcher_ran.notified()).await;
+        assert!(ran.is_ok(), "A's watcher never ran");
+        // A's refresh gets its 401 only now.
+        go.send(()).unwrap();
+        assert!(call.await.unwrap().is_err());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let shown = tokio::time::timeout(Duration::from_millis(200), signed_out.notified()).await;
+        let token = core.lock().session.clone().unwrap().current_access_token();
+        let saved = store.load().unwrap().map(|t| t.access_token);
+        let mut c = Checks::default();
+        c.check(shown.is_err(), "the sign-in screen was shown");
+        c.check(core.state().signed_in, "B was signed out");
+        c.check(core.account() == after_b, "the account count moved");
+        c.check(
+            token.as_deref() == Some("iba_b"),
+            format!("session has {token:?}"),
+        );
+        c.check(
+            saved.as_deref() == Some("iba_b"),
+            format!("store holds {saved:?}"),
+        );
+        c.check(keys.load().unwrap().is_some(), "B's MCP key is gone");
+        c.check(ssh.load("b1").unwrap().is_some(), "B's SSH token is gone");
+        c.done();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_401_during_a_background_refresh_ends_the_account_on_its_own() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        // The token is about to expire: the machines read refreshes first and gets 401.
+        let mut tok = tokens();
+        tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
+        let (core, store, keys, ssh, signed_out) = core_with_session(&server.uri(), tok);
+        let before = core.account();
+        // What the refresh loop runs; no command is running.
+        core.refresh(false).await;
+        assert_account_ended(&core, before, (&store, &keys, &ssh), &signed_out).await;
     }
 }

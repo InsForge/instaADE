@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::api::{Client, ExecRequest, ExecResult};
+use crate::gate::{Gate, guarded};
 use crate::sandbox::ensure_running;
 use crate::ssh::{self, SshTokenStore};
 
@@ -147,16 +148,29 @@ pub async fn sign_in(
     id: &str,
     agent: Agent,
     open_url: impl Fn(&str) -> Result<()>,
+    gate: &dyn Gate,
 ) -> Result<()> {
-    sign_in_with(client, store, id, agent, open_url, &SshSpawner, TIMING).await
+    sign_in_with(
+        client,
+        store,
+        id,
+        agent,
+        open_url,
+        gate,
+        &SshSpawner,
+        TIMING,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sign_in_with(
     client: &Client,
     store: &dyn SshTokenStore,
     id: &str,
     agent: Agent,
     open_url: impl Fn(&str) -> Result<()>,
+    gate: &dyn Gate,
     spawner: &dyn ForwardSpawner,
     timing: Timing,
 ) -> Result<()> {
@@ -172,7 +186,10 @@ async fn sign_in_with(
     if dir.is_empty() {
         bail!("The {} login did not start on the sandbox", agent.label());
     }
-    let result = finish(client, store, id, agent, &open_url, spawner, timing, &dir).await;
+    let result = finish(
+        client, store, id, agent, &open_url, gate, spawner, timing, &dir,
+    )
+    .await;
     // Best effort: drop the temp dir and stop a login nobody finished. The bracket keeps
     // pkill from matching this command's own shell.
     let login = agent.login();
@@ -192,6 +209,7 @@ async fn finish(
     id: &str,
     agent: Agent,
     open_url: &impl Fn(&str) -> Result<()>,
+    gate: &dyn Gate,
     spawner: &dyn ForwardSpawner,
     timing: Timing,
     dir: &str,
@@ -212,12 +230,14 @@ async fn finish(
         tokio::time::sleep(timing.url_poll).await;
     };
     let port = callback_port(&url).ok_or_else(|| anyhow!("This login has no local callback"))?;
-    let token = ssh::token(client, store, id).await?;
+    let token = ssh::token(client, store, id, gate).await?;
     // Dropped on every exit from here on, which ends the forward.
-    let mut forward = spawner
-        .spawn(port, &ssh::forward_args(&token, port))
-        .with_context(|| format!("Could not forward port {port} for the login"))?;
-    open_url(&url)?;
+    let mut forward = guarded(gate, || {
+        spawner.spawn(port, &ssh::forward_args(&token, port))
+    })
+    .ok_or_else(account_changed)?
+    .with_context(|| format!("Could not forward port {port} for the login"))?;
+    guarded(gate, || open_url(&url)).ok_or_else(account_changed)??;
     let waiting = Instant::now();
     loop {
         tokio::time::sleep(timing.status_poll).await;
@@ -236,6 +256,10 @@ async fn finish(
             bail!("Sign-in timed out");
         }
     }
+}
+
+fn account_changed() -> anyhow::Error {
+    anyhow!("The account changed. Nothing was done.")
 }
 
 /// The port of a `redirect_uri=http://localhost:<port>/...` (or 127.0.0.1) parameter.
@@ -500,6 +524,15 @@ mod tests {
 
     /// Runs the flow against a mock sandbox. Events (execs, SPAWN, OPEN) land in `log`.
     async fn flow(setup: Setup, spawner: &FakeSpawner, log: &Log) -> Result<()> {
+        flow_gated(setup, spawner, log, &crate::gate::Open).await
+    }
+
+    async fn flow_gated(
+        setup: Setup,
+        spawner: &FakeSpawner,
+        log: &Log,
+        gate: &dyn Gate,
+    ) -> Result<()> {
         let server = MockServer::start().await;
         mount_common(&server).await;
         Mock::given(method("POST"))
@@ -524,6 +557,7 @@ mod tests {
                 }
                 Ok(())
             },
+            gate,
             spawner,
             TIMING,
         )
@@ -535,6 +569,25 @@ mod tests {
             log: log.clone(),
             ..Default::default()
         }
+    }
+
+    struct ClosedGate;
+    impl Gate for ClosedGate {
+        fn run(&self, _: &mut dyn FnMut()) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_opens_no_browser_and_forwards_no_port() {
+        let log = Log::default();
+        let spawner = fake(&log);
+        let err = flow_gated(Setup::default(), &spawner, &log, &ClosedGate)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("account changed"), "{err}");
+        assert_eq!(opens(&tags(&log)), 0, "no browser");
+        assert!(spawner.ports.lock().unwrap().is_empty(), "no forward");
     }
 
     fn opens(t: &[String]) -> usize {

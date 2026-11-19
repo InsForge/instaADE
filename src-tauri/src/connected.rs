@@ -9,11 +9,19 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
+use crate::gate::{Gate, Open, guarded};
+
+/// Every write goes through the caller's gate, right when it happens: a change of a flow whose
+/// account has changed since is not written, and that is not an error.
 pub trait ConnectedStore: Send + Sync {
     /// The sandboxes `user` connected from this computer.
     fn load(&self, user: i64) -> HashSet<String>;
-    fn add(&self, user: i64, id: &str) -> Result<(), String>;
-    fn remove(&self, user: i64, id: &str) -> Result<(), String>;
+    /// Like `load`, but says why the list could not be read. The list is empty then.
+    fn load_checked(&self, user: i64, _gate: &dyn Gate) -> Result<HashSet<String>, String> {
+        Ok(self.load(user))
+    }
+    fn add(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String>;
+    fn remove(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String>;
 }
 
 type ByUser = BTreeMap<String, BTreeSet<String>>;
@@ -41,17 +49,35 @@ impl FileConnectedStore {
     }
 
     /// The map on disk. A flat list from an older build belongs to `user`, the first user
-    /// signed in to read it; the flag says it must be written back as a map.
-    fn read(&self, user: i64) -> (ByUser, bool) {
-        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+    /// signed in to read it; the flag says it must be written back as a map. A missing file
+    /// is an empty map. Any other read problem, or text that is not either format, is an
+    /// error, so a caller never writes over a file it could not understand.
+    fn read(&self, user: i64) -> Result<(ByUser, bool), String> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((ByUser::new(), false));
+            }
+            Err(e) => return Err(self.unreadable(&e.to_string())),
+        };
+        if text.trim().is_empty() {
+            return Ok((ByUser::new(), false));
+        }
         match serde_json::from_str::<OnDisk>(&text) {
-            Ok(OnDisk::ByUser(m)) => (m, false),
+            Ok(OnDisk::ByUser(m)) => Ok((m, false)),
             Ok(OnDisk::Flat(ids)) => {
                 let set: BTreeSet<String> = ids.into_iter().collect();
-                (BTreeMap::from([(user.to_string(), set)]), true)
+                Ok((BTreeMap::from([(user.to_string(), set)]), true))
             }
-            Err(_) => (ByUser::new(), false),
+            Err(e) => Err(self.unreadable(&e.to_string())),
         }
+    }
+
+    fn unreadable(&self, reason: &str) -> String {
+        format!(
+            "Could not read the list of connected sandboxes ({}): {reason}. It was left unchanged.",
+            self.path.display()
+        )
     }
 
     /// Writes a temp file, then renames it over the real one.
@@ -65,21 +91,22 @@ impl FileConnectedStore {
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
 
-    /// Reads, lets `f` change the user's set, and writes when anything changed.
+    /// Reads, lets `f` change the user's set, and writes through `gate` when anything changed.
     fn change(
         &self,
         user: i64,
+        gate: &dyn Gate,
         f: impl FnOnce(&mut BTreeSet<String>) -> bool,
     ) -> Result<(), String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut map, migrated) = self.read(user);
+        let (mut map, migrated) = self.read(user)?;
         let set = map.entry(user.to_string()).or_default();
         let changed = f(set);
         if set.is_empty() {
             map.remove(&user.to_string());
         }
         if changed || migrated {
-            self.write(&map)?;
+            guarded(gate, || self.write(&map)).unwrap_or(Ok(()))?;
         }
         Ok(())
     }
@@ -87,23 +114,28 @@ impl FileConnectedStore {
 
 impl ConnectedStore for FileConnectedStore {
     fn load(&self, user: i64) -> HashSet<String> {
+        self.load_checked(user, &Open).unwrap_or_default()
+    }
+
+    fn load_checked(&self, user: i64, gate: &dyn Gate) -> Result<HashSet<String>, String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (map, migrated) = self.read(user);
+        let (map, migrated) = self.read(user)?;
         if migrated {
-            // Best effort: a failed write migrates again on the next load.
-            let _ = self.write(&map);
+            // Best effort: a failed or skipped write migrates again on the next load.
+            let _ = guarded(gate, || self.write(&map));
         }
-        map.get(&user.to_string())
+        Ok(map
+            .get(&user.to_string())
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
-    fn add(&self, user: i64, id: &str) -> Result<(), String> {
-        self.change(user, |s| s.insert(id.to_string()))
+    fn add(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+        self.change(user, gate, |s| s.insert(id.to_string()))
     }
 
-    fn remove(&self, user: i64, id: &str) -> Result<(), String> {
-        self.change(user, |s| s.remove(id))
+    fn remove(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+        self.change(user, gate, |s| s.remove(id))
     }
 }
 
@@ -120,19 +152,23 @@ impl ConnectedStore for MemoryConnectedStore {
             .cloned()
             .unwrap_or_default()
     }
-    fn add(&self, user: i64, id: &str) -> Result<(), String> {
-        self.0
-            .lock()
-            .unwrap()
-            .entry(user)
-            .or_default()
-            .insert(id.to_string());
+    fn add(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+        guarded(gate, || {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(user)
+                .or_default()
+                .insert(id.to_string());
+        });
         Ok(())
     }
-    fn remove(&self, user: i64, id: &str) -> Result<(), String> {
-        if let Some(s) = self.0.lock().unwrap().get_mut(&user) {
-            s.remove(id);
-        }
+    fn remove(&self, user: i64, id: &str, gate: &dyn Gate) -> Result<(), String> {
+        guarded(gate, || {
+            if let Some(s) = self.0.lock().unwrap().get_mut(&user) {
+                s.remove(id);
+            }
+        });
         Ok(())
     }
 }
@@ -151,12 +187,12 @@ mod tests {
         let path = dir.path().join("sub").join("connected.json");
         let store = FileConnectedStore::new(path.clone());
         assert!(store.load(7).is_empty(), "missing file is empty");
-        store.add(7, "m1").unwrap();
-        store.add(7, "m2").unwrap();
-        store.add(7, "m1").unwrap();
+        store.add(7, "m1", &Open).unwrap();
+        store.add(7, "m2", &Open).unwrap();
+        store.add(7, "m1", &Open).unwrap();
         let again = FileConnectedStore::new(path.clone());
         assert_eq!(again.load(7), set(&["m1", "m2"]));
-        again.remove(7, "m1").unwrap();
+        again.remove(7, "m1", &Open).unwrap();
         assert_eq!(FileConnectedStore::new(path).load(7), set(&["m2"]));
     }
 
@@ -165,8 +201,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connected.json");
         let store = FileConnectedStore::new(path.clone());
-        store.add(7, "m1").unwrap();
-        store.add(8, "m2").unwrap();
+        store.add(7, "m1", &Open).unwrap();
+        store.add(8, "m2", &Open).unwrap();
         assert_eq!(store.load(7), set(&["m1"]));
         assert_eq!(store.load(8), set(&["m2"]));
         assert!(store.load(9).is_empty());
@@ -190,13 +226,94 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_file_reads_as_empty() {
+    fn a_corrupt_file_is_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connected.json");
-        std::fs::write(&path, "not json").unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        let store = FileConnectedStore::new(path.clone());
+        assert!(store.load(7).is_empty());
+        let err = store.add(7, "m1", &Open).unwrap_err();
+        assert!(err.contains("Could not read the list of connected sandboxes"));
+        assert!(err.contains("It was left unchanged."));
+        assert!(store.remove(7, "m1", &Open).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        let original = r#"{"8":["m9"]}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            eprintln!("skipped: running as root, file permissions do not apply");
+            return;
+        }
+        let store = FileConnectedStore::new(path.clone());
+        assert!(store.load(7).is_empty());
+        assert!(store.add(7, "m1", &Open).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn an_empty_file_counts_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, "  \n").unwrap();
         let store = FileConnectedStore::new(path);
         assert!(store.load(7).is_empty());
-        store.add(7, "m1").unwrap();
-        assert_eq!(store.load(7).len(), 1);
+        store.add(7, "m1", &Open).unwrap();
+        assert_eq!(store.load(7), set(&["m1"]));
+    }
+
+    #[test]
+    fn a_missing_file_is_created_by_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        let store = FileConnectedStore::new(path.clone());
+        store.add(7, "m1", &Open).unwrap();
+        assert_eq!(store.load(7), set(&["m1"]));
+    }
+
+    struct Closed;
+    impl Gate for Closed {
+        fn run(&self, _: &mut dyn FnMut()) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_closed_gate_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        let original = r#"{"7":["a1"]}"#;
+        std::fs::write(&path, original).unwrap();
+        let store = FileConnectedStore::new(path.clone());
+        store.add(7, "a2", &Closed).unwrap();
+        store.remove(7, "a1", &Closed).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // An older build's flat list is not rewritten through a closed gate either.
+        let flat = r#"["m1"]"#;
+        std::fs::write(&path, flat).unwrap();
+        assert_eq!(store.load_checked(7, &Closed).unwrap(), set(&["m1"]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), flat);
+        let memory = MemoryConnectedStore::default();
+        memory.add(7, "m1", &Closed).unwrap();
+        assert!(memory.load(7).is_empty());
+    }
+
+    #[test]
+    fn add_keeps_other_users_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, r#"{"7":["a1"],"8":["b1","b2"]}"#).unwrap();
+        let store = FileConnectedStore::new(path.clone());
+        store.add(7, "a2", &Open).unwrap();
+        assert_eq!(store.load(7), set(&["a1", "a2"]));
+        assert_eq!(store.load(8), set(&["b1", "b2"]));
     }
 }

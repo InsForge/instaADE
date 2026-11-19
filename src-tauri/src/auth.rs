@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use url::Url;
 
 use crate::api::{self, ApiErrorBody, Credentials, DeviceStart, Tokens};
@@ -18,7 +18,7 @@ const KEYCHAIN_ACCOUNT: &str = "tokens";
 const REFRESH_MARGIN_SECS: i64 = 60;
 const SLOW_DOWN_SECS: u64 = 5;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Sign-out waits this long at most for the server.
+/// The background logout call gives up after this long.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,10 +138,18 @@ struct Stored {
     http: reqwest::Client,
     store: Arc<dyn TokenStore>,
     tokens: Mutex<Tokens>,
+    /// A copy of the current access token, readable while a refresh holds `tokens`.
+    access: StdMutex<String>,
+    /// Taken around "check `dead`, then save" and "set `dead`, then clear", so a refresh
+    /// that finishes after a sign-out can never write tokens back.
+    gate: StdMutex<()>,
     /// Counts completed refreshes; lets a waiting caller see that another refreshed.
     generation: AtomicU64,
-    /// Set when the server ended the session (refresh answered 401).
+    /// Set when the session ends: the user signed out, another session replaced it, or a
+    /// refresh answered 401.
     dead: AtomicBool,
+    /// Turns true when `dead` is set, so the app learns of an end it did not cause.
+    ended: watch::Sender<bool>,
     /// The last failure to save rotated tokens; the running session still works.
     save_error: StdMutex<Option<String>>,
 }
@@ -249,12 +257,13 @@ pub async fn start(base: &Url, provider: Provider) -> Result<DeviceStart> {
     Ok(post(&http_client(), url, body).await?)
 }
 
-/// Polls until the user approves, then stores the tokens in the keychain.
+/// Polls until the user approves. The session's tokens are not saved yet: the app saves them
+/// with `Session::save` when the session becomes the account (see `gate`).
 pub async fn poll(base: &Url, start: &DeviceStart) -> Result<Session> {
     poll_with(base, start, Arc::new(KeyringStore), tokio::time::sleep).await
 }
 
-/// `poll` with an injected store and sleep function.
+/// `poll` with an injected store and sleep function. `store` is where the session saves.
 pub async fn poll_with<S, Fut>(
     base: &Url,
     start: &DeviceStart,
@@ -278,10 +287,7 @@ where
         waited += interval;
         let body = serde_json::json!({ "deviceCode": start.device_code });
         match post::<Tokens>(&http, url.clone(), body).await {
-            Ok(tokens) => {
-                store.save(&tokens).map_err(Error::Store)?;
-                return Ok(Session::from_tokens(base.clone(), http, store, tokens));
-            }
+            Ok(tokens) => return Ok(Session::from_tokens(base.clone(), http, store, tokens)),
             Err(e) if e.code == "authorization_pending" => {}
             Err(e) if e.code == "slow_down" => interval += SLOW_DOWN_SECS,
             Err(e) if e.code == "expired_token" => return Err(Error::Expired),
@@ -305,9 +311,12 @@ impl Session {
                 base,
                 http,
                 store,
+                access: StdMutex::new(tokens.access_token.clone()),
+                gate: StdMutex::new(()),
                 tokens: Mutex::new(tokens),
                 generation: AtomicU64::new(0),
                 dead: AtomicBool::new(false),
+                ended: watch::channel(false).0,
                 save_error: StdMutex::new(None),
             })),
         }
@@ -347,6 +356,15 @@ impl Session {
         }
     }
 
+    /// Turns true when the session ends, for whatever reason. None for an API key, which
+    /// never ends.
+    pub fn ended(&self) -> Option<watch::Receiver<bool>> {
+        match &self.kind {
+            Kind::ApiKey(_) => None,
+            Kind::Tokens(s) => Some(s.ended.subscribe()),
+        }
+    }
+
     /// The last failure to save rotated tokens, if any. The session keeps working
     /// in memory, but the user must sign in again after a restart.
     pub fn store_error(&self) -> Option<String> {
@@ -356,35 +374,84 @@ impl Session {
         }
     }
 
-    /// Ends the session on the server (`POST /v1/auth/logout`), so its tokens stop working
-    /// everywhere. Best effort: any failure is ignored, and an API key has no session to end.
-    pub async fn logout(&self) {
-        let Kind::Tokens(s) = &self.kind else { return };
-        let Ok(token) = self.bearer().await else {
-            return;
-        };
-        let Ok(url) = endpoint(&s.base, &["logout"]) else {
-            return;
-        };
-        let _ = s
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .timeout(LOGOUT_TIMEOUT)
-            .send()
-            .await;
+    /// The access token as it is now, without a refresh and without waiting for one, even
+    /// while a refresh is running. None for an API key or an ended session.
+    pub fn current_access_token(&self) -> Option<String> {
+        match &self.kind {
+            Kind::ApiKey(_) => None,
+            Kind::Tokens(s) => {
+                if s.dead.load(Ordering::SeqCst) {
+                    return None;
+                }
+                Some(s.access.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            }
+        }
     }
 
-    /// Forgets the saved tokens.
+    /// Saves the session's tokens: a device sign-in's session as it becomes the account.
+    pub fn save(&self) -> Result<()> {
+        match &self.kind {
+            Kind::ApiKey(_) => Ok(()),
+            Kind::Tokens(s) => {
+                let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if s.dead.load(Ordering::SeqCst) {
+                    return Err(Error::Store("the session already ended".into()));
+                }
+                // A refresh that holds the tokens saves them itself when it is done.
+                match s.tokens.try_lock() {
+                    Ok(cur) => s.store.save(&cur).map_err(Error::Store),
+                    Err(_) => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Ends the session here and leaves the token store alone: another session's tokens go
+    /// there next. A refresh still running neither saves nor clears after this.
+    pub fn retire(&self) {
+        if let Kind::Tokens(s) = &self.kind {
+            let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+            s.end();
+        }
+    }
+
+    /// Ends the session here and forgets the saved tokens.
     pub fn sign_out(&self) -> Result<()> {
         match &self.kind {
             Kind::ApiKey(_) => Ok(()),
-            Kind::Tokens(s) => s.store.clear().map_err(Error::Store),
+            Kind::Tokens(s) => {
+                // End the session first: a refresh still running must not save again.
+                let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+                s.end();
+                s.store.clear().map_err(Error::Store)
+            }
         }
     }
 }
 
+/// Ends a session on the server (`POST /v1/auth/logout`) with `token`, so its tokens stop
+/// working everywhere. Best effort: the whole call is bounded and any failure is ignored.
+pub async fn logout_with(base: &Url, token: &str) {
+    let Ok(url) = endpoint(base, &["logout"]) else {
+        return;
+    };
+    let call = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .timeout(LOGOUT_TIMEOUT)
+        .send();
+    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, call).await;
+}
+
 impl Stored {
+    /// Marks the session ended and tells whoever watches it. The caller holds `gate`.
+    /// True when this call ended it.
+    fn end(&self) -> bool {
+        let first = !self.dead.swap(true, Ordering::SeqCst);
+        self.ended.send_replace(true);
+        first
+    }
+
     /// Refreshes while the caller holds the token lock. Rotated tokens go to the store.
     async fn refresh_locked(&self, cur: &mut Tokens) -> api::Result<String> {
         if self.dead.load(Ordering::SeqCst) {
@@ -394,17 +461,26 @@ impl Stored {
         let body = serde_json::json!({ "refreshToken": cur.refresh_token });
         match post::<Tokens>(&self.http, url, body).await {
             Ok(new) => {
+                let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if self.dead.load(Ordering::SeqCst) {
+                    // Signed out while the call ran: keep nothing.
+                    return Err(signed_out());
+                }
                 // Keep the new tokens first: the old refresh token is already revoked.
                 *cur = new;
+                *self.access.lock().unwrap_or_else(|e| e.into_inner()) = cur.access_token.clone();
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 *self.save_error.lock().unwrap() = self.store.save(cur).err();
                 Ok(cur.access_token.clone())
             }
             Err(e) => {
                 if e.status == 401 {
-                    // The session is over: never send this refresh token again.
-                    self.dead.store(true, Ordering::SeqCst);
-                    let _ = self.store.clear();
+                    // The session is over: never send this refresh token again. After a
+                    // sign-out the store may belong to a newer account: leave it alone.
+                    let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                    if self.end() {
+                        let _ = self.store.clear();
+                    }
                 }
                 Err(e)
             }
@@ -436,6 +512,10 @@ impl Credentials for Session {
         };
         let seen = s.generation.load(Ordering::SeqCst);
         let mut cur = s.tokens.lock().await;
+        if s.dead.load(Ordering::SeqCst) {
+            // Signed out while this retry waited: hand out no token.
+            return Err(signed_out());
+        }
         if s.generation.load(Ordering::SeqCst) != seen {
             // Another caller refreshed while we waited for the lock.
             return Ok(cur.access_token.clone());
@@ -561,6 +641,8 @@ mod tests {
         // 5 s, 5 s (after pending), then 10 s (slow_down grew the interval by 5).
         assert_eq!(*log.lock().unwrap(), vec![5, 5, 10]);
         assert_eq!(session.bearer().await.unwrap(), "iba_1");
+        assert!(store.load().unwrap().is_none(), "saved only by save()");
+        session.save().unwrap();
         assert_eq!(store.load().unwrap().unwrap(), done);
     }
 
@@ -780,47 +862,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_ends_the_server_session_with_the_access_token() {
+    async fn logout_with_sends_the_given_token_and_ignores_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/auth/logout"))
             .and(wiremock::matchers::header("authorization", "Bearer iba_1"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let base = Url::parse(&server.uri()).unwrap();
-        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
-        Session::load_from(&base, None, store)
-            .unwrap()
-            .logout()
-            .await;
-    }
-
-    #[tokio::test]
-    async fn logout_ignores_a_failure_and_an_api_key_never_calls() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/auth/logout"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&server)
             .await;
         let base = Url::parse(&server.uri()).unwrap();
-        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
-        Session::load_from(&base, None, store)
-            .unwrap()
-            .logout()
-            .await;
-        Session::load_from(
+        logout_with(&base, "iba_1").await;
+    }
+
+    #[test]
+    fn current_access_token_is_none_for_an_api_key() {
+        let base = Url::parse("http://127.0.0.1:1").unwrap();
+        let key = Session::load_from(
             &base,
             Some("ibk_x".into()),
             Arc::new(MemoryStore::default()),
         )
-        .unwrap()
-        .logout()
-        .await;
-        // Dropping the server checks expect(1): the API key session sent nothing.
+        .unwrap();
+        assert_eq!(key.current_access_token(), None);
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let s = Session::load_from(&base, None, store).unwrap();
+        assert_eq!(s.current_access_token().as_deref(), Some("iba_1"));
     }
 
     #[test]
@@ -831,5 +898,115 @@ mod tests {
         let session = Session::load_from(&base, None, store.clone()).unwrap();
         session.sign_out().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_old_sessions_401_after_sign_out_leaves_a_newer_store_alone() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_millis(500)))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 5)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let s2 = session.clone();
+        let call = tokio::spawn(async move { s2.bearer().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.sign_out().unwrap();
+        // Another account signs in and saves into the same single store.
+        store.save(&tokens("iba_new", "ibr_new", 3600)).unwrap();
+        assert!(call.await.unwrap().is_err());
+        assert_eq!(store.load().unwrap().unwrap().access_token, "iba_new");
+    }
+
+    #[tokio::test]
+    async fn every_end_of_a_session_tells_its_watchers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let session = |secs| {
+            let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", secs)));
+            Session::load_from(&base, None, store).unwrap()
+        };
+        // The server ends it: a refresh answers 401.
+        let s = session(5);
+        let ended = s.ended().unwrap();
+        assert!(!*ended.borrow());
+        assert!(s.bearer().await.is_err());
+        assert!(*ended.borrow(), "a refresh 401");
+        let s = session(3600);
+        let ended = s.ended().unwrap();
+        s.retire();
+        assert!(*ended.borrow(), "replaced");
+        let s = session(3600);
+        let ended = s.ended().unwrap();
+        s.sign_out().unwrap();
+        assert!(*ended.borrow(), "signed out");
+        let key = Session::load_from(&base, Some("ibk".into()), Arc::new(MemoryStore::default()));
+        assert!(key.unwrap().ended().is_none(), "an API key never ends");
+    }
+
+    #[tokio::test]
+    async fn a_queued_retry_gets_the_signed_out_error_after_sign_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let Kind::Tokens(s) = &session.kind else {
+            unreachable!()
+        };
+        // Stand in for a refresh in progress: hold the token lock.
+        let held = s.tokens.lock().await;
+        let waiter = session.clone();
+        let call = tokio::spawn(async move { waiter.refreshed().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // That refresh finishes (generation moves), then the user signs out.
+        s.generation.fetch_add(1, Ordering::SeqCst);
+        session.sign_out().unwrap();
+        drop(held);
+        let err = call.await.unwrap().unwrap_err();
+        assert_eq!(err.code, "unauthenticated", "no token for the retry");
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_client_request_that_got_401_is_not_retried_after_sign_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_millis(300)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let client = api::Client::new(base.clone(), session.clone());
+        let call = tokio::spawn(async move { client.me().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Kind::Tokens(s) = &session.kind else {
+            unreachable!()
+        };
+        // A refresh in progress holds the token lock while the 401 comes back.
+        let held = s.tokens.lock().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.generation.fetch_add(1, Ordering::SeqCst);
+        session.sign_out().unwrap();
+        drop(held);
+        let err = call.await.unwrap().unwrap_err();
+        assert_eq!(err.code, "unauthenticated");
+        // Dropping the server checks the request was sent once, never retried.
     }
 }

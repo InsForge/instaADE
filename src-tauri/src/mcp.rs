@@ -12,6 +12,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::api::Client;
+use crate::gate::{Gate, guarded};
 use crate::process::{RunError, run_bounded};
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
@@ -240,13 +241,15 @@ pub fn claude_installed() -> bool {
 }
 
 /// Adds the instabox MCP server at `url` to `client`, creating the API key in `keys` on
-/// first use.
+/// first use. Saving the key, writing the Codex config and the whole `claude mcp add` run
+/// happen inside `gate`.
 pub async fn add(
     api: &Client,
     url: &str,
     home: &Path,
     client: McpClient,
     keys: Arc<dyn KeyStore>,
+    gate: Arc<dyn Gate>,
 ) -> Result<()> {
     let api_key_session = std::env::var("INSTABOX_API_KEY").is_ok_and(|k| !k.is_empty());
     add_with(
@@ -257,10 +260,12 @@ pub async fn add(
         keys,
         Arc::new(SystemRunner),
         api_key_session,
+        gate,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn add_with(
     api: &Client,
     url: &str,
@@ -269,6 +274,7 @@ pub async fn add_with(
     keys: Arc<dyn KeyStore>,
     runner: Arc<dyn CliRunner>,
     api_key_session: bool,
+    gate: Arc<dyn Gate>,
 ) -> Result<()> {
     if client == McpClient::ClaudeCode {
         let r = runner.clone();
@@ -285,13 +291,16 @@ pub async fn add_with(
     {
         return Ok(());
     }
-    let key = api_key(api, keys.as_ref(), api_key_session).await?;
+    let key = api_key(api, keys.as_ref(), api_key_session, &*gate).await?;
     match client {
         McpClient::ClaudeCode => {
+            // The whole command runs inside the gate, on its own thread: an account change
+            // waits for it (at most CLI_TIMEOUT), and after one it never starts.
             let args = add_args(url, &key);
-            let out = tokio::task::spawn_blocking(move || runner.run(&args))
+            let out = tokio::task::spawn_blocking(move || guarded(&*gate, || runner.run(&args)))
                 .await
                 .context("claude add failed")?
+                .ok_or_else(account_changed)?
                 .map_err(|e| match e {
                     CliError::NotFound => anyhow!("Claude Code is not installed"),
                     CliError::Failed(m) => anyhow!("claude mcp add failed: {m}"),
@@ -301,8 +310,14 @@ pub async fn add_with(
             }
             Ok(())
         }
-        McpClient::Codex => write_codex(home, url, &key),
+        McpClient::Codex => {
+            guarded(&*gate, || write_codex(home, url, &key)).ok_or_else(account_changed)?
+        }
     }
+}
+
+fn account_changed() -> anyhow::Error {
+    anyhow!("The account changed. Nothing was done.")
 }
 
 /// True when `mcp_servers.instabox` exists in any form (table, inline table, stdio or http).
@@ -325,7 +340,12 @@ fn read_codex(path: &Path) -> Result<Option<toml_edit::DocumentMut>> {
 }
 
 /// The stored key, or a new one. An API-key session cannot create keys.
-async fn api_key(api: &Client, keys: &dyn KeyStore, api_key_session: bool) -> Result<String> {
+async fn api_key(
+    api: &Client,
+    keys: &dyn KeyStore,
+    api_key_session: bool,
+    gate: &dyn Gate,
+) -> Result<String> {
     if let Some(k) = keys.load().map_err(|e| anyhow!("keychain: {e}"))? {
         return Ok(k);
     }
@@ -333,7 +353,9 @@ async fn api_key(api: &Client, keys: &dyn KeyStore, api_key_session: bool) -> Re
         bail!("Sign in to add MCP");
     }
     let created = api.create_api_key(KEY_NAME, &KEY_SCOPES, KEY_DAYS).await?;
-    keys.save(&created.key)
+    // After a sign-out the new key is neither saved nor used.
+    guarded(gate, || keys.save(&created.key))
+        .ok_or_else(account_changed)?
         .map_err(|e| anyhow!("keychain: {e}"))?;
     Ok(created.key)
 }
@@ -402,6 +424,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::api::{Credentials, Result as ApiResult};
+    use crate::gate::Open;
     use async_trait::async_trait;
     use url::Url;
     use wiremock::matchers::{body_json, method, path};
@@ -474,6 +497,7 @@ mod tests {
             keys,
             Arc::new(Fake::default()),
             false,
+            Arc::new(Open),
         )
         .await
     }
@@ -574,6 +598,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             fake.clone(),
             false,
+            Arc::new(Open),
         )
         .await
         .unwrap();
@@ -597,6 +622,80 @@ mod tests {
         assert_eq!(*adds[0], want);
     }
 
+    /// A gate that is open or closed, and says whether a call happens inside it.
+    struct Watched {
+        open: bool,
+        inside: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Gate for Watched {
+        fn run(&self, f: &mut dyn FnMut()) -> bool {
+            if !self.open {
+                return false;
+            }
+            self.inside.store(true, std::sync::atomic::Ordering::SeqCst);
+            f();
+            self.inside
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Records whether each `claude` call ran inside the gate.
+    struct InsideRunner {
+        inside: Arc<std::sync::atomic::AtomicBool>,
+        adds: Mutex<Vec<bool>>,
+    }
+
+    impl CliRunner for InsideRunner {
+        fn run(&self, args: &[String]) -> std::result::Result<CliOutput, CliError> {
+            let code = if args[1] == "get" {
+                1
+            } else {
+                let inside = self.inside.load(std::sync::atomic::Ordering::SeqCst);
+                self.adds.lock().unwrap().push(inside);
+                0
+            };
+            Ok(CliOutput {
+                code,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_add_runs_inside_the_gate_and_not_after_it_closed() {
+        for open in [true, false] {
+            let server = MockServer::start().await;
+            let keys = Arc::new(MemoryKeyStore::default());
+            keys.save("ibk_test").unwrap();
+            let inside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let runner = Arc::new(InsideRunner {
+                inside: inside.clone(),
+                adds: Mutex::new(Vec::new()),
+            });
+            let r = add_with(
+                &client(&server),
+                &prod_url(),
+                Path::new("/nonexistent"),
+                McpClient::ClaudeCode,
+                keys,
+                runner.clone(),
+                false,
+                Arc::new(Watched { open, inside }),
+            )
+            .await;
+            let adds = runner.adds.lock().unwrap().clone();
+            if open {
+                r.unwrap();
+                assert_eq!(adds, vec![true], "the add ran inside the gate");
+            } else {
+                assert!(r.unwrap_err().to_string().contains("account changed"));
+                assert!(adds.is_empty(), "no add after the gate closed");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn claude_code_does_nothing_when_get_succeeds() {
         let server = MockServer::start().await;
@@ -610,6 +709,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             fake.clone(),
             false,
+            Arc::new(Open),
         )
         .await
         .unwrap();
@@ -645,6 +745,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(fake),
             false,
+            Arc::new(Open),
         )
         .await
         .unwrap_err();
@@ -674,6 +775,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(Fake::default()),
             true,
+            Arc::new(Open),
         )
         .await
         .unwrap_err();
