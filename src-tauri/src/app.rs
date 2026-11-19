@@ -876,9 +876,10 @@ impl Core {
         Ok(())
     }
 
-    /// An account boundary: ends the session on the server, forgets the sign-in tokens, the
+    /// An account boundary: forgets the sign-in tokens, the
     /// MCP key and every SSH token, and clears the account state, the user's connected set
-    /// included (it stays on disk for that user). The state clears even when a store fails;
+    /// included (it stays on disk for that user). Then it ends the session on the server in
+    /// the background, with the token it had, and never refreshes for that. The state clears even when a store fails;
     /// the first failure is returned and shown.
     pub async fn sign_out(&self) -> Res<()> {
         let session = self.update(|i| {
@@ -888,15 +889,19 @@ impl Core {
             i.data = Data::default();
             s
         });
-        if let Some(s) = &session {
-            s.logout().await;
-        }
+        // Capture the token as it is: a refresh here could hold the secrets for 30 s.
+        let token = session.as_ref().and_then(|s| s.current_access_token());
         let tokens = match session {
             Some(s) => s.sign_out().map_err(|e| e.to_string()),
             None => Ok(()),
         };
         let key = self.keys.clear();
         let ssh = self.ssh.clear_all();
+        if let Some(token) = token {
+            // Best effort, in the background: the local sign-out never waits for the server.
+            let base = self.base.clone();
+            tokio::spawn(async move { auth::logout_with(&base, &token).await });
+        }
         self.settle(tokens.and(key).and(ssh).map_err(ErrorView::other))
     }
 
@@ -2142,6 +2147,17 @@ mod tests {
             "state emitted"
         );
         assert!(core.client().is_err(), "no client after sign-out");
+        for _ in 0..50 {
+            if !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         // Dropping the server checks the one logout call.
     }
 
@@ -2153,6 +2169,92 @@ mod tests {
     #[tokio::test]
     async fn sign_out_goes_on_when_the_logout_call_fails() {
         sign_out_with_logout(500).await;
+    }
+
+    /// A core signed in with `tok` against `server`, plus its token and key stores.
+    fn core_with_session(
+        server_uri: &str,
+        tok: Tokens,
+    ) -> (
+        Core,
+        Arc<MemoryStore>,
+        Arc<MemoryKeyStore>,
+        Arc<MemorySshStore>,
+    ) {
+        let base = Url::parse(server_uri).unwrap();
+        let store = Arc::new(MemoryStore::with(tok));
+        let keys = Arc::new(MemoryKeyStore::default());
+        keys.save("ibk_secret").unwrap();
+        let ssh = Arc::new(MemorySshStore::default());
+        ssh.save("a", &ssh_token()).unwrap();
+        let core = Core::new(
+            base.clone(),
+            keys.clone(),
+            ssh.clone(),
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(|_| Ok(())),
+            Arc::new(|_| {}),
+            PathBuf::from("/nonexistent"),
+        );
+        let session = Session::load_from(&base, None, store.clone()).expect("session");
+        core.install_session(session);
+        (core, store, keys, ssh)
+    }
+
+    #[tokio::test]
+    async fn sign_out_clears_secrets_without_waiting_for_the_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+        let (core, store, keys, ssh) = core_with_session(&server.uri(), tokens());
+        let started = std::time::Instant::now();
+        core.sign_out().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "sign_out waited for the server"
+        );
+        assert_eq!(store.load().unwrap(), None, "tokens cleared");
+        assert_eq!(keys.load().unwrap(), None, "MCP key cleared");
+        assert_eq!(ssh.load("a").unwrap(), None, "SSH tokens cleared");
+    }
+
+    #[tokio::test]
+    async fn sign_out_never_refreshes_and_logs_out_with_the_captured_token() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/logout"))
+            .and(header("authorization", "Bearer iba_a"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The access token is about to expire: bearer() would refresh it.
+        let mut tok = tokens();
+        tok.access_expires_at = Utc::now() + chrono::Duration::seconds(5);
+        let (core, store, _keys, _ssh) = core_with_session(&server.uri(), tok);
+        core.sign_out().await.unwrap();
+        assert_eq!(store.load().unwrap(), None);
+        for _ in 0..50 {
+            let n = server.received_requests().await.unwrap_or_default().len();
+            if n > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Dropping the server checks: one logout with the old token, no refresh.
     }
 
     #[tokio::test]

@@ -356,23 +356,18 @@ impl Session {
         }
     }
 
-    /// Ends the session on the server (`POST /v1/auth/logout`), so its tokens stop working
-    /// everywhere. Best effort: any failure is ignored, and an API key has no session to end.
-    pub async fn logout(&self) {
-        let Kind::Tokens(s) = &self.kind else { return };
-        let Ok(token) = self.bearer().await else {
-            return;
-        };
-        let Ok(url) = endpoint(&s.base, &["logout"]) else {
-            return;
-        };
-        let _ = s
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .timeout(LOGOUT_TIMEOUT)
-            .send()
-            .await;
+    /// The access token as it is now, without a refresh and without waiting for one. None
+    /// for an API key, when signed out, or while a refresh holds the tokens.
+    pub fn current_access_token(&self) -> Option<String> {
+        match &self.kind {
+            Kind::ApiKey(_) => None,
+            Kind::Tokens(s) => {
+                if s.dead.load(Ordering::SeqCst) {
+                    return None;
+                }
+                s.tokens.try_lock().ok().map(|t| t.access_token.clone())
+            }
+        }
     }
 
     /// Forgets the saved tokens.
@@ -382,6 +377,20 @@ impl Session {
             Kind::Tokens(s) => s.store.clear().map_err(Error::Store),
         }
     }
+}
+
+/// Ends a session on the server (`POST /v1/auth/logout`) with `token`, so its tokens stop
+/// working everywhere. Best effort: the whole call is bounded and any failure is ignored.
+pub async fn logout_with(base: &Url, token: &str) {
+    let Ok(url) = endpoint(base, &["logout"]) else {
+        return;
+    };
+    let call = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .timeout(LOGOUT_TIMEOUT)
+        .send();
+    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, call).await;
 }
 
 impl Stored {
@@ -780,47 +789,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_ends_the_server_session_with_the_access_token() {
+    async fn logout_with_sends_the_given_token_and_ignores_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/auth/logout"))
             .and(wiremock::matchers::header("authorization", "Bearer iba_1"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let base = Url::parse(&server.uri()).unwrap();
-        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
-        Session::load_from(&base, None, store)
-            .unwrap()
-            .logout()
-            .await;
-    }
-
-    #[tokio::test]
-    async fn logout_ignores_a_failure_and_an_api_key_never_calls() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/auth/logout"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&server)
             .await;
         let base = Url::parse(&server.uri()).unwrap();
-        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
-        Session::load_from(&base, None, store)
-            .unwrap()
-            .logout()
-            .await;
-        Session::load_from(
+        logout_with(&base, "iba_1").await;
+    }
+
+    #[test]
+    fn current_access_token_is_none_for_an_api_key() {
+        let base = Url::parse("http://127.0.0.1:1").unwrap();
+        let key = Session::load_from(
             &base,
             Some("ibk_x".into()),
             Arc::new(MemoryStore::default()),
         )
-        .unwrap()
-        .logout()
-        .await;
-        // Dropping the server checks expect(1): the API key session sent nothing.
+        .unwrap();
+        assert_eq!(key.current_access_token(), None);
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let s = Session::load_from(&base, None, store).unwrap();
+        assert_eq!(s.current_access_token().as_deref(), Some("iba_1"));
     }
 
     #[test]
