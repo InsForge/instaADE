@@ -1695,8 +1695,9 @@ mod tests {
         assert!(sync_targets(&d).contains(&"t".to_string()));
     }
 
+    // A closed local port: a test that reaches the network fails here, never at the real API.
     fn core_with(store: Arc<dyn ConnectedStore>) -> Arc<Core> {
-        core_on(api_base(None), store)
+        core_on(Url::parse("http://127.0.0.1:9/").unwrap(), store)
     }
 
     fn core_on(base: Url, store: Arc<dyn ConnectedStore>) -> Arc<Core> {
