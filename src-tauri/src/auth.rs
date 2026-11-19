@@ -466,6 +466,10 @@ impl Credentials for Session {
         };
         let seen = s.generation.load(Ordering::SeqCst);
         let mut cur = s.tokens.lock().await;
+        if s.dead.load(Ordering::SeqCst) {
+            // Signed out while this retry waited: hand out no token.
+            return Err(signed_out());
+        }
         if s.generation.load(Ordering::SeqCst) != seen {
             // Another caller refreshed while we waited for the lock.
             return Ok(cur.access_token.clone());
@@ -867,5 +871,34 @@ mod tests {
         store.save(&tokens("iba_new", "ibr_new", 3600)).unwrap();
         assert!(call.await.unwrap().is_err());
         assert_eq!(store.load().unwrap().unwrap().access_token, "iba_new");
+    }
+
+    #[tokio::test]
+    async fn a_queued_retry_gets_the_signed_out_error_after_sign_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 3600)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let Kind::Tokens(s) = &session.kind else {
+            unreachable!()
+        };
+        // Stand in for a refresh in progress: hold the token lock.
+        let held = s.tokens.lock().await;
+        let waiter = session.clone();
+        let call = tokio::spawn(async move { waiter.refreshed().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // That refresh finishes (generation moves), then the user signs out.
+        s.generation.fetch_add(1, Ordering::SeqCst);
+        session.sign_out().unwrap();
+        drop(held);
+        let err = call.await.unwrap().unwrap_err();
+        assert_eq!(err.code, "unauthenticated", "no token for the retry");
+        assert_eq!(store.load().unwrap(), None);
     }
 }
