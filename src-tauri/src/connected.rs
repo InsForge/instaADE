@@ -41,17 +41,32 @@ impl FileConnectedStore {
     }
 
     /// The map on disk. A flat list from an older build belongs to `user`, the first user
-    /// signed in to read it; the flag says it must be written back as a map.
-    fn read(&self, user: i64) -> (ByUser, bool) {
-        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+    /// signed in to read it; the flag says it must be written back as a map. A missing file
+    /// is an empty map. Any other read problem, or text that is not either format, is an
+    /// error, so a caller never writes over a file it could not understand.
+    fn read(&self, user: i64) -> Result<(ByUser, bool), String> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((ByUser::new(), false));
+            }
+            Err(e) => return Err(self.unreadable(&e.to_string())),
+        };
         match serde_json::from_str::<OnDisk>(&text) {
-            Ok(OnDisk::ByUser(m)) => (m, false),
+            Ok(OnDisk::ByUser(m)) => Ok((m, false)),
             Ok(OnDisk::Flat(ids)) => {
                 let set: BTreeSet<String> = ids.into_iter().collect();
-                (BTreeMap::from([(user.to_string(), set)]), true)
+                Ok((BTreeMap::from([(user.to_string(), set)]), true))
             }
-            Err(_) => (ByUser::new(), false),
+            Err(e) => Err(self.unreadable(&e.to_string())),
         }
+    }
+
+    fn unreadable(&self, reason: &str) -> String {
+        format!(
+            "Could not read the list of connected sandboxes ({}): {reason}. It was left unchanged.",
+            self.path.display()
+        )
     }
 
     /// Writes a temp file, then renames it over the real one.
@@ -72,7 +87,7 @@ impl FileConnectedStore {
         f: impl FnOnce(&mut BTreeSet<String>) -> bool,
     ) -> Result<(), String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut map, migrated) = self.read(user);
+        let (mut map, migrated) = self.read(user)?;
         let set = map.entry(user.to_string()).or_default();
         let changed = f(set);
         if set.is_empty() {
@@ -88,7 +103,9 @@ impl FileConnectedStore {
 impl ConnectedStore for FileConnectedStore {
     fn load(&self, user: i64) -> HashSet<String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (map, migrated) = self.read(user);
+        let Ok((map, migrated)) = self.read(user) else {
+            return HashSet::new();
+        };
         if migrated {
             // Best effort: a failed write migrates again on the next load.
             let _ = self.write(&map);
@@ -190,13 +207,55 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_file_reads_as_empty() {
+    fn a_corrupt_file_is_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connected.json");
-        std::fs::write(&path, "not json").unwrap();
-        let store = FileConnectedStore::new(path);
+        std::fs::write(&path, "{not json").unwrap();
+        let store = FileConnectedStore::new(path.clone());
         assert!(store.load(7).is_empty());
+        let err = store.add(7, "m1").unwrap_err();
+        assert!(err.contains("Could not read the list of connected sandboxes"));
+        assert!(err.contains("It was left unchanged."));
+        assert!(store.remove(7, "m1").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        let original = r#"{"8":["m9"]}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        let store = FileConnectedStore::new(path.clone());
+        assert!(store.load(7).is_empty());
+        assert!(store.add(7, "m1").is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_missing_file_is_created_by_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        let store = FileConnectedStore::new(path.clone());
         store.add(7, "m1").unwrap();
-        assert_eq!(store.load(7).len(), 1);
+        assert_eq!(store.load(7), set(&["m1"]));
+    }
+
+    #[test]
+    fn add_keeps_other_users_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, r#"{"7":["a1"],"8":["b1","b2"]}"#).unwrap();
+        let store = FileConnectedStore::new(path.clone());
+        store.add(7, "a2").unwrap();
+        assert_eq!(store.load(7), set(&["a1", "a2"]));
+        assert_eq!(store.load(8), set(&["b1", "b2"]));
     }
 }
