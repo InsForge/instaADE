@@ -106,7 +106,6 @@ export default function Details({ state, sandbox: s, run, onConnect, onBack }: P
         {stateLabel(s.state)} · {s.size} · <T3Line s={s} desktop={state.t3} run={run} />
         {s.t3Version && !s.updatePending && !s.desktopBehind && s.t3Version === state.t3 && " (matches T3 Code)"}
       </p>
-      {s.t3CodeConnected && <p className="success">T3 Code connected · won't auto sleep</p>}
 
       <div className="row-actions">
         {running && (

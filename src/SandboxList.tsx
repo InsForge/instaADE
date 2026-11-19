@@ -63,7 +63,6 @@ function Row({ s, state, run, onConnect, onDetails }: RowProps) {
         <span className="muted">{stateLabel(s.state)}</span>
         <span className="muted">{s.size}</span>
         <T3Line s={s} desktop={state.t3} run={run} />
-        {s.t3CodeConnected && <span className="success">T3 Code connected · won't auto sleep</span>}
       </div>
       <div className="row-actions">
         {s.state === "running" && (

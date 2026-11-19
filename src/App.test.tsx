@@ -164,9 +164,10 @@ test("resize starts at the current size, warns about the restart and applies ano
   expect(invoke).toHaveBeenCalledWith("resize", { id: "a", vcpus: 2, memMiB: 4096 });
 });
 
-test("a connected T3 Code shows it will not auto sleep", async () => {
+test("a connected T3 Code shows no auto sleep warning", async () => {
   show({}, [{ t3CodeConnected: true }]);
-  expect(await screen.findByText("T3 Code connected · won't auto sleep")).toBeTruthy();
+  await screen.findAllByText("dev-1");
+  expect(screen.queryByText(/won't auto sleep/)).toBeNull();
 });
 
 test("an unconnected sandbox offers Connect to T3 Code", async () => {
