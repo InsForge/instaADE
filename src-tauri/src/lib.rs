@@ -5,6 +5,7 @@ pub mod auth;
 pub mod commands;
 pub mod connected;
 pub mod errors;
+pub mod gate;
 pub mod mcp;
 pub mod process;
 pub mod sandbox;

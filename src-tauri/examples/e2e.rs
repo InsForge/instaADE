@@ -498,11 +498,11 @@ async fn ssh_check(client: &Client, c: &Checks, id: &str) {
     let t = Instant::now();
     let name = "ssh::token + server command runs `true`";
     let store = MemorySshStore::default();
-    let tok = match ssh::token(client, &store, id).await {
+    let tok = match ssh::token(client, &store, id, &instabox_bridge_lib::gate::Open).await {
         Ok(tok) => tok,
         Err(e) => return c.check(name, false, t, e),
     };
-    let reused = ssh::token(client, &store, id)
+    let reused = ssh::token(client, &store, id, &instabox_bridge_lib::gate::Open)
         .await
         .is_ok_and(|again| again.token == tok.token);
     let cmd = ssh::display_command(&tok);

@@ -5,7 +5,19 @@ use std::sync::Mutex as StdMutex;
 
 use chrono::{Duration, Utc};
 
-use crate::api::{Client, Result, SshToken};
+use crate::api::{Client, Error, Result, SshToken};
+use crate::gate::{Gate, guarded};
+
+/// The error for a flow whose account signed out or changed before it could act.
+pub fn account_changed() -> Error {
+    Error {
+        status: 0,
+        code: "account_changed".into(),
+        message: "The account changed. Nothing was done.".into(),
+        retryable: false,
+        retry_after: None,
+    }
+}
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const TOKEN_NAME: &str = "Instabox Bridge";
@@ -88,7 +100,12 @@ impl SshTokenStore for MemorySshStore {
 }
 
 /// The sandbox's SSH token: the stored one while it has more than 24 h left, else a new one.
-pub async fn token(client: &Client, store: &dyn SshTokenStore, id: &str) -> Result<SshToken> {
+pub async fn token(
+    client: &Client,
+    store: &dyn SshTokenStore,
+    id: &str,
+    gate: &dyn Gate,
+) -> Result<SshToken> {
     // A broken store only costs a fresh token, so treat a load failure as a miss.
     if let Ok(Some(t)) = store.load(id)
         && t.expires_at
@@ -98,7 +115,11 @@ pub async fn token(client: &Client, store: &dyn SshTokenStore, id: &str) -> Resu
     }
     let t = client.ssh_token(id, TOKEN_NAME, TOKEN_TTL_SECS).await?;
     // The token still works this run if saving fails; the next run asks for a new one.
-    let _ = store.save(id, &t);
+    // After a sign-out nothing is saved, and the caller gets no token either.
+    guarded(gate, || {
+        let _ = store.save(id, &t);
+    })
+    .ok_or_else(account_changed)?;
     Ok(t)
 }
 
@@ -262,7 +283,9 @@ mod tests {
         let store = MemorySshStore::default();
         let stored = tok("ibssh_old", Duration::days(10));
         store.save("m1", &stored).unwrap();
-        let got = token(&client(&server), &store, "m1").await.unwrap();
+        let got = token(&client(&server), &store, "m1", &crate::gate::Open)
+            .await
+            .unwrap();
         assert_eq!(got, stored);
     }
 
@@ -283,9 +306,34 @@ mod tests {
         store
             .save("m1", &tok("ibssh_old", Duration::hours(2)))
             .unwrap();
-        let got = token(&client(&server), &store, "m1").await.unwrap();
+        let got = token(&client(&server), &store, "m1", &crate::gate::Open)
+            .await
+            .unwrap();
         assert_eq!(got.token, "ibssh_new");
         assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_new");
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_saves_nothing_and_returns_no_token() {
+        struct Closed;
+        impl Gate for Closed {
+            fn run(&self, _: &mut dyn FnMut()) -> bool {
+                false
+            }
+        }
+        let server = MockServer::start().await;
+        let fresh = tok("ibssh_new", Duration::days(30));
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m3/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body_for(&fresh)))
+            .mount(&server)
+            .await;
+        let store = MemorySshStore::default();
+        let err = token(&client(&server), &store, "m3", &Closed)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "account_changed");
+        assert!(store.load("m3").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -299,7 +347,9 @@ mod tests {
             .mount(&server)
             .await;
         let store = MemorySshStore::default();
-        let got = token(&client(&server), &store, "m2").await.unwrap();
+        let got = token(&client(&server), &store, "m2", &crate::gate::Open)
+            .await
+            .unwrap();
         assert_eq!(got.token, "ibssh_new");
         assert!(store.load("m2").unwrap().is_some());
     }

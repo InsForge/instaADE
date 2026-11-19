@@ -12,6 +12,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::api::Client;
+use crate::gate::{Gate, guarded};
 use crate::process::{RunError, run_bounded};
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
@@ -247,6 +248,7 @@ pub async fn add(
     home: &Path,
     client: McpClient,
     keys: Arc<dyn KeyStore>,
+    gate: &dyn Gate,
 ) -> Result<()> {
     let api_key_session = std::env::var("INSTABOX_API_KEY").is_ok_and(|k| !k.is_empty());
     add_with(
@@ -257,10 +259,12 @@ pub async fn add(
         keys,
         Arc::new(SystemRunner),
         api_key_session,
+        gate,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn add_with(
     api: &Client,
     url: &str,
@@ -269,6 +273,7 @@ pub async fn add_with(
     keys: Arc<dyn KeyStore>,
     runner: Arc<dyn CliRunner>,
     api_key_session: bool,
+    gate: &dyn Gate,
 ) -> Result<()> {
     if client == McpClient::ClaudeCode {
         let r = runner.clone();
@@ -285,9 +290,12 @@ pub async fn add_with(
     {
         return Ok(());
     }
-    let key = api_key(api, keys.as_ref(), api_key_session).await?;
+    let key = api_key(api, keys.as_ref(), api_key_session, gate).await?;
     match client {
         McpClient::ClaudeCode => {
+            // The command runs in a thread, so it cannot sit inside the gate: check right
+            // before it starts.
+            guarded(gate, || ()).ok_or_else(account_changed)?;
             let args = add_args(url, &key);
             let out = tokio::task::spawn_blocking(move || runner.run(&args))
                 .await
@@ -301,8 +309,14 @@ pub async fn add_with(
             }
             Ok(())
         }
-        McpClient::Codex => write_codex(home, url, &key),
+        McpClient::Codex => {
+            guarded(gate, || write_codex(home, url, &key)).ok_or_else(account_changed)?
+        }
     }
+}
+
+fn account_changed() -> anyhow::Error {
+    anyhow!("The account changed. Nothing was done.")
 }
 
 /// True when `mcp_servers.instabox` exists in any form (table, inline table, stdio or http).
@@ -325,7 +339,12 @@ fn read_codex(path: &Path) -> Result<Option<toml_edit::DocumentMut>> {
 }
 
 /// The stored key, or a new one. An API-key session cannot create keys.
-async fn api_key(api: &Client, keys: &dyn KeyStore, api_key_session: bool) -> Result<String> {
+async fn api_key(
+    api: &Client,
+    keys: &dyn KeyStore,
+    api_key_session: bool,
+    gate: &dyn Gate,
+) -> Result<String> {
     if let Some(k) = keys.load().map_err(|e| anyhow!("keychain: {e}"))? {
         return Ok(k);
     }
@@ -333,7 +352,9 @@ async fn api_key(api: &Client, keys: &dyn KeyStore, api_key_session: bool) -> Re
         bail!("Sign in to add MCP");
     }
     let created = api.create_api_key(KEY_NAME, &KEY_SCOPES, KEY_DAYS).await?;
-    keys.save(&created.key)
+    // After a sign-out the new key is neither saved nor used.
+    guarded(gate, || keys.save(&created.key))
+        .ok_or_else(account_changed)?
         .map_err(|e| anyhow!("keychain: {e}"))?;
     Ok(created.key)
 }
@@ -402,6 +423,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::api::{Credentials, Result as ApiResult};
+    use crate::gate::Open;
     use async_trait::async_trait;
     use url::Url;
     use wiremock::matchers::{body_json, method, path};
@@ -474,6 +496,7 @@ mod tests {
             keys,
             Arc::new(Fake::default()),
             false,
+            &Open,
         )
         .await
     }
@@ -574,6 +597,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             fake.clone(),
             false,
+            &Open,
         )
         .await
         .unwrap();
@@ -610,6 +634,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             fake.clone(),
             false,
+            &Open,
         )
         .await
         .unwrap();
@@ -645,6 +670,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(fake),
             false,
+            &Open,
         )
         .await
         .unwrap_err();
@@ -674,6 +700,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(Fake::default()),
             true,
+            &Open,
         )
         .await
         .unwrap_err();
