@@ -124,7 +124,6 @@ pub struct Data {
     pub templates: Vec<Template>,
     pub machines: Vec<Machine>,
     pub snapshots: Vec<Snapshot>,
-    pub desktop_running: bool,
     /// The T3 version this app last saw on each sandbox.
     pub t3_versions: HashMap<String, String>,
     /// Sandboxes whose T3 is behind the desktop's and could not be updated (busy or failed).
@@ -285,7 +284,6 @@ pub fn sandbox_views(d: &Data, org_id: Option<&str>, now: DateTime<Utc>) -> Vec<
             v.update_pending = d.update_pending.contains(&m.id);
             v.desktop_behind = d.desktop_behind.contains(&m.id);
             v.connected = d.connected.contains(&m.id);
-            v.t3_code_connected = v.connected && v.state == ViewState::Running && d.desktop_running;
             v
         })
         .collect()
@@ -958,9 +956,6 @@ impl Core {
     /// desktop T3 version. Lists only; nothing here runs a command on a sandbox.
     pub async fn refresh(self: &Arc<Self>, full: bool) -> Option<SyncJob> {
         let (client, account, no_me) = self.signed_in_with(|i| i.data.me.is_none()).ok()?;
-        let running = tokio::task::spawn_blocking(desktop::running)
-            .await
-            .unwrap_or(false);
         let full = full || no_me;
         let machines = client.machines().await;
         let account_reads = if full {
@@ -985,7 +980,6 @@ impl Core {
         // When the account changed while the reads were in flight, they are not its data.
         let job = self.update_in(account, |i| {
             let mut failure: Option<ErrorView> = None;
-            i.data.desktop_running = running;
             if let Some((user, set, problem)) = connected {
                 i.data.use_connected(user, set);
                 if let Some(e) = problem {
@@ -1742,7 +1736,6 @@ mod tests {
                 snap("s3", "ready", "mac", None),
                 snap("s4", "ready", "agent-browser", Some("org-team")),
             ],
-            desktop_running: true,
             t3_versions: HashMap::from([("a".to_string(), "0.1.10".to_string())]),
             update_pending: HashSet::from(["e".to_string()]),
             desktop_behind: HashSet::from(["g".to_string()]),
@@ -1895,21 +1888,16 @@ mod tests {
     }
 
     #[test]
-    fn t3_code_connected_needs_connected_running_and_desktop_running() {
-        let mut d = data();
+    fn sandbox_views_carry_the_t3_version_seen() {
+        let d = data();
         let get = |d: &Data, id: &str| {
             sandbox_views(d, Some("org-me"), now())
                 .into_iter()
                 .find(|v| v.id == id)
                 .unwrap()
         };
-        assert!(get(&d, "a").t3_code_connected);
-        assert!(!get(&d, "e").t3_code_connected, "suspended");
-        assert!(!get(&d, "f").t3_code_connected, "not connected");
         assert_eq!(get(&d, "a").t3_version.as_deref(), Some("0.1.10"));
         assert_eq!(get(&d, "f").t3_version, None);
-        d.desktop_running = false;
-        assert!(!get(&d, "a").t3_code_connected, "desktop not running");
     }
 
     #[test]
@@ -2007,7 +1995,7 @@ mod tests {
         d.machines
             .push(machine("t", "org-me", "agent-browser", "running", true));
         let t = view_of(&d, "t");
-        assert!(!t.connected && !t.t3_code_connected);
+        assert!(!t.connected);
         assert!(!sync_targets(&d).contains(&"t".to_string()));
         // Once this computer connects it, it is a sync target.
         d.connected.insert("t".into());

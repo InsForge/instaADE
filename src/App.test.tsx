@@ -50,7 +50,6 @@ const box: SandboxView = {
   autoSleep: { seconds: 1800, label: "After 30 min" },
   runLeftMinutes: 80,
   cooldownMinutes: null,
-  t3CodeConnected: false,
   updatePending: false,
   desktopBehind: false,
 };
@@ -164,11 +163,6 @@ test("resize starts at the current size, warns about the restart and applies ano
   expect(invoke).toHaveBeenCalledWith("resize", { id: "a", vcpus: 2, memMiB: 4096 });
 });
 
-test("a connected T3 Code shows no auto sleep warning", async () => {
-  show({}, [{ t3CodeConnected: true }]);
-  await screen.findAllByText("dev-1");
-  expect(screen.queryByText(/won't auto sleep/)).toBeNull();
-});
 
 test("an unconnected sandbox offers Connect to T3 Code", async () => {
   show({}, [{ connected: false }]);

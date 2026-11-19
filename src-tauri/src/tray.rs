@@ -182,7 +182,6 @@ mod tests {
             },
             run_left_minutes: None,
             cooldown_minutes: None,
-            t3_code_connected: false,
             update_pending: false,
             desktop_behind: false,
         }

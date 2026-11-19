@@ -48,7 +48,6 @@ export interface SandboxView {
   autoSleep: { seconds: number | null; label: string };
   runLeftMinutes: number | null;
   cooldownMinutes: number | null;
-  t3CodeConnected: boolean;
   /** The sandbox's T3 is behind the desktop's and the update was deferred or failed: offer [Update]. */
   updatePending: boolean;
   /** The sandbox's T3 is newer than the desktop's: offer "Update T3 Code on this computer", never [Update]. */
