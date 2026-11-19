@@ -136,9 +136,9 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                 }
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
+    // Template image: macOS tints it for light and dark menu bars.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    builder = builder.icon(icon).icon_as_template(true);
     builder.build(app)?;
     Ok(())
 }
