@@ -52,6 +52,9 @@ impl FileConnectedStore {
             }
             Err(e) => return Err(self.unreadable(&e.to_string())),
         };
+        if text.trim().is_empty() {
+            return Ok((ByUser::new(), false));
+        }
         match serde_json::from_str::<OnDisk>(&text) {
             Ok(OnDisk::ByUser(m)) => Ok((m, false)),
             Ok(OnDisk::Flat(ids)) => {
@@ -237,6 +240,17 @@ mod tests {
         assert!(store.add(7, "m1").is_err());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn an_empty_file_counts_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, "  \n").unwrap();
+        let store = FileConnectedStore::new(path);
+        assert!(store.load(7).is_empty());
+        store.add(7, "m1").unwrap();
+        assert_eq!(store.load(7), set(&["m1"]));
     }
 
     #[test]
