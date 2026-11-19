@@ -18,7 +18,7 @@ const KEYCHAIN_ACCOUNT: &str = "tokens";
 const REFRESH_MARGIN_SECS: i64 = 60;
 const SLOW_DOWN_SECS: u64 = 5;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Sign-out waits this long at most for the server.
+/// The background logout call gives up after this long.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +138,11 @@ struct Stored {
     http: reqwest::Client,
     store: Arc<dyn TokenStore>,
     tokens: Mutex<Tokens>,
+    /// A copy of the current access token, readable while a refresh holds `tokens`.
+    access: StdMutex<String>,
+    /// Taken around "check `dead`, then save" and "set `dead`, then clear", so a refresh
+    /// that finishes after a sign-out can never write tokens back.
+    gate: StdMutex<()>,
     /// Counts completed refreshes; lets a waiting caller see that another refreshed.
     generation: AtomicU64,
     /// Set when the server ended the session (refresh answered 401).
@@ -305,6 +310,8 @@ impl Session {
                 base,
                 http,
                 store,
+                access: StdMutex::new(tokens.access_token.clone()),
+                gate: StdMutex::new(()),
                 tokens: Mutex::new(tokens),
                 generation: AtomicU64::new(0),
                 dead: AtomicBool::new(false),
@@ -356,8 +363,8 @@ impl Session {
         }
     }
 
-    /// The access token as it is now, without a refresh and without waiting for one. None
-    /// for an API key, when signed out, or while a refresh holds the tokens.
+    /// The access token as it is now, without a refresh and without waiting for one, even
+    /// while a refresh is running. None for an API key or an ended session.
     pub fn current_access_token(&self) -> Option<String> {
         match &self.kind {
             Kind::ApiKey(_) => None,
@@ -365,7 +372,7 @@ impl Session {
                 if s.dead.load(Ordering::SeqCst) {
                     return None;
                 }
-                s.tokens.try_lock().ok().map(|t| t.access_token.clone())
+                Some(s.access.lock().unwrap_or_else(|e| e.into_inner()).clone())
             }
         }
     }
@@ -374,7 +381,12 @@ impl Session {
     pub fn sign_out(&self) -> Result<()> {
         match &self.kind {
             Kind::ApiKey(_) => Ok(()),
-            Kind::Tokens(s) => s.store.clear().map_err(Error::Store),
+            Kind::Tokens(s) => {
+                // End the session first: a refresh still running must not save again.
+                let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+                s.dead.store(true, Ordering::SeqCst);
+                s.store.clear().map_err(Error::Store)
+            }
         }
     }
 }
@@ -403,17 +415,26 @@ impl Stored {
         let body = serde_json::json!({ "refreshToken": cur.refresh_token });
         match post::<Tokens>(&self.http, url, body).await {
             Ok(new) => {
+                let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if self.dead.load(Ordering::SeqCst) {
+                    // Signed out while the call ran: keep nothing.
+                    return Err(signed_out());
+                }
                 // Keep the new tokens first: the old refresh token is already revoked.
                 *cur = new;
+                *self.access.lock().unwrap_or_else(|e| e.into_inner()) = cur.access_token.clone();
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 *self.save_error.lock().unwrap() = self.store.save(cur).err();
                 Ok(cur.access_token.clone())
             }
             Err(e) => {
                 if e.status == 401 {
-                    // The session is over: never send this refresh token again.
-                    self.dead.store(true, Ordering::SeqCst);
-                    let _ = self.store.clear();
+                    // The session is over: never send this refresh token again. After a
+                    // sign-out the store may belong to a newer account: leave it alone.
+                    let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                    if !self.dead.swap(true, Ordering::SeqCst) {
+                        let _ = self.store.clear();
+                    }
                 }
                 Err(e)
             }
@@ -825,5 +846,26 @@ mod tests {
         let session = Session::load_from(&base, None, store.clone()).unwrap();
         session.sign_out().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_old_sessions_401_after_sign_out_leaves_a_newer_store_alone() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_millis(500)))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let store = Arc::new(MemoryStore::with(tokens("iba_1", "ibr_1", 5)));
+        let session = Arc::new(Session::load_from(&base, None, store.clone()).unwrap());
+        let s2 = session.clone();
+        let call = tokio::spawn(async move { s2.bearer().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.sign_out().unwrap();
+        // Another account signs in and saves into the same single store.
+        store.save(&tokens("iba_new", "ibr_new", 3600)).unwrap();
+        assert!(call.await.unwrap().is_err());
+        assert_eq!(store.load().unwrap().unwrap().access_token, "iba_new");
     }
 }
