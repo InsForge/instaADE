@@ -99,7 +99,7 @@ export default function Details({ state, sandbox: s, run, onConnect, onBack }: P
       <button className="btn small back" onClick={onBack}>
         ← Sandboxes
       </button>
-      <h1 className="mono">
+      <h1>
         <StateDot state={s.state} /> {s.name}
       </h1>
       <p className="muted">
@@ -220,7 +220,7 @@ export default function Details({ state, sandbox: s, run, onConnect, onBack }: P
         <dd>
           {ssh && "command" in ssh ? (
             <>
-              <code className="mono">{ssh.command}</code>{" "}
+              <code>{ssh.command}</code>{" "}
               <button className="btn small" onClick={copy}>
                 {copied ? "Copied" : "Copy"}
               </button>

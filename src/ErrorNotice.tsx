@@ -51,7 +51,7 @@ export default function ErrorNotice({ error, sandboxes, onConnect, onRetry, onDi
     case "setup":
       return (
         <div className="notice danger" role="alert">
-          <pre className="mono">{error.message}</pre>
+          <pre>{error.message}</pre>
           {onRetry && (
             <button className="btn" onClick={onRetry}>
               Retry

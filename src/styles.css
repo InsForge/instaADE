@@ -9,7 +9,6 @@
   --success: #22c55e;
   --warning: #f59e0b;
   --info: #0ea5e9;
-  --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --radius: 4px;
   color-scheme: dark;
 }
@@ -27,7 +26,6 @@ body {
 
 h1,
 h2 {
-  font-family: var(--mono);
   font-weight: 600;
   margin: 0 0 12px;
 }
@@ -46,10 +44,9 @@ a {
   color: var(--info);
 }
 
-.mono,
 code,
 pre {
-  font-family: var(--mono);
+  font: inherit;
 }
 .muted {
   color: var(--muted);
@@ -256,7 +253,6 @@ select:disabled {
 }
 .checks .label {
   width: 90px;
-  font-family: var(--mono);
 }
 .num {
   width: 20px;

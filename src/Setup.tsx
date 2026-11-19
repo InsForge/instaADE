@@ -48,7 +48,7 @@ export default function Setup({ state, run, onCreate }: Props) {
         </li>
         {!signedIn && state.signInCode && (
           <li className="sub">
-            Waiting for sign-in in your browser. Your code is <strong className="mono code">{state.signInCode}</strong>
+            Waiting for sign-in in your browser. Your code is <strong className="code">{state.signInCode}</strong>
           </li>
         )}
         <li>

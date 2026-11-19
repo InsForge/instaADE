@@ -117,7 +117,7 @@ export default function App() {
   return (
     <main className="page">
       <header className="top">
-        <strong className="mono brand">Instabox Bridge</strong>
+        <strong className="brand">Instabox Bridge</strong>
         {!needSetup && (
           <>
             <nav>

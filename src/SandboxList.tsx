@@ -59,7 +59,7 @@ function Row({ s, state, run, onConnect, onDetails }: RowProps) {
     <li className="row">
       <div className="row-main">
         <StateDot state={s.state} />
-        <strong className="mono">{s.name}</strong>
+        <strong>{s.name}</strong>
         <span className="muted">{stateLabel(s.state)}</span>
         <span className="muted">{s.size}</span>
         <T3Line s={s} desktop={state.t3} run={run} />
