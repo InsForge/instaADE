@@ -254,12 +254,13 @@ pub async fn start(base: &Url, provider: Provider) -> Result<DeviceStart> {
     Ok(post(&http_client(), url, body).await?)
 }
 
-/// Polls until the user approves, then stores the tokens in the keychain.
+/// Polls until the user approves. The session's tokens are not saved yet: the app saves them
+/// with `Session::save` when the session becomes the account (see `gate`).
 pub async fn poll(base: &Url, start: &DeviceStart) -> Result<Session> {
     poll_with(base, start, Arc::new(KeyringStore), tokio::time::sleep).await
 }
 
-/// `poll` with an injected store and sleep function.
+/// `poll` with an injected store and sleep function. `store` is where the session saves.
 pub async fn poll_with<S, Fut>(
     base: &Url,
     start: &DeviceStart,
@@ -283,10 +284,7 @@ where
         waited += interval;
         let body = serde_json::json!({ "deviceCode": start.device_code });
         match post::<Tokens>(&http, url.clone(), body).await {
-            Ok(tokens) => {
-                store.save(&tokens).map_err(Error::Store)?;
-                return Ok(Session::from_tokens(base.clone(), http, store, tokens));
-            }
+            Ok(tokens) => return Ok(Session::from_tokens(base.clone(), http, store, tokens)),
             Err(e) if e.code == "authorization_pending" => {}
             Err(e) if e.code == "slow_down" => interval += SLOW_DOWN_SECS,
             Err(e) if e.code == "expired_token" => return Err(Error::Expired),
@@ -377,7 +375,34 @@ impl Session {
         }
     }
 
-    /// Forgets the saved tokens.
+    /// Saves the session's tokens: a device sign-in's session as it becomes the account.
+    pub fn save(&self) -> Result<()> {
+        match &self.kind {
+            Kind::ApiKey(_) => Ok(()),
+            Kind::Tokens(s) => {
+                let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if s.dead.load(Ordering::SeqCst) {
+                    return Err(Error::Store("the session already ended".into()));
+                }
+                // A refresh that holds the tokens saves them itself when it is done.
+                match s.tokens.try_lock() {
+                    Ok(cur) => s.store.save(&cur).map_err(Error::Store),
+                    Err(_) => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Ends the session here and leaves the token store alone: another session's tokens go
+    /// there next. A refresh still running neither saves nor clears after this.
+    pub fn retire(&self) {
+        if let Kind::Tokens(s) = &self.kind {
+            let _g = s.gate.lock().unwrap_or_else(|e| e.into_inner());
+            s.dead.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Ends the session here and forgets the saved tokens.
     pub fn sign_out(&self) -> Result<()> {
         match &self.kind {
             Kind::ApiKey(_) => Ok(()),
@@ -595,6 +620,8 @@ mod tests {
         // 5 s, 5 s (after pending), then 10 s (slow_down grew the interval by 5).
         assert_eq!(*log.lock().unwrap(), vec![5, 5, 10]);
         assert_eq!(session.bearer().await.unwrap(), "iba_1");
+        assert!(store.load().unwrap().is_none(), "saved only by save()");
+        session.save().unwrap();
         assert_eq!(store.load().unwrap().unwrap(), done);
     }
 

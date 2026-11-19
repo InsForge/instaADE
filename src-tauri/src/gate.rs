@@ -1,9 +1,33 @@
-//! Keeps the side effects of a long flow (saving a credential, writing a config file,
-//! opening a link or a terminal) from happening after the account they began under has
-//! signed out or changed.
+//! Keeps the side effects of a long flow (saving a credential, writing a config file or the
+//! connected list, opening a link or a terminal, starting a process) from happening after the
+//! account they began under has signed out or changed.
+//!
+//! One lock, the account lock (`Core::side_effects`), orders all of it. Every account change
+//! (sign-out, a device sign-in, the session saved by the last run, a session the server
+//! ended) takes it, moves the account count on, ends the old session and clears or saves the
+//! stores before it lets go. A gate takes the same lock, compares the flow's account count
+//! with the current one and does the work before it lets go, so a change can never fall
+//! between the check and the work.
+//!
+//! Lock order, outermost first. A thread that holds one of these locks may take a later one,
+//! never an earlier one:
+//!
+//! 1. a connected-list store's own lock (the store writes through a gate);
+//! 2. the account lock (`Core::side_effects`);
+//! 3. the app state lock (`Core::inner`), held only for short reads and writes;
+//! 4. a session's own lock (`auth`), which makes "check that the session is alive, then save
+//!    or clear its tokens" one step;
+//! 5. the stores themselves (keychain entries, files, in-memory test stores).
+//!
+//! A refresh holds its session's token lock across the network call and then takes 4; nothing
+//! that holds 2, 3 or 4 waits for that token lock. Locks 2 and 3 are never held across an
+//! await, and the state is emitted only after both are released. The only callbacks run under
+//! 2 are the launches themselves (the URL opener, Terminal, the port forward, the `claude`
+//! command); none of them calls back into the app.
 
 /// A flow's permission to act. `run` does the work only while the flow's account is still
-/// the current one, and it does the check and the work as one step with respect to sign-out.
+/// the current one, and it does the check and the work as one step with respect to every
+/// account change.
 pub trait Gate: Send + Sync {
     /// Runs `f` if the account is unchanged. Returns false when `f` did not run.
     fn run(&self, f: &mut dyn FnMut()) -> bool;
