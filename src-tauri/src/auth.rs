@@ -145,7 +145,7 @@ struct Stored {
     gate: StdMutex<()>,
     /// Counts completed refreshes; lets a waiting caller see that another refreshed.
     generation: AtomicU64,
-    /// Set when the server ended the session (refresh answered 401).
+    /// Set when the session ends: the user signed out, or a refresh answered 401.
     dead: AtomicBool,
     /// The last failure to save rotated tokens; the running session still works.
     save_error: StdMutex<Option<String>>,
