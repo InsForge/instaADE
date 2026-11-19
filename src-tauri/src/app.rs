@@ -488,6 +488,7 @@ impl Inner {
             .map(|v| SyncJob {
                 version: v,
                 ids: sync_targets(&self.data),
+                account: self.account,
             });
         self.state.t3 = t3;
         job
@@ -525,6 +526,8 @@ impl Inner {
 pub struct SyncJob {
     pub version: String,
     pub ids: Vec<String>,
+    /// The account count when the job was made; a job for an older account is dropped.
+    account: u64,
 }
 
 pub struct CreateArgs {
@@ -813,22 +816,31 @@ impl Core {
     /// One sync per running connected sandbox. This exec follows a version change; it is
     /// not a timer. A sandbox that cannot be updated shows `updatePending`; nothing retries.
     async fn sync_all(&self, job: SyncJob) {
+        if self.account() != job.account {
+            return;
+        }
         let Ok(client) = self.client() else { return };
         for id in &job.ids {
             let r = sandbox::sync::sync(&client, id, &job.version).await;
-            self.record_sync(id, &job.version, r.as_ref().ok());
+            self.record_sync(id, &job.version, r.as_ref().ok(), job.account);
         }
     }
 
-    fn record_sync(&self, id: &str, desktop: &str, outcome: Option<&SyncOutcome>) {
+    fn record_sync(&self, id: &str, desktop: &str, outcome: Option<&SyncOutcome>, account: u64) {
         self.update(|i| {
+            if i.account != account {
+                return;
+            }
             i.data.record_sync(id, desktop, outcome);
             i.rebuild();
         });
     }
 
-    fn record_version(&self, id: &str, version: &str) {
+    fn record_version(&self, id: &str, version: &str, account: u64) {
         self.update(|i| {
+            if i.account != account {
+                return;
+            }
             i.data.set_version(id, version);
             i.rebuild();
         });
@@ -988,8 +1000,9 @@ impl Core {
             auto_suspend_after_seconds: a.auto_suspend_after_seconds,
             org_id,
         };
-        self.begin_progress("create", "creating", None);
-        let r = connect::create_and_connect(&client, &req, &version, self.progress_cb()).await;
+        self.begin_progress("create", "creating", None, account);
+        let r =
+            connect::create_and_connect(&client, &req, &version, self.progress_cb(account)).await;
         self.finish_connect(r, &version, account).await
     }
 
@@ -1001,8 +1014,8 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        self.begin_progress("connect", "connecting", Some(id.to_string()));
-        let r = connect::connect_existing(&client, id, &version, self.progress_cb()).await;
+        self.begin_progress("connect", "connecting", Some(id.to_string()), account);
+        let r = connect::connect_existing(&client, id, &version, self.progress_cb(account)).await;
         self.finish_connect(r, &version, account).await
     }
 
@@ -1018,6 +1031,7 @@ impl Core {
         if !connected {
             return self.connect_sandbox(id).await;
         }
+        let account = self.account();
         let client = self.client()?;
         let version = self.lock().state.t3.clone();
         let r = async {
@@ -1026,7 +1040,7 @@ impl Core {
                 .map_err(ErrorView::from)?;
             if let Some(v) = &version {
                 let out = sandbox::sync::sync(&client, id, v).await;
-                self.record_sync(id, v, out.as_ref().ok());
+                self.record_sync(id, v, out.as_ref().ok(), account);
             }
             (self.open)(T3_APP_URL).map_err(ErrorView::other)
         };
@@ -1107,8 +1121,11 @@ impl Core {
         Ok((self.client()?, self.desktop_version().await?))
     }
 
-    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>) {
+    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>, account: u64) {
         self.update(|i| {
+            if i.account != account {
+                return;
+            }
             i.state.error = None;
             i.state.progress = Some(ProgressView {
                 kind: kind.to_string(),
@@ -1120,9 +1137,12 @@ impl Core {
     }
 
     /// Moves the progress on. A progress that was dismissed or pruned stays gone.
-    fn progress_cb(&self) -> impl Fn(Step) + '_ {
+    fn progress_cb(&self, account: u64) -> impl Fn(Step) + '_ {
         move |step| {
             self.update(|i| {
+                if i.account != account {
+                    return;
+                }
                 if let Some(p) = &i.state.progress {
                     i.state.progress = Some(progress_after(p, &step));
                 }
@@ -1197,6 +1217,7 @@ impl Core {
 
     /// Wakes the sandbox. A connected one also gets its T3 brought in step with the desktop.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
+        let account = self.account();
         let client = self.client()?;
         // Only a sandbox connected from this computer gets its T3 synced after a resume.
         let version = {
@@ -1214,7 +1235,7 @@ impl Core {
                         .await
                         .map_err(ErrorView::from)?;
                     if let Some(o) = o {
-                        self.record_sync(id, v, Some(&o));
+                        self.record_sync(id, v, Some(&o), account);
                     }
                     Ok(())
                 }
@@ -1278,13 +1299,14 @@ impl Core {
     }
 
     pub async fn reinstall_t3(self: &Arc<Self>, id: &str) -> Res<()> {
+        let account = self.account();
         let client = self.client()?;
         let r = async {
             let v = self.desktop_version().await?;
             lifecycle::reinstall(&client, id, &v)
                 .await
                 .map_err(ErrorView::from)?;
-            self.record_version(id, &v);
+            self.record_version(id, &v, account);
             Ok(())
         };
         self.act(r).await
@@ -2700,5 +2722,25 @@ mod tests {
         let _ = call.await.unwrap();
         assert!(store.load(8).contains("m1"), "user 8's list is untouched");
         assert!(core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn progress_from_a_flow_of_an_old_account_is_dropped() {
+        let base = Url::parse("http://127.0.0.1:9").unwrap();
+        let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
+        sign_in_as(&core, &base, 7);
+        let old = core.account();
+        let stale = core.progress_cb(old);
+        core.sign_out().await.unwrap();
+        sign_in_as(&core, &base, 8);
+        // The old flow starts and moves its progress after the switch: nothing shows.
+        core.begin_progress("create", "creating", None, old);
+        stale(Step::Pairing);
+        assert_eq!(core.state().progress, None);
+        // The new account's own progress is not moved by the old flow's callback.
+        core.begin_progress("connect", "connecting", Some("m2".into()), core.account());
+        let before = core.state().progress;
+        stale(Step::Pairing);
+        assert_eq!(core.state().progress, before);
     }
 }
