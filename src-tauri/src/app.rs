@@ -703,8 +703,12 @@ impl Core {
             i.client.as_ref()?;
             let mut failure: Option<ErrorView> = None;
             i.data.desktop_running = running;
-            if let Some((user, set)) = connected {
+            if let Some((user, set, problem)) = connected {
                 i.data.use_connected(user, set);
+                if let Some(e) = problem {
+                    // Shown once: the list is loaded again only for another user.
+                    i.state.error = Some(ErrorView::other(e));
+                }
             }
             match machines {
                 Ok(m) => {
@@ -742,13 +746,20 @@ impl Core {
     }
 
     /// The connected set of `user` from disk, when it is not the one in use.
-    async fn load_connected(&self, user: Option<i64>) -> Option<(i64, HashSet<String>)> {
+    /// A list that cannot be read comes back empty, with the reason.
+    async fn load_connected(
+        &self,
+        user: Option<i64>,
+    ) -> Option<(i64, HashSet<String>, Option<String>)> {
         let user = user.filter(|u| self.lock().data.connected_user != Some(*u))?;
         let store = self.connected.clone();
-        let set = tokio::task::spawn_blocking(move || store.load(user))
+        let r = tokio::task::spawn_blocking(move || store.load_checked(user))
             .await
             .ok()?;
-        Some((user, set))
+        Some(match r {
+            Ok(set) => (user, set, None),
+            Err(e) => (user, HashSet::new(), Some(e)),
+        })
     }
 
     /// Looks for T3 Code on this computer now (the "Check again" button), instead of
@@ -1685,8 +1696,12 @@ mod tests {
     }
 
     fn core_with(store: Arc<dyn ConnectedStore>) -> Arc<Core> {
+        core_on(api_base(None), store)
+    }
+
+    fn core_on(base: Url, store: Arc<dyn ConnectedStore>) -> Arc<Core> {
         Arc::new(Core::new(
-            api_base(None),
+            base,
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             store,
@@ -2400,5 +2415,76 @@ mod tests {
             .unwrap();
         let e = core.state().error.expect("error shown");
         assert!(e.message.contains("disk full"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_connected_list_save_stays_visible_after_pair_again() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let machine = serde_json::json!({
+            "id": "m1", "name": "n", "state": "running", "revision": 1,
+            "template": {"id": "agent-browser", "version": 1, "digest": "d"},
+            "spec": {"vcpus": 2, "memMiB": 4096, "persistentDiskGiB": 10},
+            "runtime": {"ready": true}, "autoSuspendAfterSeconds": 1800,
+            "maxRunMinutes": -1, "runStartedAt": null, "cooldownUntil": null,
+            "metadata": {}, "orgId": "o1", "free": false, "operationId": null
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(machine))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"machines": [], "nextCursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("t3 pair"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"stdout": "Token: abc123\n", "stderr": "", "exitCode": 0}
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": "https://m1.example.test", "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let base = Url::parse(&server.uri()).unwrap();
+        let core = core_on(base.clone(), Arc::new(FailingConnected));
+        sign_in_as(&core, &base, 7);
+        core.pair_again("m1").await.unwrap();
+        let e = core.state().error.expect("error shown");
+        assert!(e.message.contains("disk full"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_connected_list_is_reported_once_and_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connected.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let (_server, base) = listing_server().await;
+        let core = core_on(
+            base.clone(),
+            Arc::new(FileConnectedStore::new(path.clone())),
+        );
+        sign_in_as(&core, &base, 7);
+        core.refresh(false).await;
+        let e = core.state().error.expect("error shown");
+        assert!(
+            e.message
+                .contains("Could not read the list of connected sandboxes"),
+            "{e:?}"
+        );
+        assert!(core.lock().data.connected.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
     }
 }

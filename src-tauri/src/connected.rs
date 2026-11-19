@@ -12,6 +12,10 @@ use serde::Deserialize;
 pub trait ConnectedStore: Send + Sync {
     /// The sandboxes `user` connected from this computer.
     fn load(&self, user: i64) -> HashSet<String>;
+    /// Like `load`, but says why the list could not be read. The list is empty then.
+    fn load_checked(&self, user: i64) -> Result<HashSet<String>, String> {
+        Ok(self.load(user))
+    }
     fn add(&self, user: i64, id: &str) -> Result<(), String>;
     fn remove(&self, user: i64, id: &str) -> Result<(), String>;
 }
@@ -105,17 +109,20 @@ impl FileConnectedStore {
 
 impl ConnectedStore for FileConnectedStore {
     fn load(&self, user: i64) -> HashSet<String> {
+        self.load_checked(user).unwrap_or_default()
+    }
+
+    fn load_checked(&self, user: i64) -> Result<HashSet<String>, String> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok((map, migrated)) = self.read(user) else {
-            return HashSet::new();
-        };
+        let (map, migrated) = self.read(user)?;
         if migrated {
             // Best effort: a failed write migrates again on the next load.
             let _ = self.write(&map);
         }
-        map.get(&user.to_string())
+        Ok(map
+            .get(&user.to_string())
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     fn add(&self, user: i64, id: &str) -> Result<(), String> {
@@ -233,7 +240,8 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_ok() {
-            return; // running as root: permissions do not apply
+            eprintln!("skipped: running as root, file permissions do not apply");
+            return;
         }
         let store = FileConnectedStore::new(path.clone());
         assert!(store.load(7).is_empty());
