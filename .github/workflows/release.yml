@@ -57,6 +57,26 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/notary.p8
+      # A missing secret builds an unsigned app, which macOS reports as damaged. Never publish one.
+      - name: Check the app is signed and notarized
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmgs=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "no .dmg was built" >&2
+            exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            mnt=$(mktemp -d)
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+            apps=("$mnt"/*.app)
+            codesign --verify --strict "${apps[0]}"
+            info=$(codesign -dvv "${apps[0]}" 2>&1)
+            grep -q "^Authority=Developer ID Application" <<<"$info"
+            xcrun stapler validate "${apps[0]}"
+            hdiutil detach "$mnt" >/dev/null
+          done
       - name: Upload the .dmg
         shell: bash
         env:
