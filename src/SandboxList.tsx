@@ -1,7 +1,7 @@
 import type { MouseEvent } from "react";
 import { agentSignIn, reinstallT3, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
-import { AGENTS, agentKey, BUSY, cap, Line, openExternal, StateDot, stateLabel } from "./common";
+import { AGENTS, agentKey, BUSY, cap, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
 import { Dots, Plus } from "./icons";
 import Progress, { ProgressBar, stepText } from "./Progress";
@@ -25,7 +25,7 @@ export type RowLine =
 
 export function rowLine(s: SandboxView, state: AppState, agents: AgentCache): RowLine {
   if (state.progress && state.progress.machineId === s.id) return { kind: "progress" };
-  // A sandbox ahead of this Mac never offers Update.
+  // A sandbox ahead of this computer never offers Update.
   if (s.updatePending && !s.desktopBehind) return { kind: "update" };
   if (s.desktopBehind) return { kind: "desktopBehind" };
   if (!s.connected) return { kind: "connect" };
@@ -84,14 +84,14 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
       </div>
       {line?.kind === "progress" && <Progress state={state} run={run} onConnect={onConnect} />}
       {line?.kind === "update" && (
-        <Line tone="amber" text={state.t3 ? `T3 is older than this Mac's ${state.t3}` : "T3 is older than T3 Code on this Mac"}>
+        <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
           <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
             Update
           </button>
         </Line>
       )}
       {line?.kind === "desktopBehind" && (
-        <Line tone="amber" text="T3 Code on this Mac is older">
+        <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
           <button className="btn sm" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
             Download
           </button>

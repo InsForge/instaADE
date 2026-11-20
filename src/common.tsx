@@ -23,6 +23,9 @@ export const stateLabel = (s: ViewState) => STATE_LABEL[s] ?? s;
 
 export const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
+/** What the UI calls the computer it runs on: "this PC" on Windows, else "this Mac". */
+export const thisComputer = () => (navigator.userAgent.includes("Windows") ? "this PC" : "this Mac");
+
 export const isAsleep = (s: SandboxView) => s.state === "paused" || s.state === "stopped";
 
 /** The free plan fixes size and auto sleep. */

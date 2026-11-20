@@ -711,6 +711,7 @@ test("settings: update, account and this Mac", async () => {
     [{}],
   );
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  expect(screen.getByRole("heading", { name: "This Mac" })).toBeTruthy();
   expect(screen.getByText("A new version of Instabox is ready.")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Download" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.com/v0.2.0" });
@@ -786,6 +787,20 @@ test("signed in without T3 Code and no sandboxes stays on setup", async () => {
   expect(await screen.findByText("Signed in as alex")).toBeTruthy();
   expect(screen.getByText("T3 Code is not on this Mac")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Sign in with GitHub" })).toBeNull();
+});
+
+test("on Windows the copy says this PC, not this Mac", async () => {
+  const windows = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windows);
+  try {
+    show({ t3: null }, [{}]);
+    expect(await screen.findByText("T3 Code is not on this PC")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("heading", { name: "This PC" })).toBeTruthy();
+    expect(screen.queryByText(/this Mac/i)).toBeNull();
+  } finally {
+    ua.mockRestore();
+  }
 });
 
 test("signed in without T3 Code but with sandboxes shows the card above the list", async () => {

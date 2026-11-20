@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { refreshT3, signIn, T3_DOWNLOAD_URL } from "./api";
-import { openExternal } from "./common";
+import { openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
 import { Alert, Check, Logo } from "./icons";
 import type { AppState } from "./types";
 
-/** Reads the T3 Code version on this Mac again, and shows that it did. */
+/** Reads the T3 Code version on this computer again, and shows that it did. */
 export function CheckT3Button({ run }: { run: Run }) {
   const [phase, setPhase] = useState<"idle" | "checking" | "done">("idle");
   useEffect(() => {
@@ -24,7 +24,7 @@ export function CheckT3Button({ run }: { run: Run }) {
   );
 }
 
-/** T3 Code is not on this Mac: shown on first run and at the top of the list. */
+/** T3 Code is not on this computer: shown on first run and at the top of the list. */
 export function T3Missing({ run }: { run: Run }) {
   return (
     <div className="warn-card">
@@ -33,7 +33,7 @@ export function T3Missing({ run }: { run: Run }) {
           <Alert />
         </span>
         <div className="warn-text">
-          <span className="strong">T3 Code is not on this Mac</span>
+          <span className="strong">T3 Code is not on {thisComputer()}</span>
           <span className="small soft">Instabox opens sandboxes in T3 Code. Install it first.</span>
         </div>
       </div>
@@ -84,7 +84,7 @@ export default function Setup({ state, run }: { state: AppState; run: Run }) {
       {t3Ok && (
         <div className="foot found">
           <Check />
-          <span>T3 Code {state.t3} found on this Mac</span>
+          <span>T3 Code {state.t3} found on {thisComputer()}</span>
         </div>
       )}
     </>

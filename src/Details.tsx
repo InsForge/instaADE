@@ -16,7 +16,7 @@ import {
   toErrorView,
 } from "./api";
 import type { Agent } from "./api";
-import { AGENTS, agentKey, cap, copyText, isAsleep, isFree, Line, openExternal, StateDot, stateLabel } from "./common";
+import { AGENTS, agentKey, cap, copyText, isAsleep, isFree, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
 import { Check, Copy, Terminal } from "./icons";
 import Progress from "./Progress";
@@ -38,11 +38,11 @@ export function formatMinutes(m: number): string {
   return r === 0 ? `${h} h` : `${h} h ${r} m`;
 }
 
-/** How the sandbox's T3 compares with T3 Code on this Mac. */
+/** How the sandbox's T3 compares with T3 Code on this computer. */
 export function t3Relation(s: SandboxView, desktop: string | null): string | null {
-  if (s.desktopBehind) return "Newer than this Mac";
-  if (s.updatePending) return "Older than this Mac";
-  if (s.t3Version && s.t3Version === desktop) return "Same as this Mac";
+  if (s.desktopBehind) return `Newer than ${thisComputer()}`;
+  if (s.updatePending) return `Older than ${thisComputer()}`;
+  if (s.t3Version && s.t3Version === desktop) return `Same as ${thisComputer()}`;
   return null;
 }
 
@@ -161,13 +161,13 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
             {progress ? (
               <Progress state={state} run={run} onConnect={onConnect} />
             ) : s.updatePending && !s.desktopBehind ? (
-              <Line tone="amber" text={state.t3 ? `T3 is older than this Mac's ${state.t3}` : "T3 is older than T3 Code on this Mac"}>
+              <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
                 <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
                   Update
                 </button>
               </Line>
             ) : s.desktopBehind ? (
-              <Line tone="amber" text="T3 Code on this Mac is older">
+              <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
                 <button className="btn sm" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
                   Download
                 </button>
