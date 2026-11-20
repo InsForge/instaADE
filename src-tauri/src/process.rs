@@ -1,5 +1,6 @@
 //! Runs a local command with a deadline, so a stuck CLI cannot hang the app.
 
+use std::ffi::OsStr;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,19 @@ pub enum RunError {
     Spawn(std::io::Error),
     /// The command ran past the deadline and was killed.
     TimedOut,
+}
+
+/// A command for `program` that opens no console window on Windows.
+pub fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 /// Reads a pipe on a thread into a shared buffer; the flag flips at EOF.

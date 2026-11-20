@@ -87,14 +87,21 @@ pub struct Bounds {
 const GAP: f64 = 4.0;
 const EDGE: f64 = 8.0;
 
-/// The popover's top-left corner: centered under the icon, kept on the icon's screen.
+/// The popover's top-left corner: centered on the icon, kept on the icon's screen. It opens
+/// under an icon in the top half of the screen (the macOS menu bar) and above one in the
+/// bottom half (a Windows taskbar).
 pub fn popover_origin(icon: Bounds, window: (f64, f64), screen: Bounds) -> (f64, f64) {
     let min = screen.x + EDGE;
     let max = screen.x + screen.w - window.0 - EDGE;
     let x = (icon.x + icon.w / 2.0 - window.0 / 2.0)
         .max(min)
         .min(max.max(min));
-    (x, icon.y + icon.h + GAP)
+    let y = if icon.y + icon.h / 2.0 < screen.y + screen.h / 2.0 {
+        icon.y + icon.h + GAP
+    } else {
+        (icon.y - window.1 - GAP).max(screen.y + EDGE)
+    };
+    (x, y)
 }
 
 /// A click on the icon also takes focus from an open popover, which hides it first. Without
@@ -258,7 +265,11 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
             }
         });
     // Template image: macOS tints it for light and dark menu bars.
+    #[cfg(target_os = "macos")]
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    // Elsewhere nothing tints it, and the black template would vanish on a dark taskbar.
+    #[cfg(not(target_os = "macos"))]
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
     builder = builder.icon(icon).icon_as_template(true);
     builder.build(app)?;
     Ok(())
@@ -388,6 +399,52 @@ mod tests {
             h: 24.0,
         };
         assert_eq!(popover_origin(icon, (360.0, 600.0), second).0, 2992.0);
+    }
+
+    #[test]
+    fn popover_opens_above_an_icon_in_a_bottom_taskbar() {
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let icon = Bounds {
+            x: 1700.0,
+            y: 1040.0,
+            w: 24.0,
+            h: 40.0,
+        };
+        assert_eq!(
+            popover_origin(icon, (360.0, 600.0), screen),
+            (1532.0, 436.0)
+        );
+        let corner = Bounds { x: 1900.0, ..icon };
+        assert_eq!(popover_origin(corner, (360.0, 600.0), screen).0, 1552.0);
+        // A second screen below the first: the icon's own screen decides.
+        let lower = Bounds {
+            y: 1080.0,
+            ..screen
+        };
+        let icon = Bounds { y: 2120.0, ..icon };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), lower).1, 1516.0);
+    }
+
+    #[test]
+    fn a_short_screen_keeps_the_popover_top_on_screen() {
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1093.0,
+            h: 614.0,
+        };
+        let icon = Bounds {
+            x: 900.0,
+            y: 578.0,
+            w: 24.0,
+            h: 36.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), screen).1, 8.0);
     }
 
     #[test]

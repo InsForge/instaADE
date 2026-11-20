@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::api::Client;
 use crate::gate::{Gate, guarded};
-use crate::process::{RunError, run_bounded};
+use crate::process::{RunError, command, run_bounded};
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "mcp-key";
@@ -142,7 +142,7 @@ fn login_shell_path() -> Option<OsString> {
 }
 
 fn login_shell_path_with(shell: &str) -> Option<OsString> {
-    let mut cmd = Command::new(shell);
+    let mut cmd = command(shell);
     cmd.args(["-lic", "echo $PATH"]);
     let (_, stdout, _) = run_bounded(cmd, SHELL_TIMEOUT).ok()?;
     let text = String::from_utf8_lossy(&stdout).into_owned();
@@ -152,7 +152,7 @@ fn login_shell_path_with(shell: &str) -> Option<OsString> {
 
 /// The CLI command: `bin` with `args`, and `path` as its PATH when given (else the inherited one).
 fn cli_command(bin: &Path, args: &[String], path: Option<&OsStr>) -> Command {
-    let mut cmd = Command::new(bin);
+    let mut cmd = command(bin);
     cmd.args(args);
     if let Some(p) = path {
         cmd.env("PATH", p);
