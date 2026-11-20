@@ -10,17 +10,7 @@ Instabox Bridge connects instabox cloud sandboxes to the T3 Code desktop app. Yo
 
 ## Download
 
-Get the latest `.dmg` from [GitHub Releases](../../releases). Pick the aarch64 (Apple silicon) file or the x64 (Intel) file.
-
-## First run on an unsigned build
-
-The builds are not signed yet. macOS blocks the first launch.
-
-1. Open the app once. macOS shows a warning and does not start it.
-2. Open System Settings → Privacy & Security.
-3. Scroll to the message about Instabox Bridge and click Open Anyway.
-
-Right-click → Open no longer works on macOS 15.
+Get the latest `.dmg` from [GitHub Releases](../../releases). Pick the aarch64 (Apple silicon) file or the x64 (Intel) file. Release builds are signed and notarized by Apple, so they open like any downloaded app.
 
 ## What it does on your sandbox
 
