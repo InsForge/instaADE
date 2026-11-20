@@ -646,7 +646,7 @@ test("details check agent status once for a running sandbox, never for a paused 
   show({}, [{}, { id: "b", name: "web", state: "paused" }]);
   await userEvent.click(await screen.findByText("dev-1"));
   await waitFor(() => expect(calls("agent_status").length).toBe(2));
-  expect(screen.getByText("In T3 Code: Settings → Source control")).toBeTruthy();
+  expect(screen.queryByText("GitHub")).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
   await userEvent.click(screen.getByText("web"));
   expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();

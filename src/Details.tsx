@@ -265,10 +265,6 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
                   onStatus={onAgentStatus}
                 />
               ))}
-              <div className="group-row plain">
-                <span>GitHub</span>
-                <span className="small muted end">In T3 Code: Settings → Source control</span>
-              </div>
             </div>
           </section>
 
