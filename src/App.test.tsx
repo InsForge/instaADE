@@ -729,6 +729,16 @@ test("sign-in screen shows the device code", async () => {
   expect(screen.getByText(/Waiting for sign-in in your browser/)).toBeTruthy();
 });
 
+test("Check again shows that it is checking, then that it checked", async () => {
+  let finish: () => void = () => {};
+  show({ t3: null }, [{}], { refresh_t3: () => new Promise<void>((r) => (finish = r)) });
+  await userEvent.click(await screen.findByRole("button", { name: "Check again" }));
+  expect((screen.getByRole("button", { name: "Checking…" }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => finish());
+  expect(await screen.findByRole("button", { name: "Checked" })).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "Check again" }, { timeout: 2500 })).toBeTruthy();
+});
+
 test("first run without T3 Code: Check again and Download T3 Code", async () => {
   show({ signedIn: false, t3: null });
   expect(await screen.findByText("T3 Code is not on this Mac")).toBeTruthy();

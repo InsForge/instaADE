@@ -1,8 +1,28 @@
+import { useEffect, useState } from "react";
 import { refreshT3, signIn, T3_DOWNLOAD_URL } from "./api";
 import { openExternal } from "./common";
 import type { Run } from "./common";
 import { Alert, Check, Logo } from "./icons";
 import type { AppState } from "./types";
+
+/** Reads the T3 Code version on this Mac again, and shows that it did. */
+export function CheckT3Button({ run }: { run: Run }) {
+  const [phase, setPhase] = useState<"idle" | "checking" | "done">("idle");
+  useEffect(() => {
+    if (phase !== "done") return;
+    const t = setTimeout(() => setPhase("idle"), 1500);
+    return () => clearTimeout(t);
+  }, [phase]);
+  const check = () => {
+    setPhase("checking");
+    void run(() => refreshT3()).then((ok) => setPhase(ok ? "done" : "idle"));
+  };
+  return (
+    <button className="btn check-t3" disabled={phase === "checking"} onClick={check}>
+      {phase === "checking" ? "Checking…" : phase === "done" ? "Checked" : "Check again"}
+    </button>
+  );
+}
 
 /** T3 Code is not on this Mac: shown on first run and at the top of the list. */
 export function T3Missing({ run }: { run: Run }) {
@@ -18,9 +38,7 @@ export function T3Missing({ run }: { run: Run }) {
         </div>
       </div>
       <div className="warn-buttons">
-        <button className="btn" onClick={() => run(() => refreshT3())}>
-          Check again
-        </button>
+        <CheckT3Button run={run} />
         <button className="btn primary" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
           Download T3 Code
         </button>

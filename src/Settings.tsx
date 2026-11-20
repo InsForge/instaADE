@@ -1,4 +1,5 @@
-import { addMcp, refreshT3, setStartAtLogin, signOut, switchOrg } from "./api";
+import { addMcp, setStartAtLogin, signOut, switchOrg } from "./api";
+import { CheckT3Button } from "./Setup";
 import type { McpClient } from "./api";
 import { cap, openExternal } from "./common";
 import type { Run } from "./common";
@@ -55,9 +56,7 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
               <span>
                 T3 Code <span className="muted">{state.t3 ?? "Not found"}</span>
               </span>
-              <button className="btn" onClick={() => run(() => refreshT3())}>
-                Check again
-              </button>
+              <CheckT3Button run={run} />
             </div>
             <div className="group-row plain">
               <label htmlFor="login-switch">Start at login</label>

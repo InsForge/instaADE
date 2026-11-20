@@ -127,6 +127,10 @@ pre {
   white-space: nowrap;
   cursor: pointer;
 }
+/* Keeps the same width while the label changes. */
+.btn.check-t3 {
+  min-width: 88px;
+}
 .btn:hover:not(:disabled) {
   background: var(--hover);
 }
