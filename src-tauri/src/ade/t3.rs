@@ -12,7 +12,7 @@ use crate::process::{RunError, command, run_bounded};
 pub const ID: &str = "t3";
 pub const NAME: &str = "T3 Code";
 pub const SHORT_NAME: &str = "T3";
-pub const PLATFORMS: &[Platform] = &[Platform::MacOs, Platform::Windows, Platform::Linux];
+pub const PLATFORMS: &[Platform] = &[Platform::MacOs, Platform::Windows];
 pub const DOWNLOAD_URL: &str = "https://github.com/pingdotgg/t3code/releases/latest";
 pub const URL_SCHEME: &str = "t3code";
 
