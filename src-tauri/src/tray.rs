@@ -129,7 +129,12 @@ fn logical_size(window: &WebviewWindow) -> tauri::Result<(f64, f64)> {
 /// Places the popover by the icon. False when the icon has no place yet.
 fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<bool> {
     let p = icon.position.to_physical::<f64>(1.0);
-    let Some(screen) = app.monitor_from_point(p.x, p.y)?.or(app.primary_monitor()?) else {
+    let mut screen = app.monitor_from_point(p.x, p.y)?;
+    // On Windows an icon in the hidden icons flyout reports a place off every screen.
+    if cfg!(target_os = "macos") {
+        screen = screen.or(app.primary_monitor()?);
+    }
+    let Some(screen) = screen else {
         return Ok(false);
     };
     let scale = screen.scale_factor();
