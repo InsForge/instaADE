@@ -54,6 +54,6 @@ jobs:
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
-          name: instabox-bridge-windows-nsis
+          name: instabox-windows-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
