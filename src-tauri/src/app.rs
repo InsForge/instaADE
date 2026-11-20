@@ -306,9 +306,10 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
 /// has no mark. Empty when the mark names only ADEs this build does not know, such as one a
 /// newer app connected: such a sandbox never counts as the default.
 fn machine_ades(m: &Machine) -> Vec<Ade> {
-    match m.metadata.get(view::BRIDGE_KEY) {
-        None => vec![Ade::default()],
-        Some(_) => view::marked_ades(&m.metadata),
+    if view::has_mark(&m.metadata) {
+        view::marked_ades(&m.metadata)
+    } else {
+        vec![Ade::default()]
     }
 }
 
@@ -2026,7 +2027,7 @@ mod tests {
         // e has T3 and cmux.
         d.machines[4]
             .metadata
-            .insert("instabox-bridge".into(), "t3,cmux".into());
+            .insert("instabox-ades".into(), "t3,cmux".into());
         let mut s = AppState::default();
         s.apply(&d, now());
         s.signed_in = true;
@@ -2667,12 +2668,15 @@ mod tests {
     #[test]
     fn a_sandbox_with_several_ades_keeps_t3_in_step() {
         let mut d = data();
-        for (i, mark) in [(0, "cmux,t3"), (1, "cmux")] {
-            d.machines[i]
-                .metadata
-                .insert("instabox-bridge".into(), mark.into());
-        }
         // a: cmux first, then T3. b (running, connected, other org): cmux only.
+        for (i, ades) in [(0, vec![Ade::Cmux, Ade::T3]), (1, vec![Ade::Cmux])] {
+            let md = &mut d.machines[i].metadata;
+            md.clear();
+            for a in ades {
+                view::mark(md, a);
+            }
+        }
+        assert_eq!(d.machines[0].metadata["instabox-bridge"], "t3");
         assert_eq!(d.ades_of("a"), [Ade::Cmux, Ade::T3]);
         assert_eq!(d.ade_of("a"), Some(Ade::Cmux), "the first one");
         assert_eq!(d.ade_of("b"), Some(Ade::Cmux), "a cmux mark routes to cmux");
@@ -2686,15 +2690,18 @@ mod tests {
         assert_eq!(sync_targets(&d, Ade::Cmux), ["a", "b"]);
         // No mark is still the default; a mark keeps the ADEs this build knows and skips the rest.
         assert_eq!(d.ades_of("f"), [Ade::T3]);
-        d.machines[0]
-            .metadata
-            .insert("instabox-bridge".into(), "future-ade,t3".into());
+        let md = &mut d.machines[0].metadata;
+        md.insert("instabox-bridge".into(), "t3".into());
+        md.insert("instabox-ades".into(), "future-ade,t3".into());
         assert_eq!(d.ade_of("a"), Some(Ade::T3));
         assert_eq!(d.pinned_ade_of("a"), Some(Ade::T3));
-        d.machines[0]
-            .metadata
-            .insert("instabox-bridge".into(), "future-ade".into());
+        let md = &mut d.machines[0].metadata;
+        md.insert("instabox-bridge".into(), "future-ade".into());
+        md.insert("instabox-ades".into(), "future-ade".into());
         assert_eq!((d.ade_of("a"), d.pinned_ade_of("a")), (None, None));
+        // Only the list, with no instabox-bridge, is a mark too.
+        d.machines[0].metadata.remove("instabox-bridge");
+        assert_eq!(d.ade_of("a"), None);
         assert!(!sync_targets(&d, Ade::T3).contains(&"a".to_string()));
     }
 
@@ -3584,7 +3591,9 @@ mod tests {
 
     #[tokio::test]
     async fn open_in_cmux_opens_its_link_with_an_ssh_token_and_runs_nothing() {
-        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3,cmux"})).await;
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3,cmux"}))
+                .await;
         let ssh = Arc::new(MemorySshStore::default());
         let (core, opened) = core_full(
             base.clone(),
@@ -3636,7 +3645,8 @@ mod tests {
         assert!(execs[0].contains("chmod go-w ~/.local ~/.local/state"));
         let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
-        assert_eq!(body["metadata"]["instabox-bridge"], "t3,cmux");
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,cmux");
         let s = core.state();
         assert_eq!(s.progress, None);
         assert_eq!(s.error, None);

@@ -982,7 +982,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3"}})
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3"}})
         );
         assert!(patch.headers.get("Idempotency-Key").is_some());
     }
@@ -1176,7 +1176,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3,cmux"}})
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3,cmux"}})
         );
         drop(server);
     }

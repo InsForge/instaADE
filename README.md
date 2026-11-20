@@ -60,7 +60,12 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 
 cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so Instabox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so Instabox opens it only in the cmux app, never through cmux.com. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
-A sandbox can have several ADEs. The `instabox-bridge` metadata key lists them, comma separated (`t3,cmux`); a sandbox connected by v0.1.x holds `t3`.
+A sandbox can have several ADEs. Its metadata marks them with two keys:
+
+- `instabox-ades` lists every ADE id, comma separated, in the order they were added, such as `t3,cmux`.
+- `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating it as connected. Else it is the first id of the list.
+
+Instabox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key counts as T3.
 
 ## Roadmap
 

@@ -514,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn resume_finds_t3_in_a_mark_of_several_ades() {
         let server = MockServer::start().await;
-        let md = serde_json::json!({"instabox-bridge": "cmux,t3"});
+        let md = serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "cmux,t3"});
         mount_machine(&server, "running", false, md).await;
         exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
         let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
@@ -526,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn resume_of_a_cmux_only_sandbox_does_not_sync_t3() {
         let server = MockServer::start().await;
-        let md = serde_json::json!({"instabox-bridge": "cmux"});
+        let md = serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"});
         mount_machine(&server, "running", false, md).await;
         exec_mock(&server, "", "", "", 0, 0).await;
         let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
