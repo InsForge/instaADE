@@ -30,6 +30,8 @@ pub enum SandboxError {
     /// The sandbox runs a newer version of the ADE than the desktop; the app never moves it
     /// back.
     NewerThanDesktop(Ade),
+    /// The ADE installs nothing on the sandbox, so there is nothing to set up again.
+    NoReinstall(Ade),
     Api(api::Error),
 }
 
@@ -58,6 +60,13 @@ impl fmt::Display for SandboxError {
                 ade.short_name(),
                 ade.name()
             ),
+            SandboxError::NoReinstall(ade) => {
+                write!(
+                    f,
+                    "{} installs nothing on the sandbox to reinstall",
+                    ade.name()
+                )
+            }
             SandboxError::Api(e) => write!(f, "{}", e.message),
         }
     }

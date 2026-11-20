@@ -10,18 +10,44 @@ use crate::api::types::{Machine, MachineSpec, Me, Template};
 
 /// The server's idle time when a machine sets none, and the free plan's fixed one.
 const DEFAULT_SLEEP_SECONDS: i64 = 1800;
-/// The metadata key that marks a sandbox as connected. Its value is the ADE's id.
+/// The metadata key that marks a sandbox as connected. Its value lists the ids of the ADEs
+/// set up on it, comma separated, in the order they were added: `t3`, `t3,cmux`. Sandboxes
+/// connected by v0.1.x hold `t3`, which reads as before.
 pub(crate) const BRIDGE_KEY: &str = "instabox-bridge";
 
-/// The ADE a sandbox is marked as connected to. Sandboxes connected by v0.1.x hold `t3`.
-/// None when there is no mark or its value is not a known ADE id.
-pub fn marked_ade(metadata: &BTreeMap<String, String>) -> Option<Ade> {
-    metadata.get(BRIDGE_KEY).and_then(|v| Ade::from_id(v))
+/// The ids in a mark, trimmed, without empty entries.
+fn mark_ids(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').map(str::trim).filter(|id| !id.is_empty())
 }
 
-/// Marks a sandbox's metadata as connected to `ade`. Other keys stay.
+/// The ADEs a sandbox is marked with, in the order they were added, each once. Ids this
+/// build does not know (written by a newer one) are skipped. Empty without a mark.
+pub fn marked_ades(metadata: &BTreeMap<String, String>) -> Vec<Ade> {
+    let mut out = Vec::new();
+    for ade in metadata
+        .get(BRIDGE_KEY)
+        .into_iter()
+        .flat_map(|v| mark_ids(v))
+        .filter_map(Ade::from_id)
+    {
+        if !out.contains(&ade) {
+            out.push(ade);
+        }
+    }
+    out
+}
+
+/// Adds `ade` to a sandbox's mark. Every id already there stays, ones this build does not
+/// know too, and so do the other keys. A first mark is the ADE's id alone, as v0.1.x wrote.
 pub fn mark(metadata: &mut BTreeMap<String, String>, ade: Ade) {
-    metadata.insert(BRIDGE_KEY.to_string(), ade.id().to_string());
+    let mut ids: Vec<String> = metadata
+        .get(BRIDGE_KEY)
+        .map(|v| mark_ids(v).map(str::to_string).collect())
+        .unwrap_or_default();
+    if !ids.iter().any(|id| id == ade.id()) {
+        ids.push(ade.id().to_string());
+    }
+    metadata.insert(BRIDGE_KEY.to_string(), ids.join(","));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -69,8 +95,8 @@ pub struct SandboxView {
     pub state: ViewState,
     pub size: String,
     pub connected: bool,
-    /// The ADE the sandbox is marked as connected to.
-    pub ade: Option<Ade>,
+    /// The ADEs the sandbox is marked with, in the order they were added.
+    pub ades: Vec<Ade>,
     pub t3_version: Option<String>,
     pub free: bool,
     pub auto_sleep: AutoSleep,
@@ -151,8 +177,8 @@ pub fn view(m: &Machine, now: DateTime<Utc>) -> SandboxView {
         name: m.name.clone(),
         state,
         size: size_label(&m.spec),
-        connected: marked_ade(&m.metadata).is_some(),
-        ade: marked_ade(&m.metadata),
+        connected: !marked_ades(&m.metadata).is_empty(),
+        ades: marked_ades(&m.metadata),
         t3_version: None,
         free: m.free,
         auto_sleep,
@@ -296,27 +322,68 @@ mod tests {
         let v = view(&m, now());
         assert!(v.connected);
         assert_eq!(v.t3_version, None);
-        assert_eq!(v.ade, Some(Ade::T3));
+        assert_eq!(v.ades, [Ade::T3]);
+        m.metadata
+            .insert("instabox-bridge".into(), "t3,cmux".into());
+        assert_eq!(view(&m, now()).ades, [Ade::T3, Ade::Cmux]);
+    }
+
+    fn marked(value: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("instabox-bridge".to_string(), value.to_string()),
+        ])
     }
 
     #[test]
     fn the_mark_holds_the_ade_id_and_keeps_other_keys() {
         let mut md = BTreeMap::from([("a".to_string(), "1".to_string())]);
-        assert_eq!(marked_ade(&md), None);
+        assert_eq!(marked_ades(&md), []);
         mark(&mut md, Ade::T3);
         // The same mark v0.1.x wrote, so its sandboxes stay connected.
-        assert_eq!(
-            md,
-            BTreeMap::from([
-                ("a".to_string(), "1".to_string()),
-                ("instabox-bridge".to_string(), "t3".to_string()),
-            ])
-        );
-        assert_eq!(marked_ade(&md), Some(Ade::T3));
+        assert_eq!(md, marked("t3"));
+        assert_eq!(marked_ades(&md), [Ade::T3]);
         md.insert("instabox-bridge".into(), "other".into());
-        assert_eq!(marked_ade(&md), None);
+        assert_eq!(marked_ades(&md), []);
         let j = serde_json::to_value(view(&machine("running"), now())).unwrap();
-        assert_eq!(j["ade"], serde_json::Value::Null);
+        assert_eq!(j["ades"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_v0_1_mark_reads_exactly_as_before() {
+        // v0.1.x wrote the bare id; it is T3 and only T3, and adding T3 again changes nothing.
+        let mut md = marked("t3");
+        assert_eq!(marked_ades(&md), [Ade::T3]);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md, marked("t3"));
+    }
+
+    #[test]
+    fn the_mark_holds_several_ades_in_the_order_they_came() {
+        let mut md = marked("t3");
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked("t3,cmux"));
+        assert_eq!(marked_ades(&md), [Ade::T3, Ade::Cmux]);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md, marked("t3,cmux"), "each id once");
+
+        let mut md = BTreeMap::new();
+        mark(&mut md, Ade::Cmux);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md["instabox-bridge"], "cmux,t3");
+        assert_eq!(marked_ades(&md), [Ade::Cmux, Ade::T3]);
+    }
+
+    #[test]
+    fn the_mark_reads_loosely_and_keeps_ids_it_does_not_know() {
+        assert_eq!(marked_ades(&marked(" t3 , cmux ")), [Ade::T3, Ade::Cmux]);
+        assert_eq!(marked_ades(&marked("t3,,t3,")), [Ade::T3]);
+        assert_eq!(marked_ades(&marked("")), []);
+        // An ADE a newer build added stays in the mark when this build adds its own.
+        let mut md = marked("orca,t3");
+        assert_eq!(marked_ades(&md), [Ade::T3]);
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked("orca,t3,cmux"));
     }
 
     #[test]

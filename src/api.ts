@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AppState, ErrorView } from "./types";
+import type { AdeId, AppState, ErrorView } from "./types";
 
 /** Thin wrappers over the Tauri commands. Rejections are ErrorView objects. */
 export type Agent = "claude" | "codex";
@@ -18,6 +18,8 @@ export const createSandbox = (a: {
   vcpus: number;
   memMiB: number;
   autoSuspendAfterSeconds?: number;
+  /** The ADE to set up; none: a plain sandbox. */
+  ade?: AdeId;
 }) => invoke<void>("create_sandbox", a);
 export const connectSandbox = (id: string) => invoke<void>("connect_sandbox", { id });
 export const dismissProgress = () => invoke<void>("dismiss_progress");

@@ -1,5 +1,6 @@
-//! Create a sandbox (or take an existing one), install an ADE, pair it, publish its port
-//! and mark it connected.
+//! Create a sandbox (or take an existing one), set an ADE up on it and mark it connected.
+//! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
+//! prep command, and the app opens its link afterwards.
 
 use crate::ade::{Ade, Open, SETUP_EXIT_BUSY};
 use crate::api::{
@@ -39,10 +40,12 @@ pub enum Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connected {
     pub machine_id: String,
-    pub link: String,
+    /// The pairing link to open. None for a link ADE: the app makes its link with an SSH
+    /// token (`Open::Link`).
+    pub link: Option<String>,
     /// The ADE version the sandbox runs: the desktop's after a setup, or its own (newer, or
-    /// older with the update pending).
-    pub version: String,
+    /// older with the update pending). None for an ADE that installs nothing there.
+    pub version: Option<String>,
     /// The sandbox kept its older version because the ADE was busy: offer the update later.
     pub update_pending: bool,
 }
@@ -50,6 +53,7 @@ pub struct Connected {
 const STDERR_LINES: usize = 20;
 pub(crate) const SETUP_TIMEOUT_SECS: u32 = 600;
 const PAIR_TIMEOUT_SECS: u32 = 60;
+const PREP_TIMEOUT_SECS: u32 = 60;
 
 pub(crate) fn tail_lines(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
@@ -116,6 +120,16 @@ pub async fn create_and_connect(
     desktop_version: &str,
     progress: impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
+    let id = create(client, req, &progress).await?;
+    install_and_pair(client, ade, &id, desktop_version, &progress).await
+}
+
+/// Creates a sandbox with no ADE and waits until it runs. Returns its id.
+pub async fn create(
+    client: &Client,
+    req: &NewSandbox,
+    progress: &impl Fn(Step),
+) -> Result<String, SandboxError> {
     check_free_limit(client, req.org_id.as_deref()).await?;
     progress(Step::Creating);
     let body = CreateMachineRequest {
@@ -138,7 +152,7 @@ pub async fn create_and_connect(
     let op = retry_transient(|| client.create(&body, &key)).await?;
     progress(Step::Created(op.machine_id.clone()));
     let machine = wait_op(client, &op, CREATE_WAIT).await?;
-    install_and_pair(client, ade, &machine.id, desktop_version, &progress).await
+    Ok(machine.id)
 }
 
 pub async fn connect_existing(
@@ -155,6 +169,19 @@ pub async fn connect_existing(
     install_and_pair(client, ade, machine_id, desktop_version, &progress).await
 }
 
+/// Writes `ade` into the sandbox's mark, next to any ADE already there.
+async fn mark_connected(client: &Client, ade: Ade, id: &str) -> Result<(), SandboxError> {
+    let mut metadata = client.machine(id).await?.metadata;
+    mark(&mut metadata, ade);
+    let update = UpdateMachineRequest {
+        metadata: Some(metadata),
+        ..Default::default()
+    };
+    let key = new_key();
+    retry_transient(|| client.patch(id, &update, &key)).await?;
+    Ok(())
+}
+
 async fn install_and_pair(
     client: &Client,
     ade: Ade,
@@ -162,17 +189,26 @@ async fn install_and_pair(
     desktop_version: &str,
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
+    if let Open::Link(l) = ade.open() {
+        return prepare(client, ade, l.prep, id, desktop_version, progress).await;
+    }
     // Never move a sandbox to an older version: when it is ahead of the desktop, only pair.
-    let found = client
-        .exec(
-            id,
-            &ExecRequest {
-                cmd: ade.version_script().to_string(),
-                timeout_seconds: Some(30),
-            },
-        )
-        .await?;
-    let remote = ade.parse_version(&found.stdout);
+    let found = match ade.version_script() {
+        Some(script) => {
+            client
+                .exec(
+                    id,
+                    &ExecRequest {
+                        cmd: script.to_string(),
+                        timeout_seconds: Some(30),
+                    },
+                )
+                .await?
+                .stdout
+        }
+        None => String::new(),
+    };
+    let remote = ade.parse_version(&found);
     let ahead = remote_is_newer(desktop_version, remote.as_deref());
     let mut update_pending = false;
     if !ahead {
@@ -199,23 +235,49 @@ async fn install_and_pair(
     progress(Step::Pairing);
     let link = pair_link(client, ade, id).await?;
     // The mark goes last: only a fully set up sandbox counts as connected.
-    let mut metadata = client.machine(id).await?.metadata;
-    mark(&mut metadata, ade);
-    let update = UpdateMachineRequest {
-        metadata: Some(metadata),
-        ..Default::default()
-    };
-    let key = new_key();
-    retry_transient(|| client.patch(id, &update, &key)).await?;
+    mark_connected(client, ade, id).await?;
     progress(Step::Done);
     Ok(Connected {
         machine_id: id.to_string(),
-        link,
-        version: match remote {
+        link: Some(link),
+        version: Some(match remote {
             Some(r) if ahead || update_pending => r,
             _ => desktop_version.to_string(),
-        },
+        }),
         update_pending,
+    })
+}
+
+/// Sets a link ADE up: one run of its prep command, then the mark. Nothing is installed, so
+/// there is no version to compare and no link yet: the app makes it with an SSH token.
+async fn prepare(
+    client: &Client,
+    ade: Ade,
+    prep: &str,
+    id: &str,
+    desktop_version: &str,
+    progress: &impl Fn(Step),
+) -> Result<Connected, SandboxError> {
+    progress(Step::Installing(desktop_version.to_string()));
+    let r = client
+        .exec(
+            id,
+            &ExecRequest {
+                cmd: prep.to_string(),
+                timeout_seconds: Some(PREP_TIMEOUT_SECS),
+            },
+        )
+        .await?;
+    if r.timed_out || r.exit_code != 0 {
+        return Err(setup_failure(ade, &r, PREP_TIMEOUT_SECS));
+    }
+    mark_connected(client, ade, id).await?;
+    progress(Step::Done);
+    Ok(Connected {
+        machine_id: id.to_string(),
+        link: None,
+        version: None,
+        update_pending: false,
     })
 }
 
@@ -233,7 +295,12 @@ fn remote_is_newer(desktop: &str, remote: Option<&str>) -> bool {
 /// A fresh pairing link: one run of the ADE's pair script, then the published port. The
 /// sandbox must be running.
 async fn pair_link(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
-    let Open::Pair(p) = ade.open();
+    let Open::Pair(p) = ade.open() else {
+        return Err(SandboxError::Setup {
+            ade,
+            stderr_tail: format!("{} does not pair", ade.name()),
+        });
+    };
     let pair = client
         .exec(
             id,
@@ -450,8 +517,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.machine_id, "m1");
-        assert!(out.link.starts_with("t3code://pair?pairingUrl="));
-        assert!(out.link.contains("abc123"));
+        let link = out.link.unwrap();
+        assert!(link.starts_with("t3code://pair?pairingUrl="));
+        assert!(link.contains("abc123"));
+        assert_eq!(out.version.as_deref(), Some("9.9.9"));
         let c = calls(&server).await;
         let order = [
             "POST /v1/machines",
@@ -553,7 +622,7 @@ mod tests {
         let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
-        assert!(out.link.starts_with("t3code://pair?pairingUrl="));
+        assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
         // Dropping the server checks the expect(0) on the setup exec.
         drop(server);
     }
@@ -565,7 +634,10 @@ mod tests {
         let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
-        assert_eq!((out.version.as_str(), out.update_pending), ("9.9.9", false));
+        assert_eq!(
+            (out.version.as_deref(), out.update_pending),
+            (Some("9.9.9"), false)
+        );
         drop(server);
     }
 
@@ -585,8 +657,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(out.link.starts_with("t3code://pair?pairingUrl="));
-        assert_eq!(out.version, "9.0.0", "keeps its own T3 for now");
+        assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
+        assert_eq!(
+            out.version.as_deref(),
+            Some("9.0.0"),
+            "keeps its own T3 for now"
+        );
         assert!(out.update_pending);
         assert!(steps.lock().unwrap().contains(&Step::Done));
         let c = calls(&server).await;
@@ -1025,6 +1101,140 @@ mod tests {
         })
         .await;
         assert_eq!(*seen.lock().unwrap(), vec!["m1".to_string()]);
+    }
+
+    /// A running sandbox with `metadata`, whose exec answers `prep` with `code`.
+    async fn running_for_prep(server: &MockServer, metadata: serde_json::Value, code: i32) {
+        mock(
+            server,
+            "GET",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", metadata)),
+        )
+        .await;
+        let stderr = if code == 0 { "" } else { "chmod: denied" };
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("chmod go-w ~/.local ~/.local/state"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"stdout": "", "stderr": stderr, "exitCode": code}),
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        mock(
+            server,
+            "PATCH",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", serde_json::json!({}))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cmux_runs_its_prep_and_adds_itself_to_the_mark() {
+        let server = MockServer::start().await;
+        running_for_prep(
+            &server,
+            serde_json::json!({"a": "1", "instabox-bridge": "t3"}),
+            0,
+        )
+        .await;
+        let steps = Mutex::new(Vec::new());
+        let out = connect_existing(&client(&server), Ade::Cmux, "m1", "0.64.25", |s| {
+            steps.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            Connected {
+                machine_id: "m1".into(),
+                link: None,
+                version: None,
+                update_pending: false,
+            }
+        );
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![Step::Installing("0.64.25".into()), Step::Done]
+        );
+        let reqs = server.received_requests().await.unwrap();
+        // One exec (the prep), no port, no pairing; the mark keeps T3 and adds cmux.
+        let execs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1);
+        let prep: serde_json::Value = serde_json::from_slice(&execs[0].body).unwrap();
+        assert_eq!(
+            prep["cmd"],
+            "mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state"
+        );
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ports")));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3,cmux"}})
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_failed_cmux_prep_leaves_no_mark() {
+        let server = MockServer::start().await;
+        running_for_prep(&server, serde_json::json!({}), 1).await;
+        let e = connect_existing(&client(&server), Ade::Cmux, "m1", "0.64.25", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e,
+            SandboxError::Setup {
+                ade: Ade::Cmux,
+                stderr_tail: "chmod: denied".into()
+            }
+        );
+        let c = calls(&server).await;
+        assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_create_installs_nothing_and_marks_nothing() {
+        let server = MockServer::start().await;
+        me(&server, "pro").await;
+        mock(
+            &server,
+            "POST",
+            "/v1/machines",
+            ResponseTemplate::new(202).set_body_json(op("queued", None)),
+        )
+        .await;
+        mock(
+            &server,
+            "GET",
+            "/v1/operations/op1",
+            ResponseTemplate::new(200).set_body_json(op(
+                "succeeded",
+                Some(machine("running", serde_json::json!({}))),
+            )),
+        )
+        .await;
+        let steps = Mutex::new(Vec::new());
+        let id = create(&client(&server), &req(), &|s| steps.lock().unwrap().push(s))
+            .await
+            .unwrap();
+        assert_eq!(id, "m1");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![Step::Creating, Step::Created("m1".into())]
+        );
+        let c = calls(&server).await;
+        assert!(
+            !c.iter()
+                .any(|x| x.ends_with("/exec") || x.starts_with("PATCH")),
+            "{c:?}"
+        );
     }
 
     #[tokio::test]

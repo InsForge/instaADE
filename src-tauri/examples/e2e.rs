@@ -281,15 +281,16 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
         ),
     );
     let connected = c.must(name, t, res.map_err(|e| format!("{e} [{timings}]")))?;
-    let link_ok = connected.link.starts_with("t3code://pair");
+    let link_ok = connected
+        .link
+        .as_deref()
+        .is_some_and(|l| l.starts_with("t3code://pair"));
+    let version = connected.version.clone().unwrap_or_default();
     c.check(
         name,
-        link_ok && connected.version == desktop_v,
+        link_ok && version == desktop_v,
         t,
-        format!(
-            "link starts with t3code://pair: {link_ok}; t3 {}; {timings}",
-            connected.version
-        ),
+        format!("link starts with t3code://pair: {link_ok}; t3 {version}; {timings}"),
     );
     let id = connected.machine_id.clone();
 
@@ -447,7 +448,7 @@ async fn exec_checks(client: &Client, c: &Checks, id: &str, desktop_v: &str, whe
     }
 
     let t = Instant::now();
-    let probe = ADE.probe().path();
+    let probe = ADE.probe().expect("T3 has a probe").path();
     let name = format!("probe file mode 755 ({when})");
     match sh(client, id, &format!("stat -c '%a %U' {probe}")).await {
         Ok((code, out)) => c.check(

@@ -5,7 +5,7 @@ use crate::ade::{Ade, SETUP_EXIT_BUSY, parse_probe};
 use crate::api::{Action, Client, ExecRequest, PatchResult, UpdateMachineRequest};
 use crate::sandbox::connect::{SETUP_TIMEOUT_SECS, setup_failure};
 use crate::sandbox::sync::{SyncOutcome, sync};
-use crate::sandbox::view::marked_ade;
+use crate::sandbox::view::marked_ades;
 use crate::sandbox::{
     SandboxError, WAKE_WAIT, cooldown_or_api, ensure_running, new_key, retry_transient, wait_op,
 };
@@ -45,7 +45,7 @@ pub async fn resume(
     desktop_version: &str,
 ) -> Result<Option<SyncOutcome>, SandboxError> {
     let machine = ensure_running(client, id).await?;
-    if marked_ade(&machine.metadata) != Some(ade) {
+    if !marked_ades(&machine.metadata).contains(&ade) {
         return Ok(None);
     }
     sync(client, ade, id, desktop_version).await.map(Some)
@@ -126,16 +126,22 @@ async fn run(
 }
 
 /// Runs the ADE's setup script again at `desktop_version`, whatever the sandbox has now.
-/// Never while the ADE is busy. Wakes the sandbox first.
+/// Never while the ADE is busy. Wakes the sandbox first. An ADE that installs nothing on the
+/// sandbox (cmux) has nothing to reinstall: `NoReinstall`, with no request.
 pub async fn reinstall(
     client: &Client,
     ade: Ade,
     id: &str,
     desktop_version: &str,
 ) -> Result<(), SandboxError> {
+    let (Some(version_script), Some(probe), Some(stop)) =
+        (ade.version_script(), ade.probe(), ade.stop_script())
+    else {
+        return Err(SandboxError::NoReinstall(ade));
+    };
     ensure_running(client, id).await?;
     // Never move a sandbox to an older version, so this stops before the probe, stop and setup.
-    let found = run(client, id, ade.version_script(), QUERY_TIMEOUT_SECS).await?;
+    let found = run(client, id, version_script, QUERY_TIMEOUT_SECS).await?;
     if let (Ok(desktop), Some(Ok(remote))) = (
         semver::Version::parse(desktop_version),
         ade.parse_version(&found.stdout)
@@ -144,11 +150,11 @@ pub async fn reinstall(
     {
         return Err(SandboxError::NewerThanDesktop(ade));
     }
-    let probe = run(client, id, &ade.probe().path(), QUERY_TIMEOUT_SECS).await?;
+    let probe = run(client, id, &probe.path(), QUERY_TIMEOUT_SECS).await?;
     if parse_probe(&probe.stdout).busy {
         return Err(SandboxError::AdeBusy(ade));
     }
-    run(client, id, ade.stop_script(), STOP_TIMEOUT_SECS).await?;
+    run(client, id, stop, STOP_TIMEOUT_SECS).await?;
     let setup = run(
         client,
         id,
@@ -503,6 +509,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d, None);
+    }
+
+    #[tokio::test]
+    async fn resume_finds_t3_in_a_mark_of_several_ades() {
+        let server = MockServer::start().await;
+        let md = serde_json::json!({"instabox-bridge": "cmux,t3"});
+        mount_machine(&server, "running", false, md).await;
+        exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
+        let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
+        assert!(d.is_some(), "synced: the mark holds t3");
+    }
+
+    #[tokio::test]
+    async fn resume_of_a_cmux_only_sandbox_does_not_sync_t3() {
+        let server = MockServer::start().await;
+        let md = serde_json::json!({"instabox-bridge": "cmux"});
+        mount_machine(&server, "running", false, md).await;
+        exec_mock(&server, "", "", "", 0, 0).await;
+        let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
+        assert_eq!(d, None);
+    }
+
+    #[tokio::test]
+    async fn cmux_has_nothing_to_reinstall_and_makes_no_request() {
+        let server = MockServer::start().await;
+        let e = reinstall(&client(&server), Ade::Cmux, "m1", "0.64.25")
+            .await
+            .unwrap_err();
+        assert_eq!(e, SandboxError::NoReinstall(Ade::Cmux));
+        assert_eq!(
+            e.to_string(),
+            "cmux installs nothing on the sandbox to reinstall"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

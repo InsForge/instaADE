@@ -26,6 +26,13 @@
       "shortName": "T3",
       "version": "0.1.10",
       "downloadUrl": "https://github.com/pingdotgg/t3code/releases/latest"
+    },
+    {
+      "id": "cmux",
+      "name": "cmux",
+      "shortName": "cmux",
+      "version": "0.64.25",
+      "downloadUrl": "https://github.com/manaflow-ai/cmux/releases/latest"
     }
   ],
   "sandboxes": [
@@ -35,7 +42,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": true,
-      "ade": "t3",
+      "ades": ["t3"],
       "t3Version": "0.1.10",
       "free": true,
       "autoSleep": {
@@ -53,7 +60,7 @@
       "state": "paused",
       "size": "4 vCPU / 8 GB",
       "connected": true,
-      "ade": "t3",
+      "ades": ["t3", "cmux"],
       "t3Version": null,
       "free": false,
       "autoSleep": {
@@ -71,7 +78,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": false,
-      "ade": null,
+      "ades": [],
       "t3Version": null,
       "free": false,
       "autoSleep": {
@@ -89,7 +96,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": false,
-      "ade": null,
+      "ades": [],
       "t3Version": null,
       "free": false,
       "autoSleep": {
@@ -134,6 +141,7 @@
     "kind": "create",
     "step": "installing",
     "machineId": "a",
+    "ade": "t3",
     "error": null
   },
   "error": {

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use url::Url;
 
-use crate::ade::{self, Ade, Open};
+use crate::ade::{self, Ade, Open, SshLogin};
 use crate::agents::{self, Agent};
 use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, Template};
 use crate::auth::{self, Provider, Session};
@@ -75,13 +75,15 @@ pub struct McpStatus {
 /// Where a create or connect is. `kind` is `create` (a new sandbox) or `connect` (one that
 /// exists). `step` is one of `connecting`, `creating`, `waking`, `installing`, `pairing`,
 /// `done`. `machine_id` is set once the sandbox exists, so the UI's Retry can call
-/// `connect_sandbox` with it.
+/// `connect_sandbox` with it and `ade`. `ade` is the ADE being set up; None for a create
+/// without one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressView {
     pub kind: String,
     pub step: String,
     pub machine_id: Option<String>,
+    pub ade: Option<Ade>,
     pub error: Option<ErrorView>,
 }
 
@@ -171,12 +173,25 @@ impl Data {
         self.desktop_behind.remove(id);
     }
 
-    /// The ADE of sandbox `id`: the one it is marked with, else the default.
-    pub fn ade_of(&self, id: &str) -> Ade {
+    /// The ADEs sandbox `id` is marked with, in the order they were added.
+    pub fn ades_of(&self, id: &str) -> Vec<Ade> {
         self.machines
             .iter()
             .find(|m| m.id == id)
-            .map_or_else(Ade::default, machine_ade)
+            .map(|m| view::marked_ades(&m.metadata))
+            .unwrap_or_default()
+    }
+
+    /// The ADE of sandbox `id`: the first it is marked with, else the default.
+    pub fn ade_of(&self, id: &str) -> Ade {
+        self.ades_of(id).first().copied().unwrap_or_default()
+    }
+
+    /// The ADE of sandbox `id` that keeps in step with this computer (T3), if it has one.
+    pub fn pinned_ade_of(&self, id: &str) -> Option<Ade> {
+        self.ades_of(id)
+            .into_iter()
+            .find(|a| a.pins_local_version())
     }
 
     /// The user whose connected set applies: the one it was loaded for, else the account's.
@@ -287,11 +302,6 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
     view::size_choices(own.unwrap_or(&me.allowed_specs))
 }
 
-/// The ADE a machine is marked with, else the default.
-fn machine_ade(m: &Machine) -> Ade {
-    view::marked_ade(&m.metadata).unwrap_or_default()
-}
-
 fn template_is_linux(templates: &[Template], id: &str) -> bool {
     templates
         .iter()
@@ -356,15 +366,15 @@ pub fn version_changed(prev: Option<&str>, new: Option<&str>) -> bool {
 }
 
 /// The sandboxes to sync after a change of `ade`'s desktop version: running, connected from
-/// this computer and of that ADE, in any of the user's orgs. A sandbox someone else connected
-/// is left alone.
+/// this computer and marked with that ADE (among others or alone), in any of the user's
+/// orgs. A sandbox someone else connected is left alone.
 pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
     d.machines
         .iter()
         .filter(|m| view::view_state(&m.state) == ViewState::Running)
         .filter(|m| d.connected.contains(&m.id))
         .filter(|m| template_is_linux(&d.templates, &m.template.id))
-        .filter(|m| machine_ade(m) == ade)
+        .filter(|m| view::marked_ades(&m.metadata).contains(&ade))
         .map(|m| m.id.clone())
         .collect()
 }
@@ -396,6 +406,7 @@ pub fn progress_after(prev: &ProgressView, step: &Step) -> ProgressView {
         kind: prev.kind.clone(),
         step: name.to_string(),
         machine_id,
+        ade: prev.ade,
         error: None,
     }
 }
@@ -622,7 +633,7 @@ pub struct CreateArgs {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub auto_suspend_after_seconds: Option<i64>,
-    /// The ADE to set up; None: the default.
+    /// The ADE to set up; None: a plain sandbox, with no ADE.
     pub ade: Option<Ade>,
 }
 
@@ -1337,10 +1348,12 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let ade = a.ade.unwrap_or_default();
-        let version = match self.desktop_version(ade).await {
-            Ok(v) => v,
-            Err(e) => return self.settle_in(account, Err(e)),
+        let version = match a.ade {
+            Some(ade) => match self.desktop_version(ade).await {
+                Ok(v) => Some(v),
+                Err(e) => return self.settle_in(account, Err(e)),
+            },
+            None => None,
         };
         let req = NewSandbox {
             name: a.name,
@@ -1352,15 +1365,20 @@ impl Core {
             auto_suspend_after_seconds: a.auto_suspend_after_seconds,
             org_id,
         };
-        self.begin_progress("create", "creating", None, account);
+        self.begin_progress("create", "creating", None, a.ade, account);
+        let (Some(ade), Some(version)) = (a.ade, version) else {
+            let r = connect::create(&client, &req, &self.progress_cb(account)).await;
+            return self.finish_create(r, account).await;
+        };
         let r =
             connect::create_and_connect(&client, ade, &req, &version, self.progress_cb(account))
                 .await;
-        self.finish_connect(r, &version, account).await
+        self.finish_connect(ade, r, &version, account).await
     }
 
-    /// Connects an existing sandbox: wakes it, installs the ADE (never an older version),
-    /// pairs, then opens the ADE's app with the pairing link.
+    /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
+    /// installed (never an older version) and paired, then its app opens with the pairing
+    /// link; a link ADE (cmux) gets its prep command, then its link opens.
     pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
@@ -1371,25 +1389,42 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
         };
-        self.begin_progress("connect", "connecting", Some(id.to_string()), account);
+        self.begin_progress(
+            "connect",
+            "connecting",
+            Some(id.to_string()),
+            Some(ade),
+            account,
+        );
         let r =
             connect::connect_existing(&client, ade, id, &version, self.progress_cb(account)).await;
-        self.finish_connect(r, &version, account).await
+        self.finish_connect(ade, r, &version, account).await
     }
 
-    /// Open in the ADE's app. A connected sandbox: wake it, sync its ADE, open the app (no
-    /// setup, no new pairing). An unconnected one goes through the connect flow.
+    /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
+    /// with it: wake it, sync the ADE, open the app (no setup, no new pairing). A link ADE
+    /// (cmux) on a sandbox marked with it: open its link with an SSH token (the link wakes the
+    /// sandbox). Anything else goes through the connect flow.
     pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
         let snapshot = self.signed_in_with(|i| {
-            let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
             let ade = asked.unwrap_or_else(|| i.data.ade_of(id));
-            (connected, ade, i.sync_version(ade))
+            let marked = i.data.ades_of(id).contains(&ade);
+            let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
+            let ready = marked
+                && match ade.open() {
+                    Open::Pair(_) => connected,
+                    Open::Link(_) => true,
+                };
+            (ready, ade, i.sync_version(ade))
         });
         let (client, account, ade, version) = match snapshot {
             Ok((client, account, (true, ade, version))) => (client, account, ade, version),
             _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
+            let Open::Pair(p) = ade.open() else {
+                return self.open_link(ade, id, account).await;
+            };
             sandbox::ensure_running(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
@@ -1397,10 +1432,40 @@ impl Core {
                 let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            let Open::Pair(p) = ade.open();
             self.open_for(account, p.app_url)
         };
         self.act(account, r).await
+    }
+
+    /// Opens a link ADE's link to sandbox `id`. The SSH token comes from `ssh::token`: the
+    /// stored one while it has more than a day left, else a new 30-day one. The link holds
+    /// the token, so it goes only to the ADE's own scheme, never to a web page.
+    async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<()> {
+        let Open::Link(l) = ade.open() else {
+            return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
+        };
+        let (client, title) = self
+            .read_in(account, |i| {
+                let title = i
+                    .data
+                    .machines
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map_or_else(|| id.to_string(), |m| m.name.clone());
+                i.client.clone().map(|c| (c, title))
+            })
+            .flatten()
+            .ok_or_else(account_changed)?;
+        let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+            .await
+            .map_err(ErrorView::from)?;
+        let link = (l.link)(&SshLogin {
+            host: &t.host,
+            port: t.port,
+            user: &t.token,
+            title: &title,
+        });
+        self.open_for(account, &link)
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -1468,13 +1533,21 @@ impl Core {
         });
     }
 
-    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>, account: u64) {
+    fn begin_progress(
+        &self,
+        kind: &str,
+        step: &str,
+        machine_id: Option<String>,
+        ade: Option<Ade>,
+        account: u64,
+    ) {
         self.update_in(account, |i| {
             i.state.error = None;
             i.state.progress = Some(ProgressView {
                 kind: kind.to_string(),
                 step: step.to_string(),
                 machine_id,
+                ade,
                 error: None,
             });
         });
@@ -1496,10 +1569,31 @@ impl Core {
         self.update(Inner::clear_progress);
     }
 
-    /// Shows the result of a create or connect that began under `account`. Every write
-    /// checks the account as part of the write, so a change at any point drops the rest.
+    /// Shows the result of a create with no ADE. A failure ends the progress: its Retry would
+    /// set an ADE up.
+    async fn finish_create(
+        self: &Arc<Self>,
+        r: Result<String, SandboxError>,
+        account: u64,
+    ) -> Res<()> {
+        if self.account() != account {
+            return Ok(());
+        }
+        let r = r.map(drop).map_err(ErrorView::from);
+        self.update_in(account, Inner::clear_progress);
+        let out = self.settle_in(account, r);
+        if self.account() == account {
+            self.refresh_and_sync(false).await;
+        }
+        out
+    }
+
+    /// Shows the result of a create or connect that began under `account`, and opens the
+    /// ADE: the pairing link, or a link ADE's link. Every write checks the account as part of
+    /// the write, so a change at any point drops the rest.
     async fn finish_connect(
         self: &Arc<Self>,
+        ade: Ade,
         r: Result<Connected, SandboxError>,
         version: &str,
         account: u64,
@@ -1516,15 +1610,20 @@ impl Core {
                 // offers the update.
                 self.update_in(account, |i| {
                     i.state.progress = None;
-                    i.data.set_version(&c.machine_id, &c.version);
-                    if c.update_pending {
-                        i.data.update_pending.insert(c.machine_id.clone());
-                    } else if c.version != version {
-                        i.data.desktop_behind.insert(c.machine_id.clone());
+                    if let Some(v) = &c.version {
+                        i.data.set_version(&c.machine_id, v);
+                        if c.update_pending {
+                            i.data.update_pending.insert(c.machine_id.clone());
+                        } else if v != version {
+                            i.data.desktop_behind.insert(c.machine_id.clone());
+                        }
                     }
                     i.rebuild();
                 });
-                let opened = self.open_for(account, &c.link);
+                let opened = match &c.link {
+                    Some(link) => self.open_for(account, link),
+                    None => self.open_link(ade, &c.machine_id, account).await,
+                };
                 let out = self.settle_in(account, opened);
                 // After `settle_in`, which clears the error: a failed save stays visible.
                 self.remember(&c.machine_id, account).await;
@@ -1566,22 +1665,22 @@ impl Core {
         .await
     }
 
-    /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop.
+    /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop:
+    /// the one that keeps in step (T3), whatever other ADEs it has.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
         // Only a sandbox connected from this computer gets its ADE synced after a resume.
-        let (client, account, (ade, version)) = self.signed_in_with(|i| {
-            let ade = i.data.ade_of(id);
-            let version = i
-                .data
+        let (client, account, target) = self.signed_in_with(|i| {
+            i.data
                 .connected
                 .contains(id)
-                .then(|| i.sync_version(ade))
-                .flatten();
-            (ade, version)
+                .then(|| i.data.pinned_ade_of(id))
+                .flatten()
+                .and_then(|ade| i.sync_version(ade).map(|v| (ade, v)))
         })?;
         let r = async {
-            match &version {
-                Some(v) => {
+            match &target {
+                Some((ade, v)) => {
+                    let ade = *ade;
                     let o = lifecycle::resume(&client, ade, id, v)
                         .await
                         .map_err(ErrorView::from)?;
@@ -1888,11 +1987,16 @@ mod tests {
         d.machines[0].free = true;
         d.machines[0].run_started_at = Some(now() - chrono::Duration::minutes(20));
         d.machines[0].max_run_minutes = 120;
+        // e has T3 and cmux.
+        d.machines[4]
+            .metadata
+            .insert("instabox-bridge".into(), "t3,cmux".into());
         let mut s = AppState::default();
         s.apply(&d, now());
         s.signed_in = true;
         s.sign_in_code = None;
         s.set_desktop(Ade::T3, Some("0.1.10".into()));
+        s.set_desktop(Ade::Cmux, Some("0.64.25".into()));
         s.mcp = McpStatus {
             claude_code: Some(true),
             codex: Some(false),
@@ -1901,6 +2005,7 @@ mod tests {
             kind: "create".into(),
             step: "installing".into(),
             machine_id: Some("a".into()),
+            ade: Some(Ade::T3),
             error: None,
         });
         s.error = Some(ErrorView::from(SandboxError::Cooldown { minutes: 12 }));
@@ -2148,8 +2253,8 @@ mod tests {
     fn connected_result(id: &str, version: &str) -> Connected {
         Connected {
             machine_id: id.into(),
-            link: "t3code://pair?pairingUrl=x".into(),
-            version: version.into(),
+            link: Some("t3code://pair?pairingUrl=x".into()),
+            version: Some(version.into()),
             update_pending: false,
         }
     }
@@ -2167,7 +2272,7 @@ mod tests {
             update_pending: true,
             ..connected_result("t", "0.1.9")
         };
-        core.finish_connect(Ok(c), "0.1.11", core.account())
+        core.finish_connect(Ade::T3, Ok(c), "0.1.11", core.account())
             .await
             .unwrap();
         let v = &core.state().sandboxes[0];
@@ -2188,6 +2293,7 @@ mod tests {
         });
         assert!(!core.state().sandboxes[0].connected);
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.11")),
             "0.1.11",
             core.account(),
@@ -2214,6 +2320,7 @@ mod tests {
             i.rebuild();
         });
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.12")),
             "0.1.11",
             core.account(),
@@ -2300,6 +2407,7 @@ mod tests {
             kind: "create".into(),
             step: "creating".into(),
             machine_id: None,
+            ade: Some(Ade::Cmux),
             error: None,
         };
         let p1 = progress_after(&start, &Step::Creating);
@@ -2309,6 +2417,7 @@ mod tests {
         assert_eq!(p3.step, "installing");
         assert_eq!(p3.kind, "create");
         assert_eq!(p3.machine_id.as_deref(), Some("m1"));
+        assert_eq!(p3.ade, Some(Ade::Cmux), "the ADE stays for Retry");
         let err = ErrorView::from(SandboxError::Setup {
             ade: Ade::T3,
             stderr_tail: "boom".into(),
@@ -2324,6 +2433,7 @@ mod tests {
             kind: "connect".into(),
             step: "installing".into(),
             machine_id: Some(id.into()),
+            ade: Some(Ade::T3),
             error: Some(ErrorView::from(SandboxError::Setup {
                 ade: Ade::T3,
                 stderr_tail: "tar: bad".into(),
@@ -2451,8 +2561,14 @@ mod tests {
     fn ades_hold_the_desktop_versions_and_t3_mirrors_its_own() {
         let core = core_with(Arc::new(MemoryConnectedStore::default()));
         let s = core.state();
-        if cfg!(any(target_os = "macos", windows)) {
-            // Listed from the start; nothing is found before the first look.
+        // Listed from the start; nothing is found before the first look. cmux is macOS only.
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                s.ades,
+                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Cmux, None)]
+            );
+        }
+        if cfg!(windows) {
             assert_eq!(s.ades, vec![AdeView::new(Ade::T3, None)]);
         }
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
@@ -2490,9 +2606,30 @@ mod tests {
             .insert("instabox-bridge".into(), "other".into());
         assert_eq!(d.ade_of("a"), Ade::default(), "an unknown id");
         let views = sandbox_views(&data(), Some("org-me"), now());
-        let ades: Vec<Option<Ade>> = views.iter().map(|v| v.ade).collect();
+        let ades: Vec<Vec<Ade>> = views.iter().map(|v| v.ades.clone()).collect();
         assert_eq!(ids(&views), ["a", "e", "f", "g"]);
-        assert_eq!(ades, [Some(Ade::T3), Some(Ade::T3), None, None]);
+        assert_eq!(ades, [vec![Ade::T3], vec![Ade::T3], vec![], vec![]]);
+    }
+
+    #[test]
+    fn a_sandbox_with_several_ades_keeps_t3_in_step() {
+        let mut d = data();
+        for (i, mark) in [(0, "cmux,t3"), (1, "cmux")] {
+            d.machines[i]
+                .metadata
+                .insert("instabox-bridge".into(), mark.into());
+        }
+        // a: cmux first, then T3. b (running, connected, other org): cmux only.
+        assert_eq!(d.ades_of("a"), [Ade::Cmux, Ade::T3]);
+        assert_eq!(d.ade_of("a"), Ade::Cmux, "the first one");
+        assert_eq!(d.pinned_ade_of("a"), Some(Ade::T3));
+        assert_eq!(d.pinned_ade_of("b"), None);
+        assert_eq!(
+            sync_targets(&d, Ade::T3),
+            ["a"],
+            "b has no T3 to bring along"
+        );
+        assert_eq!(sync_targets(&d, Ade::Cmux), ["a", "b"]);
     }
 
     #[test]
@@ -2508,11 +2645,24 @@ mod tests {
     #[test]
     fn every_ade_link_may_be_opened() {
         for a in ade::ALL {
-            let Open::Pair(p) = a.open();
-            assert!(allowed_url(p.app_url), "{a:?}");
-            assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
+            match a.open() {
+                Open::Pair(p) => {
+                    assert!(allowed_url(p.app_url), "{a:?}");
+                    assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
+                }
+                Open::Link(l) => {
+                    let login = SshLogin {
+                        host: "ssh.example.test",
+                        port: 2222,
+                        user: "ibssh_x",
+                        title: "box",
+                    };
+                    assert!(allowed_url(&(l.link)(&login)), "{a:?}");
+                }
+            }
         }
         assert!(!allowed_url("t3codex://x"));
+        assert!(!allowed_url("cmux-nightly://ssh?host=x"));
     }
 
     #[tokio::test]
@@ -2951,6 +3101,7 @@ mod tests {
             i.rebuild();
         });
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.11")),
             "0.1.11",
             core.account(),
@@ -3051,9 +3202,14 @@ mod tests {
         let base = Url::parse("http://127.0.0.1:9").unwrap();
         sign_in_as(&core, &base, 7);
         let before = core.state();
-        core.finish_connect(Ok(connected_result("t", "0.1.11")), "0.1.11", started)
-            .await
-            .unwrap();
+        core.finish_connect(
+            Ade::T3,
+            Ok(connected_result("t", "0.1.11")),
+            "0.1.11",
+            started,
+        )
+        .await
+        .unwrap();
         assert!(store.load(7).is_empty(), "nothing remembered");
         assert!(core.lock().data.connected.is_empty());
         assert_eq!(core.state().error, before.error);
@@ -3191,11 +3347,17 @@ mod tests {
         core.sign_out().await.unwrap();
         sign_in_as(&core, &base, 8);
         // The old flow starts and moves its progress after the switch: nothing shows.
-        core.begin_progress("create", "creating", None, old);
+        core.begin_progress("create", "creating", None, Some(Ade::T3), old);
         stale(Step::Pairing);
         assert_eq!(core.state().progress, None);
         // The new account's own progress is not moved by the old flow's callback.
-        core.begin_progress("connect", "connecting", Some("m2".into()), core.account());
+        core.begin_progress(
+            "connect",
+            "connecting",
+            Some("m2".into()),
+            Some(Ade::T3),
+            core.account(),
+        );
         let before = core.state().progress;
         stale(Step::Pairing);
         assert_eq!(core.state().progress, before);
@@ -3242,6 +3404,199 @@ mod tests {
         sign_in_as(&core, &base, 8);
         let _ = call.await.unwrap();
         assert!(opened.lock().unwrap().is_empty(), "no pairing link opened");
+    }
+
+    /// A mock API with one running sandbox `m1` named "dev 1" with `metadata`. It mints SSH
+    /// tokens, answers every exec with success, takes a metadata patch and creates sandboxes.
+    async fn cmux_server(metadata: serde_json::Value) -> (wiremock::MockServer, Url) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let m1 = serde_json::json!({
+            "id": "m1", "name": "dev 1", "state": "running",
+            "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+            "metadata": metadata, "orgId": "org-me"
+        });
+        let answers = [
+            (
+                "GET",
+                "/v1/machines",
+                serde_json::json!({"machines": [m1], "nextCursor": null}),
+            ),
+            ("GET", "/v1/machines/m1", m1.clone()),
+            ("PATCH", "/v1/machines/m1", m1.clone()),
+            (
+                "POST",
+                "/v1/machines/m1/ssh-tokens",
+                serde_json::json!({
+                    "id": "k1", "name": "Instabox", "host": "ssh.example.test", "port": 2222,
+                    "token": "ibssh_new", "command": "ssh -p 2222 ibssh_new@ssh.example.test",
+                    "expiresAt": Utc::now() + chrono::Duration::days(30)
+                }),
+            ),
+            (
+                "POST",
+                "/v1/machines/m1/exec",
+                serde_json::json!({"stdout": "", "stderr": "", "exitCode": 0}),
+            ),
+            (
+                "GET",
+                "/v1/me",
+                serde_json::json!({"userId": 7, "login": "alex",
+                    "org": {"id": "org-me", "tier": "pro", "kind": "personal"}}),
+            ),
+            (
+                "POST",
+                "/v1/machines",
+                serde_json::json!({"id": "op1", "machineId": "m1", "type": "create",
+                    "state": "queued", "machine": null}),
+            ),
+            (
+                "GET",
+                "/v1/operations/op1",
+                serde_json::json!({"id": "op1", "machineId": "m1", "type": "create",
+                    "state": "succeeded", "machine": m1}),
+            ),
+        ];
+        for (verb, p, body) in answers {
+            Mock::given(method(verb))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let base = Url::parse(&server.uri()).unwrap();
+        (server, base)
+    }
+
+    async fn requests(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect()
+    }
+
+    const CMUX_LINK: &str = "cmux://ssh?host=ssh.example.test&user=ibssh_new&port=2222&title=dev%201&host-key-policy=accept-new";
+
+    #[tokio::test]
+    async fn open_in_cmux_opens_its_link_with_an_ssh_token_and_runs_nothing() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3,cmux"})).await;
+        let ssh = Arc::new(MemorySshStore::default());
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            ssh.clone(),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(*opened.lock().unwrap(), [CMUX_LINK]);
+        let r = requests(&server).await;
+        assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        assert_eq!(
+            r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(),
+            1,
+            "{r:?}"
+        );
+        // The token is kept, so the next open reuses it.
+        assert_eq!(ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(opened.lock().unwrap().len(), 2);
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_in_cmux_of_a_sandbox_without_it_runs_the_prep_marks_then_opens() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| i.state.set_desktop(Ade::Cmux, Some("0.64.25".into())));
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(*opened.lock().unwrap(), [CMUX_LINK]);
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(execs.len(), 1, "only the prep");
+        assert!(execs[0].contains("chmod go-w ~/.local ~/.local/state"));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3,cmux");
+        let s = core.state();
+        assert_eq!(s.progress, None);
+        assert_eq!(s.error, None);
+        assert!(core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn connecting_cmux_needs_the_app_on_this_computer() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        // Found as missing (Windows never looks): connecting asks for the app first.
+        core.update(|i| i.state.set_desktop(Ade::Cmux, None));
+        let detect_finds_nothing = !cfg!(target_os = "macos") || Ade::Cmux.locate().is_none();
+        if detect_finds_nothing {
+            let e = core
+                .connect_sandbox("m1", Some(Ade::Cmux))
+                .await
+                .unwrap_err();
+            assert_eq!(e.message, "cmux is not installed. Install it first.");
+            assert!(opened.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_create_sets_no_ade_up_and_opens_nothing() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.create_sandbox(CreateArgs {
+            name: "dev 1".into(),
+            snapshot_id: None,
+            vcpus: 2,
+            mem_mib: 4096,
+            auto_suspend_after_seconds: Some(1800),
+            ade: None,
+        })
+        .await
+        .unwrap();
+        let r = requests(&server).await;
+        assert!(r.contains(&"POST /v1/machines".to_string()), "{r:?}");
+        assert!(
+            !r.iter().any(|x| x.ends_with("/exec")
+                || x.starts_with("PATCH")
+                || x.ends_with("/ssh-tokens")),
+            "{r:?}"
+        );
+        assert!(opened.lock().unwrap().is_empty());
+        let s = core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        assert!(core.lock().data.connected.is_empty(), "not connected");
     }
 
     #[tokio::test]
@@ -3419,11 +3774,12 @@ mod tests {
             ));
             sign_in_as(&core, &base, 7);
             let old = core.account();
-            core.begin_progress("connect", "pairing", Some("t".into()), old);
+            core.begin_progress("connect", "pairing", Some("t".into()), Some(Ade::T3), old);
             let new_progress = ProgressView {
                 kind: "create".into(),
                 step: "creating".into(),
                 machine_id: None,
+                ade: Some(Ade::T3),
                 error: None,
             };
             let b = base.clone();
@@ -3444,7 +3800,7 @@ mod tests {
             } else {
                 Err(SandboxError::Timeout)
             };
-            let _ = core.finish_connect(r, "0.1.11", old).await;
+            let _ = core.finish_connect(Ade::T3, r, "0.1.11", old).await;
             c.check(core.account() != old, format!("ok={ok}: no switch"));
             let s = core.state();
             c.check(

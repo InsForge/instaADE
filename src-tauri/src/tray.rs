@@ -8,9 +8,9 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalPosition, Manager, Rect, WebviewWindow, Window};
 
-use crate::ade::Ade;
+use crate::ade::{Ade, Open};
 use crate::app::{AppState, Core};
-use crate::sandbox::view::ViewState;
+use crate::sandbox::view::{SandboxView, ViewState};
 
 const TRAY_ID: &str = "main";
 pub const MAIN_WINDOW: &str = "main";
@@ -52,6 +52,19 @@ pub fn open_label(ade: Ade, connected: bool) -> String {
     }
 }
 
+/// The ADE a row's Open item opens: the first the sandbox is marked with, else the default.
+/// It is ready to open when the sandbox has it, and for a pairing ADE (T3) when this computer
+/// connected it; else the item connects it first.
+fn open_target(s: &SandboxView) -> (Ade, bool) {
+    let ade = s.ades.first().copied().unwrap_or_default();
+    let ready = s.ades.contains(&ade)
+        && match ade.open() {
+            Open::Pair(_) => s.connected,
+            Open::Link(_) => true,
+        };
+    (ade, ready)
+}
+
 pub fn tray_rows(state: &AppState) -> Vec<TrayRow> {
     state
         .sandboxes
@@ -59,8 +72,8 @@ pub fn tray_rows(state: &AppState) -> Vec<TrayRow> {
         .map(|s| TrayRow {
             id: s.id.clone(),
             label: row_label(&s.name, s.state),
-            connected: s.connected,
-            ade: s.ade.unwrap_or_default(),
+            connected: open_target(s).1,
+            ade: open_target(s).0,
             action: match s.state {
                 ViewState::Running => Some(TrayAction::Pause),
                 ViewState::Paused | ViewState::Stopped => Some(TrayAction::Resume),
@@ -353,7 +366,7 @@ mod tests {
             state,
             size: "4 vCPU / 8 GB".into(),
             connected: true,
-            ade: Some(Ade::T3),
+            ades: vec![Ade::T3],
             t3_version: None,
             free: false,
             auto_sleep: AutoSleep {
@@ -392,7 +405,7 @@ mod tests {
         assert_eq!(open_label(Ade::T3, false), "Connect to T3 Code");
         let mut r = row("a", ViewState::Running);
         r.connected = false;
-        r.ade = None;
+        r.ades = vec![];
         let state = AppState {
             sandboxes: vec![r],
             ..AppState::default()
@@ -400,6 +413,23 @@ mod tests {
         assert!(!tray_rows(&state)[0].connected);
         assert_eq!(tray_rows(&state)[0].ade, Ade::T3, "the default ADE");
         assert_eq!(row_label("x", ViewState::Stopped), "\u{25CB} x");
+    }
+
+    #[test]
+    fn open_item_of_a_sandbox_with_several_ades() {
+        let mut r = row("a", ViewState::Running);
+        // A v0.1.x sandbox connected from here opens T3 as before.
+        assert_eq!(open_target(&r), (Ade::T3, true));
+        r.connected = false;
+        assert_eq!(
+            open_target(&r),
+            (Ade::T3, false),
+            "T3 pairs from here first"
+        );
+        // A cmux sandbox opens by its link from any computer.
+        r.ades = vec![Ade::Cmux, Ade::T3];
+        assert_eq!(open_target(&r), (Ade::Cmux, true));
+        assert_eq!(open_label(Ade::Cmux, true), "Open in cmux");
     }
 
     const SCREEN: Bounds = Bounds {

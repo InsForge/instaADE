@@ -58,14 +58,21 @@ async fn run(client: &Client, id: &str, cmd: &str, secs: u32) -> Result<ExecResu
 /// Brings the sandbox's ADE up to `desktop_version` when it is behind and idle.
 /// The sandbox must be running and connected: this does not wake it. Callers run
 /// it on connect and on user request, never on a timer, because every call execs
-/// on the sandbox and would keep it awake. A busy ADE gives `Ok(Defer)`, not an error.
+/// on the sandbox and would keep it awake. A busy ADE gives `Ok(Defer)`, not an error. An ADE
+/// with nothing installed on the sandbox (cmux) is always up to date, with no exec.
 pub async fn sync(
     client: &Client,
     ade: Ade,
     machine_id: &str,
     desktop_version: &str,
 ) -> Result<SyncOutcome, SandboxError> {
-    let out = run(client, machine_id, ade.version_script(), QUERY_TIMEOUT_SECS).await?;
+    let (Some(version_script), Some(probe)) = (ade.version_script(), ade.probe()) else {
+        return Ok(SyncOutcome {
+            decision: Decision::UpToDate,
+            remote_version: None,
+        });
+    };
+    let out = run(client, machine_id, version_script, QUERY_TIMEOUT_SECS).await?;
     let remote = ade.parse_version(&out.stdout);
     // Equal or newer: no reason to ask the probe.
     let idle = ProbeAnswer {
@@ -80,7 +87,7 @@ pub async fn sync(
     if matches!(first, Decision::UpToDate | Decision::Older) {
         return Ok(outcome(first));
     }
-    let out = run(client, machine_id, &ade.probe().path(), QUERY_TIMEOUT_SECS).await?;
+    let out = run(client, machine_id, &probe.path(), QUERY_TIMEOUT_SECS).await?;
     let decision = decide(
         desktop_version,
         remote.as_deref(),
@@ -190,6 +197,16 @@ mod tests {
     const VERSION: &str = "t3 --version";
     const PROBE: &str = "\"cmd\":\"/usr/local/lib/instabox/activity.d/t3\"";
     const SETUP: &str = "v=0.1.11";
+
+    #[tokio::test]
+    async fn cmux_is_always_up_to_date_without_an_exec() {
+        let server = MockServer::start().await;
+        let d = sync(&client(&server), Ade::Cmux, "m1", "0.64.25")
+            .await
+            .unwrap();
+        assert_eq!(d.decision, Decision::UpToDate);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn equal_versions_make_one_exec() {

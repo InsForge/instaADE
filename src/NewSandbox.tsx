@@ -64,6 +64,7 @@ export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: 
         vcpus: free ? 4 : size.vcpus,
         memMiB: free ? 8192 : size.memMiB,
         autoSuspendAfterSeconds: free ? 1800 : sleep,
+        ade: "t3",
       },
       free ? FREE_SIZE : size.label,
     );

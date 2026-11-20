@@ -47,7 +47,7 @@ const box: SandboxView = {
   state: "running",
   size: "4 vCPU / 8 GB",
   connected: true,
-  ade: "t3",
+  ades: ["t3"],
   t3Version: "0.1.10",
   free: true,
   autoSleep: { seconds: 1800, label: "After 30 min" },
@@ -91,7 +91,7 @@ test("fixture and sample have the same nested keys", () => {
   const sampleWithRows: AppState = {
     ...sample,
     sandboxes: [box],
-    progress: { kind: "create", step: "x", machineId: null, error: null },
+    progress: { kind: "create", step: "x", machineId: null, ade: "t3", error: null },
     error: { kind: "other", message: "" },
     update: { version: "", url: "" },
   };
@@ -272,7 +272,7 @@ test("the details header has the same menu", async () => {
 // ---- the line under a row ----
 
 test("each row shows at most one line, by priority", async () => {
-  show({ progress: { kind: "connect", step: "installing", machineId: "a", error: null } }, [
+  show({ progress: { kind: "connect", step: "installing", machineId: "a", ade: "t3", error: null } }, [
     { id: "a", name: "p-progress", updatePending: true },
     { id: "b", name: "p-update", updatePending: true, t3Version: "0.1.2" },
     { id: "c", name: "p-behind", desktopBehind: true, updatePending: true },
@@ -330,7 +330,7 @@ test("the list never asks for agent status; it shows what details found", async 
 });
 
 test("a create before its sandbox exists is a row at the top with its progress", async () => {
-  show({ progress: { kind: "create", step: "creating", machineId: null, error: null } }, [{}]);
+  show({ progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: null } }, [{}]);
   await screen.findByText("dev-1");
   const first = screen.getAllByRole("listitem")[0];
   expect(within(first).getByText("New sandbox")).toBeTruthy();
@@ -340,7 +340,7 @@ test("a create before its sandbox exists is a row at the top with its progress",
 });
 
 test("connecting an existing sandbox starts at Waking, not Creating", async () => {
-  show({ progress: { kind: "connect", step: "connecting", machineId: "a", error: null } }, [{}]);
+  show({ progress: { kind: "connect", step: "connecting", machineId: "a", ade: "t3", error: null } }, [{}]);
   expect(await screen.findByText("Waking sandbox")).toBeTruthy();
   expect(screen.queryByText("Creating sandbox")).toBeNull();
 });
@@ -380,6 +380,7 @@ test("paid plan with always on: auto sleep defaults to 30 min, size to the first
     vcpus: 2,
     memMiB: 4096,
     autoSuspendAfterSeconds: 1800,
+    ade: "t3",
   });
 });
 
@@ -430,7 +431,7 @@ test("a create returns to the list at once and shows the new row while it runs",
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(screen.queryByLabelText("Name")).toBeNull();
   act(() =>
-    emit({ ...sample, tier: "pro", sandboxes: [box], progress: { kind: "create", step: "creating", machineId: null, error: null } }),
+    emit({ ...sample, tier: "pro", sandboxes: [box], progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: null } }),
   );
   const first = within(screen.getAllByRole("listitem")[0]);
   expect(first.getByText("dev-2")).toBeTruthy();
@@ -463,7 +464,7 @@ test("a failed create shows its message in the list, without the confirm line", 
 const tarBad = { kind: "setup" as const, message: "tar: bad" };
 
 test("a failed create with a sandbox offers only Retry, not Create", async () => {
-  show({ tier: "pro", progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ tier: "pro", progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "dev-2");
   expect((screen.getByRole("button", { name: "Create sandbox" }) as HTMLButtonElement).disabled).toBe(true);
@@ -493,7 +494,7 @@ test("free limit offers Connect on the unconnected sandbox, not create", async (
 });
 
 test("retry after a failed create connects the existing sandbox", async () => {
-  show({ progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   expect(await screen.findByText("tar: bad")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -502,7 +503,7 @@ test("retry after a failed create connects the existing sandbox", async () => {
 });
 
 test("a failed connect shows one notice and one Retry, in list and new views", async () => {
-  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   expect((await screen.findAllByText("tar: bad")).length).toBe(1);
   expect(screen.getAllByRole("button", { name: "Retry" }).length).toBe(1);
   await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
@@ -511,7 +512,7 @@ test("a failed connect shows one notice and one Retry, in list and new views", a
 });
 
 test("settings shows a progress error as a banner with its Retry", async () => {
-  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
   expect(screen.getAllByText("tar: bad").length).toBe(1);
   await userEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -522,7 +523,7 @@ test("a different state.error still shows next to a progress error", async () =>
   show(
     {
       error: { kind: "cooldown", message: "x", minutes: 12 },
-      progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad },
+      progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad },
     },
     [{}],
   );
@@ -532,13 +533,13 @@ test("a different state.error still shows next to a progress error", async () =>
 });
 
 test("Dismiss closes a failed progress", async () => {
-  show({ progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
   expect(invoke).toHaveBeenCalledWith("dismiss_progress");
 });
 
 test("a rejected connect that is the progress error shows once", async () => {
-  show({ error: tarBad, progress: { kind: "connect", step: "installing", machineId: "a", error: tarBad } }, [{ connected: false }], {
+  show({ error: tarBad, progress: { kind: "connect", step: "installing", machineId: "a", ade: "t3", error: tarBad } }, [{ connected: false }], {
     connect_sandbox: () => Promise.reject(tarBad),
   });
   const row = await screen.findByText("dev-1").then(() => within(rowOf("dev-1")));
@@ -549,7 +550,7 @@ test("a rejected connect that is the progress error shows once", async () => {
 });
 
 test("another setup error (a reinstall) gets no Retry of the progress sandbox", async () => {
-  show({ error: { kind: "setup", message: "reinstall: boom" }, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [
+  show({ error: { kind: "setup", message: "reinstall: boom" }, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [
     {},
   ]);
   expect(await screen.findByText("reinstall: boom")).toBeTruthy();
@@ -641,7 +642,7 @@ test("details: a failed resize goes back to the current size", async () => {
 });
 
 test("progress buttons never submit the New sandbox form", async () => {
-  show({ progress: { kind: "create", step: "creating", machineId: null, error: { kind: "api", message: "boom" } } });
+  show({ progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: { kind: "api", message: "boom" } } });
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "typed");
   for (const b of screen.getAllByRole("button", { name: "Dismiss" })) await userEvent.click(b);
