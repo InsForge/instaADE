@@ -37,7 +37,7 @@ You need macOS, the [T3 Code](https://github.com/pingdotgg/t3code/releases/lates
 - Installs T3 at the same version as your T3 Code
 - Pause, resume, resize and set auto sleep
 - Copy the SSH command or open it in Terminal
-- Sign Claude Code or Codex in on the sandbox
+- Sign in to Claude Code or Codex on the sandbox
 - Starts at login (turn it off in Settings)
 
 ## What it installs on your sandbox
