@@ -22,7 +22,7 @@
 
 ## Getting Started
 
-You need macOS or Windows (x64), an [instabox](https://instabox.sh) account and a supported ADE. Today that is the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app.
+You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need a supported one: the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app, or [cmux](https://github.com/manaflow-ai/cmux/releases/latest) on macOS.
 
 1. Download the latest release from [Releases](https://github.com/InsForge/instabox-bridge/releases/latest):
    - macOS: the `.dmg`, `aarch64` for Apple silicon, `x64` for Intel.
@@ -32,12 +32,14 @@ You need macOS or Windows (x64), an [instabox](https://instabox.sh) account and 
    - Windows: run the installer. It is not signed yet, so Windows SmartScreen asks once: click **More info**, then **Run anyway**.
 3. Click the Instabox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow).
 4. Sign in with GitHub or Google.
-5. Click **New sandbox**, pick a size, then click **Create sandbox**.
-6. Confirm the new environment in T3 Code.
+5. To open sandboxes in an ADE, pick it in the menu at the top (**Instabox** keeps to sandboxes only). If you used T3 Code with Instabox before, it starts in T3 Code.
+6. Click **New sandbox**, pick a size, then click **Create sandbox**.
+7. Confirm the new environment in T3 Code, or the workspace in cmux.
 
 ## Features
 
 - Create a sandbox or connect one you already have
+- Pick an ADE at the top: each sandbox gets **Open in** it, or **Install** it when the sandbox does not have it yet
 - Set up your ADE on the sandbox and pair it with the app on your computer
 - Pause, resume, resize and set auto sleep
 - Copy the SSH command or open it in a terminal
@@ -54,17 +56,24 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 - A `t3-instabox` service that runs the T3 server
 - An activity probe, so the sandbox sleeps only when T3 is idle
 
+### cmux (macOS)
+
+cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so Instabox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so Instabox opens it only in the cmux app, never through cmux.com. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+
+A sandbox can have several ADEs. The `instabox-bridge` metadata key lists them, comma separated (`t3,cmux`); a sandbox connected by v0.1.x holds `t3`.
+
 ## Roadmap
 
-- More ADEs: Orca, cmux, Superset and others
+- More ADEs: Orca, Superset and others
 
 ## Adding an ADE
 
 - Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
-- ADE module: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
-- Flow: `src-tauri/src/sandbox/connect.rs` installs, pairs and marks a sandbox connected with the ADE's id. `src-tauri/src/sandbox/sync.rs` keeps the versions in step. `open_in_ade` in `src-tauri/src/app.rs` opens it.
-- UI text such as "Open in T3 Code" is in `src/` (`Details.tsx`, `SandboxMenu.tsx`, `Setup.tsx`, `Progress.tsx`).
-- A new ADE needs an install script, a version check, a pairing or connect step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`.
+- ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link.
+- How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux).
+- Flow: `src-tauri/src/sandbox/connect.rs` sets the ADE up and adds its id to the sandbox's mark. `src-tauri/src/sandbox/sync.rs` keeps the versions in step for an ADE that pins them. `open_in_ade` in `src-tauri/src/app.rs` opens it.
+- UI: `src/ades.tsx` holds each ADE's colors, badge and text, and `src/mode.ts` the ADE the user picked. The switcher is `src/AdeSwitcher.tsx`.
+- A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command.
 
 Pull requests that add an ADE are welcome.
 

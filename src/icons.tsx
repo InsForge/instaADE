@@ -5,10 +5,11 @@ const MARK =
 
 const markPath = <path transform="translate(4.39 2.92) scale(0.82)" fill="#FFFFFF" d={MARK} />;
 
-/** The instabox mark on its own, for the header. */
-export const Mark = () => (
-  <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
-    {markPath}
+/** The mark on a small black tile: plain Instabox in the ADE switcher. */
+export const MarkTile = ({ size = 20 }: { size?: number }) => (
+  <svg className="ade-badge" width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+    <rect x="0.5" y="0.5" width="31" height="31" rx="7" fill="#000000" stroke="rgba(255,255,255,0.2)" />
+    <path transform="translate(7.15 6.1) scale(0.62)" fill="#FFFFFF" d={MARK} />
   </svg>
 );
 
@@ -84,5 +85,18 @@ export const Alert = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" strokeWidth="2" aria-hidden="true" {...stroke}>
     <circle cx="12" cy="12" r="9" />
     <path d="M12 8v5M12 16h.01" />
+  </svg>
+);
+
+export const Info = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" strokeWidth="2" aria-hidden="true" {...stroke}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 11v5M12 8h.01" />
+  </svg>
+);
+
+export const Close = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" strokeWidth="2" aria-hidden="true" {...stroke}>
+    <path d="M18 6L6 18M6 6l12 12" />
   </svg>
 );

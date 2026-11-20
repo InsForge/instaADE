@@ -1,20 +1,24 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
-import { deleteSandbox, openInT3, openSsh, pairAgain, pause, reinstallT3, resize, resume, setAutoSleep, sshCommand } from "./api";
+import { deleteSandbox, openSsh, pairAgain, pause, reinstallT3, resize, resume, setAutoSleep, sshCommand } from "./api";
+import { adeName, hasAde, pairs } from "./ades";
+import type { Mode } from "./ades";
 import { BUSY, copyText, isAsleep, isFree } from "./common";
 import type { Run } from "./common";
 import { Check, ChevronDown, ChevronRight } from "./icons";
-import type { AppState, SandboxView } from "./types";
+import type { AdeId, AppState, SandboxView } from "./types";
 
 interface Props {
   s: SandboxView;
   state: AppState;
   run: Run;
+  mode: Mode;
   /** The "…" button the menu hangs from. */
   anchor: HTMLElement;
   /** The popover box: the menu stays inside it. */
   container: HTMLElement;
-  onConnect: (id: string) => void;
+  onOpen: (id: string, ade: AdeId) => void;
+  onConnect: (id: string, ade: AdeId) => void;
   onCopied: () => void;
   onClose: () => void;
 }
@@ -32,7 +36,7 @@ function Item({ children, onClick, disabled, danger }: { children: ReactNode; on
 
 const Sep = () => <div className="menu-sep" role="separator" />;
 
-export default function SandboxMenu({ s, state, run, anchor, container, onConnect, onCopied, onClose }: Props) {
+export default function SandboxMenu({ s, state, run, mode, anchor, container, onOpen, onConnect, onCopied, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const hint = useId();
   const [sub, setSub] = useState<"size" | "sleep" | null>(null);
@@ -116,6 +120,11 @@ export default function SandboxMenu({ s, state, run, anchor, container, onConnec
 
   const busy = BUSY.includes(s.state);
   const free = isFree(s, state.tier);
+  // Plain Instabox has no ADE actions. T3 pairs from this computer: Pair again and Reinstall
+  // need that pairing; cmux has neither.
+  const ade = mode === "instabox" ? null : mode;
+  const has = !!ade && hasAde(s, ade);
+  const paired = !!ade && pairs(ade) && has && s.connected;
   const copySsh = () => {
     close(true);
     // The command is asked for only now: each new one may mint a 30-day token.
@@ -147,23 +156,19 @@ export default function SandboxMenu({ s, state, run, anchor, container, onConnec
       style={pos ? { top: pos.top, right: pos.right } : { top: 0, right: EDGE, visibility: "hidden" }}
       onKeyDown={onKeyDown}
     >
-      {s.connected ? (
-        <Item disabled={busy} onClick={() => act(() => openInT3(s.id))}>
-          Open in T3 Code
-        </Item>
-      ) : (
+      {ade && (
         <Item
           disabled={busy}
           onClick={() => {
             close(true);
-            onConnect(s.id);
+            (has ? onOpen : onConnect)(s.id, ade);
           }}
         >
-          Connect to T3 Code
+          {has ? "Open in" : "Install"} {adeName(state, ade)}
         </Item>
       )}
-      {s.connected && <Item onClick={() => act(() => pairAgain(s.id))}>Pair again</Item>}
-      <Sep />
+      {paired && <Item onClick={() => act(() => pairAgain(s.id))}>Pair again</Item>}
+      {ade && <Sep />}
       {s.state === "running" && <Item onClick={() => act(() => pause(s.id))}>Pause</Item>}
       {isAsleep(s) && <Item onClick={() => act(() => resume(s.id))}>Resume</Item>}
       {subItem("size", "Resize", s.size)}
@@ -214,7 +219,7 @@ export default function SandboxMenu({ s, state, run, anchor, container, onConnec
       <Item onClick={copySsh}>Copy SSH command</Item>
       <Item onClick={() => act(() => openSsh(s.id))}>Open in Terminal</Item>
       <Sep />
-      {s.connected && !s.desktopBehind && <Item onClick={() => act(() => reinstallT3(s.id))}>Reinstall T3</Item>}
+      {paired && !s.desktopBehind && <Item onClick={() => act(() => reinstallT3(s.id))}>Reinstall T3</Item>}
       <Item danger onClick={() => (confirmDelete ? act(() => deleteSandbox(s.id)) : setConfirmDelete(true))}>
         {confirmDelete ? "Confirm delete" : "Delete sandbox…"}
       </Item>

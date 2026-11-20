@@ -1,12 +1,14 @@
 import type { MouseEvent } from "react";
 import { agentSignIn, reinstallT3, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
+import { AdeMissing, ConnectAdeCard, SwitchedHint } from "./AdeCards";
+import { adeName, hasAde, localAde, readyText } from "./ades";
+import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, cap, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
 import { Dots, Plus } from "./icons";
 import Progress, { ProgressBar, stepText } from "./Progress";
-import { T3Missing } from "./Setup";
-import type { AppState, SandboxView } from "./types";
+import type { AdeId, AppState, SandboxView } from "./types";
 
 /** What a create that has no sandbox yet looks like: the name and size the form sent. */
 export interface PendingCreate {
@@ -19,16 +21,20 @@ export type RowLine =
   | { kind: "progress" }
   | { kind: "update" }
   | { kind: "desktopBehind" }
-  | { kind: "connect" }
+  | { kind: "open"; ade: AdeId }
+  | { kind: "install"; ade: AdeId }
   | { kind: "agent"; agent: Agent; label: string }
   | null;
 
-export function rowLine(s: SandboxView, state: AppState, agents: AgentCache): RowLine {
+/** Plain Instabox shows no ADE line; an ADE mode shows Open or Install on every row. */
+export function rowLine(s: SandboxView, state: AppState, agents: AgentCache, mode: Mode): RowLine {
   if (state.progress && state.progress.machineId === s.id) return { kind: "progress" };
-  // A sandbox ahead of this computer never offers Update.
-  if (s.updatePending && !s.desktopBehind) return { kind: "update" };
-  if (s.desktopBehind) return { kind: "desktopBehind" };
-  if (!s.connected) return { kind: "connect" };
+  if (mode === "t3") {
+    // A sandbox ahead of this computer never offers Update.
+    if (s.updatePending && !s.desktopBehind) return { kind: "update" };
+    if (s.desktopBehind) return { kind: "desktopBehind" };
+  }
+  if (mode !== "instabox") return { kind: hasAde(s, mode) ? "open" : "install", ade: mode };
   if (s.state === "running") {
     const a = AGENTS.find((x) => agents[agentKey(s.id, x.id)] === false);
     if (a) return { kind: "agent", agent: a.id, label: a.label };
@@ -36,24 +42,34 @@ export function rowLine(s: SandboxView, state: AppState, agents: AgentCache): Ro
   return null;
 }
 
-export function metaText(s: SandboxView) {
-  return s.t3Version ? `${s.size} · T3 ${s.t3Version}` : s.size;
+/** The size, and in T3 mode the sandbox's T3 version unless its Open line shows it. */
+export function metaText(s: SandboxView, mode: Mode, line: RowLine) {
+  return mode === "t3" && s.t3Version && line?.kind !== "open" ? `${s.size} · T3 ${s.t3Version}` : s.size;
 }
 
-interface RowProps {
-  s: SandboxView;
-  state: AppState;
-  run: Run;
-  agents: AgentCache;
-  menuOpen: boolean;
-  onConnect: (id: string) => void;
+/** The actions of the list and its rows, which App runs. */
+export interface ListActions {
+  /** Opens the sandbox in the ADE; one without it gets it first. */
+  onOpen: (id: string, ade: AdeId) => void;
+  /** Sets the ADE up on the sandbox, then opens it. */
+  onConnect: (id: string, ade: AdeId) => void;
   onDetails: (id: string) => void;
   onMenu: (id: string, anchor: HTMLElement) => void;
   onAgentStatus: OnAgentStatus;
 }
 
-function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, onAgentStatus }: RowProps) {
-  const line = rowLine(s, state, agents);
+interface RowProps extends ListActions {
+  s: SandboxView;
+  state: AppState;
+  run: Run;
+  mode: Mode;
+  agents: AgentCache;
+  menuOpen: boolean;
+}
+
+function Row({ s, state, run, mode, agents, menuOpen, onOpen, onConnect, onDetails, onMenu, onAgentStatus }: RowProps) {
+  const line = rowLine(s, state, agents, mode);
+  const busy = BUSY.includes(s.state);
   // A click anywhere on the row opens details, except on its buttons.
   const open = (e: MouseEvent) => {
     if ((e.target as HTMLElement).closest("button, a, select, input")) return;
@@ -69,7 +85,7 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
               <span className="name">{s.name}</span>
               <span className="state">{stateLabel(s.state)}</span>
             </span>
-            <span className="row-meta">{metaText(s)}</span>
+            <span className="row-meta">{metaText(s, mode, line)}</span>
           </span>
         </button>
         <button
@@ -82,7 +98,7 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
           <Dots />
         </button>
       </div>
-      {line?.kind === "progress" && <Progress state={state} run={run} onConnect={onConnect} />}
+      {line?.kind === "progress" && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
       {line?.kind === "update" && (
         <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
           <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
@@ -92,15 +108,22 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
       )}
       {line?.kind === "desktopBehind" && (
         <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
-          <button className="btn sm" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
+          <button className="btn sm" onClick={() => openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL)}>
             Download
           </button>
         </Line>
       )}
-      {line?.kind === "connect" && (
-        <Line text="Not in T3 Code yet">
-          <button className="btn sm" disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id)}>
-            Connect
+      {line?.kind === "open" && (
+        <Line text={readyText(state, s, line.ade)}>
+          <button className="btn sm primary" disabled={busy} onClick={() => onOpen(s.id, line.ade)}>
+            Open in {adeName(state, line.ade)}
+          </button>
+        </Line>
+      )}
+      {line?.kind === "install" && (
+        <Line text={`No ${adeName(state, line.ade)} here yet`}>
+          <button className="btn sm accent-outline" disabled={busy} onClick={() => onConnect(s.id, line.ade)}>
+            Install {adeName(state, line.ade)}
           </button>
         </Line>
       )}
@@ -120,11 +143,23 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
 }
 
 /** A create in flight before its sandbox is in the list. */
-function PendingRow({ state, run, pending, onConnect }: { state: AppState; run: Run; pending: PendingCreate | null; onConnect: (id: string) => void }) {
+function PendingRow({
+  state,
+  run,
+  mode,
+  pending,
+  onConnect,
+}: {
+  state: AppState;
+  run: Run;
+  mode: Mode;
+  pending: PendingCreate | null;
+  onConnect: (id: string, ade: AdeId) => void;
+}) {
   const p = state.progress!;
   const name = p.kind === "create" && pending ? pending.name : "New sandbox";
   const size = p.kind === "create" ? pending?.size : undefined;
-  const meta = p.error ? size : [size, stepText(p, state.t3)].filter(Boolean).join(" · ");
+  const meta = p.error ? size : [size, stepText(p, state)].filter(Boolean).join(" · ");
   return (
     <li className="row pending">
       <div className="row-top">
@@ -140,7 +175,7 @@ function PendingRow({ state, run, pending, onConnect }: { state: AppState; run: 
           </div>
         </div>
       </div>
-      {p.error && <Progress state={state} run={run} onConnect={onConnect} />}
+      {p.error && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
     </li>
   );
 }
@@ -158,23 +193,29 @@ function counts(sandboxes: SandboxView[]) {
     .join(" · ");
 }
 
-interface Props {
+interface Props extends ListActions {
   state: AppState;
   run: Run;
+  mode: Mode;
   agents: AgentCache;
   pending: PendingCreate | null;
   menuFor: string | null;
+  /** Plain Instabox before any pick: offer an ADE. */
+  firstRun: boolean;
+  /** The ADE just switched to, while its hint shows. */
+  hint: AdeId | null;
   onNew: () => void;
-  onConnect: (id: string) => void;
-  onDetails: (id: string) => void;
-  onMenu: (id: string, anchor: HTMLElement) => void;
-  onAgentStatus: OnAgentStatus;
+  onPickAde: () => void;
+  onNotNow: () => void;
+  onDismissHint: () => void;
 }
 
-export default function SandboxList({ state, run, agents, pending, menuFor, onNew, onConnect, onDetails, onMenu, onAgentStatus }: Props) {
+export default function SandboxList(props: Props) {
+  const { state, run, mode, agents, pending, menuFor, firstRun, hint, onNew, onPickAde, onNotNow, onDismissHint, onConnect } = props;
   const p = state.progress;
   const showPending = p !== null && !state.sandboxes.some((s) => s.id === p.machineId);
   const empty = state.sandboxes.length === 0 && !showPending;
+  const missing = mode !== "instabox" && localAde(state, mode)?.version == null;
   return (
     <>
       <div className="list-head">
@@ -187,32 +228,29 @@ export default function SandboxList({ state, run, agents, pending, menuFor, onNe
         </button>
       </div>
       <div className="scroll">
-        {state.t3 === null && (
+        {mode !== "instabox" && missing && (
           <div className="list-card">
-            <T3Missing run={run} />
+            <AdeMissing state={state} ade={mode} run={run} />
+          </div>
+        )}
+        {mode !== "instabox" && hint === mode && (
+          <div className="list-card">
+            <SwitchedHint state={state} ade={mode} onDismiss={onDismissHint} />
           </div>
         )}
         {empty ? (
-          <p className="empty">No sandboxes yet. Create one and open it in T3 Code.</p>
+          <p className="empty">
+            {mode === "instabox" ? "No sandboxes yet. Create one to get started." : `No sandboxes yet. Create one and open it in ${adeName(state, mode)}.`}
+          </p>
         ) : (
           <ul className="rows">
-            {showPending && <PendingRow state={state} run={run} pending={pending} onConnect={onConnect} />}
+            {showPending && <PendingRow state={state} run={run} mode={mode} pending={pending} onConnect={onConnect} />}
             {state.sandboxes.map((s) => (
-              <Row
-                key={s.id}
-                s={s}
-                state={state}
-                run={run}
-                agents={agents}
-                menuOpen={menuFor === s.id}
-                onConnect={onConnect}
-                onDetails={onDetails}
-                onMenu={onMenu}
-                onAgentStatus={onAgentStatus}
-              />
+              <Row key={s.id} {...props} s={s} agents={agents} menuOpen={menuFor === s.id} />
             ))}
           </ul>
         )}
+        {mode === "instabox" && firstRun && <ConnectAdeCard state={state} onConnect={onPickAde} onNotNow={onNotNow} />}
       </div>
       <div className="foot">
         <span>

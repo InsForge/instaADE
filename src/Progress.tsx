@@ -1,20 +1,24 @@
 import { dismissProgress } from "./api";
+import { adeName } from "./ades";
+import type { Mode } from "./ades";
 import type { Run } from "./common";
 import { errorCopy, errorTone, unconnectedFor } from "./ErrorNotice";
-import type { AppState, ProgressView } from "./types";
+import type { AdeId, AppState, ProgressView } from "./types";
 
 // The back end's steps, by the place they take in the flow.
 const PLACE: Record<string, number> = { connecting: 0, creating: 0, waking: 0, installing: 1, pairing: 2, done: 3 };
 const WIDTH = [20, 62, 88, 100];
 
-export function stepText(p: ProgressView, t3: string | null): string {
+export function stepText(p: ProgressView, state: AppState): string {
+  const t3 = p.ade === null || p.ade === "t3";
+  const name = p.ade ? adeName(state, p.ade) : "";
   switch (p.step) {
     case "installing":
-      return `Installing T3 ${t3 ?? ""}`.trim();
+      return t3 ? `Installing T3 ${state.t3 ?? ""}`.trim() : `Installing ${name}, then opening`;
     case "pairing":
-      return "Pairing with T3 Code";
+      return `Pairing with ${name || "T3 Code"}`;
     case "done":
-      return "Confirm in T3 Code";
+      return t3 ? "Confirm in T3 Code" : `Opening ${name}`;
     case "creating":
       return "Creating sandbox";
     default:
@@ -35,24 +39,27 @@ export function ProgressBar({ p }: { p: ProgressView }) {
 interface Props {
   state: AppState;
   run: Run;
-  /** Connects a sandbox that exists: Retry, and Connect on a free-limit error. */
-  onConnect: (id: string) => void;
+  mode: Mode;
+  /** Sets an ADE up on a sandbox that exists: Retry, and Connect on a free-limit error. */
+  onConnect: (id: string, ade: AdeId) => void;
 }
 
 /** The progress of a create or connect: the step and a bar, or the error with Retry and Dismiss. */
-export default function Progress({ state, run, onConnect }: Props) {
+export default function Progress({ state, run, mode, onConnect }: Props) {
   const p = state.progress;
   if (!p) return null;
   if (!p.error) {
     return (
       <div className="progress">
-        <span className="line-text">{stepText(p, state.t3)}</span>
+        <span className="line-text">{stepText(p, state)}</span>
         <ProgressBar p={p} />
       </div>
     );
   }
   const machineId = p.machineId;
-  const unconnected = unconnectedFor(p.error, state.sandboxes);
+  // Retry sets up the ADE the failed flow set up.
+  const retryAde = p.ade ?? (mode === "instabox" ? null : mode);
+  const unconnected = unconnectedFor(p.error, state.sandboxes, mode);
   const tone = errorTone(p.error);
   return (
     <div
@@ -62,14 +69,14 @@ export default function Progress({ state, run, onConnect }: Props) {
       <span className={`line-text${p.error.kind === "setup" ? " pre" : ""}`}>{errorCopy(p.error)}</span>
       {/* type="button": the New sandbox form shows this too, and these must not submit it. */}
       <span className="line-buttons">
-        {machineId && (
+        {machineId && retryAde && (
           // Retry connects the sandbox that already exists. It never creates another.
-          <button type="button" className="btn sm" onClick={() => onConnect(machineId)}>
+          <button type="button" className="btn sm" onClick={() => onConnect(machineId, retryAde)}>
             Retry
           </button>
         )}
-        {unconnected && (
-          <button type="button" className="btn sm" onClick={() => onConnect(unconnected.id)}>
+        {unconnected && mode !== "instabox" && (
+          <button type="button" className="btn sm" onClick={() => onConnect(unconnected.id, mode)}>
             Connect
           </button>
         )}
