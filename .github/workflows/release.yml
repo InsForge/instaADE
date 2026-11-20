@@ -44,7 +44,19 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
       - run: bun install --frozen-lockfile
+      - name: Write the notary key
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
+      # Tauri signs with the Developer ID certificate, then notarizes and staples the app.
       - run: bun tauri build --target ${{ matrix.target }} --bundles dmg
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/notary.p8
       - name: Upload the .dmg
         shell: bash
         env:
