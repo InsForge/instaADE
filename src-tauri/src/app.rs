@@ -508,6 +508,13 @@ impl Inner {
         }
     }
 
+    /// Shows a new sign-in code. The error of an earlier attempt, such as an expired code,
+    /// no longer applies.
+    fn show_sign_in_code(&mut self, code: String) {
+        self.state.sign_in_code = Some(code);
+        self.state.error = None;
+    }
+
     /// Shows a failed save of the current session's rotated tokens. A session the server
     /// ended is an account change, which `Core::end_session` makes.
     fn session_flags(&mut self) {
@@ -1170,7 +1177,7 @@ impl Core {
             .await
             .map_err(|e| ErrorView::from_auth(&e))?;
         let code = start.user_code.clone();
-        self.update_in(since, |i| i.state.sign_in_code = Some(code))
+        self.update_in(since, |i| i.show_sign_in_code(code))
             .ok_or_else(account_changed)?;
         self.open_for(since, start.browser_url())?;
         let session = auth::poll(&self.base, &start)
@@ -2659,6 +2666,21 @@ mod tests {
         assert_eq!(core.state().error, Some(ErrorView::other("boom")));
         core.settle(Ok(())).unwrap();
         assert_eq!(core.state().error, None);
+    }
+
+    #[test]
+    fn a_new_sign_in_code_clears_the_expired_one() {
+        let core = core_on(
+            Url::parse("http://127.0.0.1:9").unwrap(),
+            Arc::new(MemoryConnectedStore::default()),
+        );
+        let expired = ErrorView::from_auth(&auth::Error::Expired);
+        assert!(core.settle::<()>(Err(expired.clone())).is_err());
+        assert_eq!(core.state().error, Some(expired));
+        core.update(|i| i.show_sign_in_code("WXYZ-1234".into()));
+        let s = core.state();
+        assert_eq!(s.sign_in_code.as_deref(), Some("WXYZ-1234"));
+        assert_eq!(s.error, None);
     }
 
     #[tokio::test]

@@ -160,6 +160,10 @@ pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()>
     if let Err(e) = r {
         return core.settle(Err(ErrorView::other(e.to_string())));
     }
+    #[cfg(windows)]
+    if on {
+        crate::login::quote_windows_run_entry(&app.package_info().name);
+    }
     core.set_start_at_login(on);
     core.settle(Ok(()))
 }
