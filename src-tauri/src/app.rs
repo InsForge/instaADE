@@ -714,9 +714,22 @@ async fn detect(ade: Ade) -> Option<String> {
 
 /// The desktop version of each ADE that runs on this computer; None: not found.
 async fn detect_local() -> Vec<(Ade, Option<String>)> {
-    let mut found = Vec::new();
-    for ade in ade::local() {
-        found.push((ade, detect(ade).await));
+    detect_each(ade::local(), Ade::detect).await
+}
+
+/// Runs `detect` for every ADE at once, off the async runtime: each may block for seconds,
+/// so the wait is the slowest one, not their sum. The results keep the order of `ades`.
+async fn detect_each(
+    ades: Vec<Ade>,
+    detect: fn(Ade) -> Option<String>,
+) -> Vec<(Ade, Option<String>)> {
+    let running: Vec<_> = ades
+        .into_iter()
+        .map(|ade| (ade, tokio::task::spawn_blocking(move || detect(ade))))
+        .collect();
+    let mut found = Vec::with_capacity(running.len());
+    for (ade, task) in running {
+        found.push((ade, task.await.ok().flatten()));
     }
     found
 }
@@ -2683,6 +2696,41 @@ mod tests {
             .insert("instabox-bridge".into(), "future-ade".into());
         assert_eq!((d.ade_of("a"), d.pinned_ade_of("a")), (None, None));
         assert!(!sync_targets(&d, Ade::T3).contains(&"a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_ades_on_this_computer_are_looked_for_at_once_in_their_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        // Each look waits until both have started. One after the other, the first would give
+        // up after 5 s and find nothing.
+        fn meet(ade: Ade) -> Option<String> {
+            STARTED.fetch_add(1, SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while STARTED.load(SeqCst) < 2 {
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Some(format!("{}-1.0", ade.id()))
+        }
+        let found = detect_each(vec![Ade::Cmux, Ade::T3], meet).await;
+        assert_eq!(
+            found,
+            vec![
+                (Ade::Cmux, Some("cmux-1.0".to_string())),
+                (Ade::T3, Some("t3-1.0".to_string()))
+            ]
+        );
+        // An ADE that is not found leaves the others alone.
+        fn only_t3(ade: Ade) -> Option<String> {
+            (ade == Ade::T3).then(|| "0.1.10".into())
+        }
+        assert_eq!(
+            detect_each(vec![Ade::T3, Ade::Cmux], only_t3).await,
+            vec![(Ade::T3, Some("0.1.10".into())), (Ade::Cmux, None)]
+        );
     }
 
     #[test]
