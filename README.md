@@ -107,10 +107,6 @@ bun tauri build --bundles dmg
 
 Only needed to test installing. The file lands in `src-tauri/target/release/bundle/dmg/`.
 
-## Credits
-
-Parts are adapted from [t3boat](https://github.com/paukraft/t3boat) by Pau Kraft (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
 ## Contributing
 
 **Pull requests**: Welcome. To add a coding tool, start with [Adding another coding tool](#adding-another-coding-tool).
