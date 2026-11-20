@@ -171,12 +171,13 @@ impl Data {
         self.desktop_behind.remove(id);
     }
 
-    /// The ADE of sandbox `id`: the one it is marked with, else the default.
-    pub fn ade_of(&self, id: &str) -> Ade {
+    /// The ADE of sandbox `id`: the one it is marked with, else the default. None when its
+    /// mark names an ADE this build does not know.
+    pub fn ade_of(&self, id: &str) -> Option<Ade> {
         self.machines
             .iter()
             .find(|m| m.id == id)
-            .map_or_else(Ade::default, machine_ade)
+            .map_or(Some(Ade::default()), machine_ade)
     }
 
     /// The user whose connected set applies: the one it was loaded for, else the account's.
@@ -287,9 +288,13 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
     view::size_choices(own.unwrap_or(&me.allowed_specs))
 }
 
-/// The ADE a machine is marked with, else the default.
-fn machine_ade(m: &Machine) -> Ade {
-    view::marked_ade(&m.metadata).unwrap_or_default()
+/// The ADE a machine is marked with, else the default when it has no mark. None when the
+/// mark names an ADE this build does not know, such as one a newer app connected.
+fn machine_ade(m: &Machine) -> Option<Ade> {
+    match m.metadata.get(view::BRIDGE_KEY) {
+        None => Some(Ade::default()),
+        Some(id) => Ade::from_id(id),
+    }
 }
 
 fn template_is_linux(templates: &[Template], id: &str) -> bool {
@@ -364,7 +369,7 @@ pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
         .filter(|m| view::view_state(&m.state) == ViewState::Running)
         .filter(|m| d.connected.contains(&m.id))
         .filter(|m| template_is_linux(&d.templates, &m.template.id))
-        .filter(|m| machine_ade(m) == ade)
+        .filter(|m| machine_ade(m) == Some(ade))
         .map(|m| m.id.clone())
         .collect()
 }
@@ -706,6 +711,12 @@ fn anyhow_view(e: &anyhow::Error) -> ErrorView {
 
 fn account_changed() -> ErrorView {
     ErrorView::other("The account changed. Nothing was done.")
+}
+
+fn unknown_ade() -> ErrorView {
+    ErrorView::other(
+        "A newer version of Instabox connected this sandbox to another ADE. Update Instabox to use it.",
+    )
 }
 
 fn not_signed_in() -> ErrorView {
@@ -1327,9 +1338,12 @@ impl Core {
         }
     }
 
-    /// The ADE for an action on sandbox `id`: the one asked for, else the sandbox's own.
-    fn ade_for(&self, id: &str, asked: Option<Ade>) -> Ade {
-        asked.unwrap_or_else(|| self.lock().data.ade_of(id))
+    /// The ADE for an action on sandbox `id`: the one asked for, else the sandbox's own. An
+    /// error when the sandbox is marked with an ADE this build does not know.
+    fn ade_for(&self, id: &str, asked: Option<Ade>) -> Res<Ade> {
+        asked
+            .or_else(|| self.lock().data.ade_of(id))
+            .ok_or_else(unknown_ade)
     }
 
     pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<()> {
@@ -1366,7 +1380,10 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let ade = self.ade_for(id, ade);
+        let ade = match self.ade_for(id, ade) {
+            Ok(a) => a,
+            Err(e) => return self.settle_in(account, Err(e)),
+        };
         let version = match self.desktop_version(ade).await {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
@@ -1382,11 +1399,11 @@ impl Core {
     pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
         let snapshot = self.signed_in_with(|i| {
             let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
-            let ade = asked.unwrap_or_else(|| i.data.ade_of(id));
-            (connected, ade, i.sync_version(ade))
+            let ade = asked.or_else(|| i.data.ade_of(id));
+            (connected, ade, ade.and_then(|a| i.sync_version(a)))
         });
         let (client, account, ade, version) = match snapshot {
-            Ok((client, account, (true, ade, version))) => (client, account, ade, version),
+            Ok((client, account, (true, Some(ade), version))) => (client, account, ade, version),
             _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
@@ -1406,9 +1423,9 @@ impl Core {
     /// Makes a new pairing link for a connected sandbox and opens it.
     pub async fn pair_again(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
-        let ade = self.ade_for(id, ade);
         let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
+            let ade = self.ade_for(id, ade)?;
             let link = connect::pair_again(&client, ade, id)
                 .await
                 .map_err(ErrorView::from)?;
@@ -1568,21 +1585,19 @@ impl Core {
 
     /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
-        // Only a sandbox connected from this computer gets its ADE synced after a resume.
-        let (client, account, (ade, version)) = self.signed_in_with(|i| {
-            let ade = i.data.ade_of(id);
-            let version = i
+        // Only a sandbox connected from this computer, to an ADE this build knows, gets its
+        // ADE synced after a resume.
+        let (client, account, sync) = self.signed_in_with(|i| {
+            let ade = i
                 .data
-                .connected
-                .contains(id)
-                .then(|| i.sync_version(ade))
-                .flatten();
-            (ade, version)
+                .ade_of(id)
+                .filter(|_| i.data.connected.contains(id))?;
+            i.sync_version(ade).map(|v| (ade, v))
         })?;
         let r = async {
-            match &version {
-                Some(v) => {
-                    let o = lifecycle::resume(&client, ade, id, v)
+            match &sync {
+                Some((ade, v)) => {
+                    let o = lifecycle::resume(&client, *ade, id, v)
                         .await
                         .map_err(ErrorView::from)?;
                     if let Some(o) = o {
@@ -1648,8 +1663,8 @@ impl Core {
     /// Sets the ADE up again on the sandbox at the desktop version.
     pub async fn reinstall(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
-        let ade = self.ade_for(id, ade);
         let r = async {
+            let ade = self.ade_for(id, ade)?;
             let v = self.desktop_version(ade).await?;
             lifecycle::reinstall(&client, ade, id, &v)
                 .await
@@ -2128,6 +2143,19 @@ mod tests {
         assert!(sync_targets(&d, Ade::T3).contains(&"t".to_string()));
     }
 
+    #[test]
+    fn a_sandbox_of_an_unknown_ade_is_not_synced_as_the_default() {
+        let mut d = data();
+        // A newer app connected "n" from here to an ADE this build does not know.
+        let mut n = machine("n", "org-me", "agent-browser", "running", true);
+        n.metadata
+            .insert("instabox-bridge".into(), "future-ade".into());
+        d.machines.push(n);
+        d.connected.insert("n".into());
+        assert!(!sync_targets(&d, Ade::T3).contains(&"n".to_string()));
+        assert_eq!(d.ade_of("n"), None);
+    }
+
     // A closed local port: a test that reaches the network fails here, never at the real API.
     fn core_with(store: Arc<dyn ConnectedStore>) -> Arc<Core> {
         core_on(Url::parse("http://127.0.0.1:9/").unwrap(), store)
@@ -2482,13 +2510,17 @@ mod tests {
     fn a_sandbox_ade_comes_from_its_mark() {
         let mut d = data();
         // a carries the mark v0.1.x wrote; f has none; "x" is not listed.
-        assert_eq!(d.ade_of("a"), Ade::T3);
-        assert_eq!(d.ade_of("f"), Ade::default());
-        assert_eq!(d.ade_of("x"), Ade::default());
+        assert_eq!(d.ade_of("a"), Some(Ade::T3));
+        assert_eq!(d.ade_of("f"), Some(Ade::default()));
+        assert_eq!(d.ade_of("x"), Some(Ade::default()));
         d.machines[0]
             .metadata
             .insert("instabox-bridge".into(), "other".into());
-        assert_eq!(d.ade_of("a"), Ade::default(), "an unknown id");
+        assert_eq!(
+            d.ade_of("a"),
+            None,
+            "an ADE this build does not know is not the default"
+        );
         let views = sandbox_views(&data(), Some("org-me"), now());
         let ades: Vec<Option<Ade>> = views.iter().map(|v| v.ade).collect();
         assert_eq!(ids(&views), ["a", "e", "f", "g"]);
