@@ -5,7 +5,7 @@
 
   <h1>Instabox</h1>
 
-  <p>Run T3 Code on an instabox sandbox from your menu bar.</p>
+  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar.</p>
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
@@ -22,7 +22,7 @@
 
 ## Getting Started
 
-You need macOS, the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app and an [instabox](https://instabox.sh) account.
+You need macOS, an [instabox](https://instabox.sh) account and a supported ADE. Today that is the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app.
 
 1. Download the latest `.dmg` from [Releases](https://github.com/InsForge/instabox-bridge/releases/latest): `aarch64` for Apple silicon, `x64` for Intel.
 2. Drag Instabox to Applications and open it. It is signed and notarized, so it opens normally.
@@ -34,34 +34,41 @@ You need macOS, the [T3 Code](https://github.com/pingdotgg/t3code/releases/lates
 ## Features
 
 - Create a sandbox or connect one you already have
-- Installs T3 at the same version as your T3 Code
+- Set up your ADE on the sandbox and pair it with the app on your Mac
 - Pause, resume, resize and set auto sleep
 - Copy the SSH command or open it in Terminal
 - Sign in to Claude Code or Codex on the sandbox
 - Starts at login (turn it off in Settings)
 
-## What it installs on your sandbox
+## Supported ADEs
+
+### T3 Code
+
+Instabox installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
 
 - T3 under `/opt/t3`
 - A `t3-instabox` service that runs the T3 server
 - An activity probe, so the sandbox sleeps only when T3 is idle
 
+## Roadmap
+
+- More ADEs: Orca, cmux, Superset and others
+- Windows
+
 ## Known limits
 
 - A sandbox stays awake while T3 Code is connected to it. Pause it when you are done.
-- macOS only for now. Windows is in progress.
 - GitHub on a sandbox is manual: run `gh auth login` there, for example from **Open in Terminal**.
-- T3 Code is the only supported tool for now.
 
-## Adding another coding tool
+## Adding an ADE
 
 - Sandbox side: `src-tauri/src/t3/remote.rs` holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
 - Mac side: `src-tauri/src/t3/desktop.rs` finds T3 Code and reads its version. `open_in_t3` in `src-tauri/src/app.rs` opens it.
 - Flow: `src-tauri/src/sandbox/connect.rs` installs, pairs and marks a sandbox connected. `src-tauri/src/sandbox/sync.rs` keeps the versions in step.
 - UI text such as "Open in T3 Code" is in `src/` (`Details.tsx`, `SandboxMenu.tsx`, `Setup.tsx`, `Progress.tsx`).
-- A new tool needs an install script, a version check, a pairing or connect step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`.
+- A new ADE needs an install script, a version check, a pairing or connect step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`.
 
-Pull requests that add a tool are welcome.
+Pull requests that add an ADE are welcome.
 
 ## Development
 
@@ -109,7 +116,7 @@ Only needed to test installing. The file lands in `src-tauri/target/release/bund
 
 ## Contributing
 
-**Pull requests**: Welcome. To add a coding tool, start with [Adding another coding tool](#adding-another-coding-tool).
+**Pull requests**: Welcome. To add an ADE, start with [Adding an ADE](#adding-an-ade).
 
 **Issues**: Open an [issue](https://github.com/InsForge/instabox-bridge/issues) for bugs or ideas.
 
