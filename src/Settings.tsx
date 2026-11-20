@@ -1,6 +1,6 @@
 import { setStartAtLogin, signOut, switchOrg } from "./api";
 import { CheckT3Button } from "./Setup";
-import { cap, openExternal } from "./common";
+import { cap, openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
 import type { AppState } from "./types";
 
@@ -43,7 +43,7 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
         </section>
 
         <section className="section">
-          <h2 className="section-label">This Mac</h2>
+          <h2 className="section-label">{cap(thisComputer())}</h2>
           <div className="group">
             <div className="group-row">
               <span>

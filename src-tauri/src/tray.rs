@@ -87,14 +87,30 @@ pub struct Bounds {
 const GAP: f64 = 4.0;
 const EDGE: f64 = 8.0;
 
-/// The popover's top-left corner: centered under the icon, kept on the icon's screen.
+/// The popover's top-left corner: centered on the icon, kept on the icon's screen. It opens
+/// under an icon in the top half of the screen (the macOS menu bar) and above one in the
+/// bottom half (a Windows taskbar).
 pub fn popover_origin(icon: Bounds, window: (f64, f64), screen: Bounds) -> (f64, f64) {
     let min = screen.x + EDGE;
     let max = screen.x + screen.w - window.0 - EDGE;
     let x = (icon.x + icon.w / 2.0 - window.0 / 2.0)
         .max(min)
         .min(max.max(min));
-    (x, icon.y + icon.h + GAP)
+    let y = if icon.y + icon.h / 2.0 < screen.y + screen.h / 2.0 {
+        (icon.y + icon.h + GAP).min((screen.y + screen.h - window.1 - EDGE).max(screen.y + EDGE))
+    } else {
+        (icon.y - window.1 - GAP).max(screen.y + EDGE)
+    };
+    (x, y)
+}
+
+/// The popover's top-left corner when the icon's place is unknown: the bottom-right corner of
+/// the work area, by the Windows notification area.
+pub fn corner_origin(window: (f64, f64), work: Bounds) -> (f64, f64) {
+    (
+        (work.x + work.w - window.0 - EDGE).max(work.x),
+        (work.y + work.h - window.1 - EDGE).max(work.y),
+    )
 }
 
 /// A click on the icon also takes focus from an open popover, which hides it first. Without
@@ -103,23 +119,32 @@ pub fn hid_just_now(last: Option<Instant>, now: Instant) -> bool {
     last.is_some_and(|t| now.duration_since(t) < Duration::from_millis(300))
 }
 
-fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<()> {
+fn logical_size(window: &WebviewWindow) -> tauri::Result<(f64, f64)> {
+    let win = window
+        .outer_size()?
+        .to_logical::<f64>(window.scale_factor()?);
+    Ok((win.width, win.height))
+}
+
+/// Places the popover by the icon. False when the icon has no place yet.
+fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<bool> {
     let p = icon.position.to_physical::<f64>(1.0);
-    let Some(screen) = app.monitor_from_point(p.x, p.y)?.or(app.primary_monitor()?) else {
-        return Ok(());
+    let mut screen = app.monitor_from_point(p.x, p.y)?;
+    // On Windows an icon in the hidden icons flyout reports a place off every screen.
+    if cfg!(target_os = "macos") {
+        screen = screen.or(app.primary_monitor()?);
+    }
+    let Some(screen) = screen else {
+        return Ok(false);
     };
     let scale = screen.scale_factor();
     let pos = icon.position.to_logical::<f64>(scale);
     let size = icon.size.to_logical::<f64>(scale);
     if size.width == 0.0 {
-        // The icon is not laid out yet; the window keeps its last place.
-        return Ok(());
+        return Ok(false);
     }
     let spos = screen.position().to_logical::<f64>(scale);
     let ssize = screen.size().to_logical::<f64>(scale);
-    let win = window
-        .outer_size()?
-        .to_logical::<f64>(window.scale_factor()?);
     let (x, y) = popover_origin(
         Bounds {
             x: pos.x,
@@ -127,7 +152,7 @@ fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<(
             w: size.width,
             h: size.height,
         },
-        (win.width, win.height),
+        logical_size(window)?,
         Bounds {
             x: spos.x,
             y: spos.y,
@@ -135,10 +160,32 @@ fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<(
             h: ssize.height,
         },
     );
+    window.set_position(LogicalPosition::new(x, y))?;
+    Ok(true)
+}
+
+fn place_in_corner(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()> {
+    let Some(screen) = app.primary_monitor()? else {
+        return Ok(());
+    };
+    // The window's own scale: `set_position` converts the logical point back with it.
+    let scale = window.scale_factor()?;
+    let area = screen.work_area();
+    let pos = area.position.to_logical::<f64>(scale);
+    let size = area.size.to_logical::<f64>(scale);
+    let (x, y) = corner_origin(
+        logical_size(window)?,
+        Bounds {
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+        },
+    );
     window.set_position(LogicalPosition::new(x, y))
 }
 
-/// Shows the popover under the icon. `icon` is the clicked icon's place; None looks it up.
+/// Shows the popover by the icon. `icon` is the clicked icon's place; None looks it up.
 pub fn show_popover(app: &AppHandle, icon: Option<Rect>) {
     let Some(w) = app.get_webview_window(MAIN_WINDOW) else {
         return;
@@ -147,8 +194,11 @@ pub fn show_popover(app: &AppHandle, icon: Option<Rect>) {
         app.tray_by_id(TRAY_ID)
             .and_then(|t| t.rect().ok().flatten())
     });
-    if let Some(icon) = icon {
-        let _ = place(app, &w, icon);
+    let placed = icon.is_some_and(|icon| place(app, &w, icon).unwrap_or(false));
+    // Windows keeps a new tray icon in the hidden icons flyout, where it has no place. On
+    // macOS an icon not laid out yet leaves the window in its last place.
+    if !placed && cfg!(not(target_os = "macos")) {
+        let _ = place_in_corner(app, &w);
     }
     let _ = w.show();
     let _ = w.set_focus();
@@ -258,7 +308,11 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
             }
         });
     // Template image: macOS tints it for light and dark menu bars.
+    #[cfg(target_os = "macos")]
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    // Elsewhere nothing tints it, and the black template would vanish on a dark taskbar.
+    #[cfg(not(target_os = "macos"))]
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
     builder = builder.icon(icon).icon_as_template(true);
     builder.build(app)?;
     Ok(())
@@ -388,6 +442,83 @@ mod tests {
             h: 24.0,
         };
         assert_eq!(popover_origin(icon, (360.0, 600.0), second).0, 2992.0);
+    }
+
+    #[test]
+    fn popover_opens_above_an_icon_in_a_bottom_taskbar() {
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let icon = Bounds {
+            x: 1700.0,
+            y: 1040.0,
+            w: 24.0,
+            h: 40.0,
+        };
+        assert_eq!(
+            popover_origin(icon, (360.0, 600.0), screen),
+            (1532.0, 436.0)
+        );
+        let corner = Bounds { x: 1900.0, ..icon };
+        assert_eq!(popover_origin(corner, (360.0, 600.0), screen).0, 1552.0);
+        // A second screen below the first: the icon's own screen decides.
+        let lower = Bounds {
+            y: 1080.0,
+            ..screen
+        };
+        let icon = Bounds { y: 2120.0, ..icon };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), lower).1, 1516.0);
+    }
+
+    #[test]
+    fn without_an_icon_place_the_popover_sits_in_the_work_area_corner() {
+        let work = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1280.0,
+            h: 752.0,
+        };
+        assert_eq!(corner_origin((376.0, 609.0), work), (896.0, 135.0));
+        let tiny = Bounds { h: 500.0, ..work };
+        assert_eq!(corner_origin((376.0, 609.0), tiny).1, 0.0);
+    }
+
+    #[test]
+    fn a_short_screen_keeps_the_popover_top_on_screen() {
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1093.0,
+            h: 614.0,
+        };
+        let icon = Bounds {
+            x: 900.0,
+            y: 578.0,
+            w: 24.0,
+            h: 36.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), screen).1, 8.0);
+    }
+
+    #[test]
+    fn a_short_screen_keeps_the_popover_bottom_on_screen() {
+        // A taskbar at the top of a short screen: the popover opens below the icon.
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1093.0,
+            h: 614.0,
+        };
+        let icon = Bounds {
+            x: 900.0,
+            y: 0.0,
+            w: 24.0,
+            h: 36.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), screen).1, 8.0);
     }
 
     #[test]

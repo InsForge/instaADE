@@ -125,7 +125,7 @@ pub struct SshSpawner;
 
 impl ForwardSpawner for SshSpawner {
     fn spawn(&self, _port: u16, args: &[String]) -> std::io::Result<Box<dyn Forward>> {
-        let child = tokio::process::Command::new("ssh")
+        let child = tokio::process::Command::from(crate::process::command("ssh"))
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

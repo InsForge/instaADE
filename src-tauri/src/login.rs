@@ -37,6 +37,40 @@ pub fn mark(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, "")
 }
 
+/// This program's Windows Run entry with its path in quotes, so a path with a space in it
+/// (a user name such as "Jane Doe") starts the right program. None when the entry is
+/// already quoted or is not this program's.
+pub fn quoted_run_command(value: &str, exe: &str) -> Option<String> {
+    let rest = value.strip_prefix(exe)?;
+    // The path must end where the arguments begin: `<exe>.bak` is another program.
+    if rest.starts_with(|c: char| !c.is_whitespace()) {
+        return None;
+    }
+    Some(format!("\"{exe}\"{rest}"))
+}
+
+/// The autostart plugin writes the current user's Run entry without quotes: rewrite it
+/// with them. A failure is only logged; the unquoted entry still works for most paths.
+#[cfg(windows)]
+pub fn quote_windows_run_entry(app_name: &str) {
+    use windows_registry::CURRENT_USER;
+    const RUN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.display().to_string();
+    let r = CURRENT_USER.create(RUN).and_then(|key| {
+        let value = key.get_string(app_name)?;
+        match quoted_run_command(&value, &exe) {
+            Some(quoted) => key.set_string(app_name, quoted),
+            None => Ok(()),
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("start at login: could not quote the Run entry: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +94,23 @@ mod tests {
     fn after_the_default_the_choice_stands() {
         assert_eq!(startup(true, true, false), Startup::Keep);
         assert_eq!(startup(true, true, true), Startup::Rewrite);
+    }
+
+    #[test]
+    fn the_run_entry_gets_its_path_quoted_once() {
+        let exe = r"C:\Users\Jane Doe\AppData\Local\Instabox\instabox-bridge.exe";
+        let quoted = quoted_run_command(&format!("{exe} --at-login"), exe).unwrap();
+        assert_eq!(quoted, format!("\"{exe}\" --at-login"));
+        assert_eq!(quoted_run_command(&quoted, exe), None);
+        assert_eq!(
+            quoted_run_command(r"C:\Other\app.exe --at-login", exe),
+            None
+        );
+        assert_eq!(
+            quoted_run_command(&format!("{exe}.bak --at-login"), exe),
+            None
+        );
+        assert_eq!(quoted_run_command(exe, exe), Some(format!("\"{exe}\"")));
     }
 
     #[test]

@@ -129,11 +129,25 @@ pub fn display_command(t: &SshToken) -> String {
 }
 
 /// File content for the macOS `.command` launcher.
+#[cfg(any(target_os = "macos", test))]
 fn command_file_content(cmd: &str) -> String {
     format!("#!/bin/sh\nexec {cmd}\n")
 }
 
-/// Open the login in Terminal (macOS).
+/// The words of a login command (`ssh -p 2222 ibssh_x@host`) when none needs quoting, so
+/// they pass to a Windows console as they are. None for anything else.
+#[cfg(any(windows, test))]
+fn plain_words(cmd: &str) -> Option<Vec<&str>> {
+    let plain = |w: &&str| {
+        w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.@:=/+,".contains(c))
+    };
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    (!words.is_empty() && words.iter().all(plain)).then_some(words)
+}
+
+/// Open the login in a terminal: Terminal on macOS; Windows Terminal, else a console window,
+/// on Windows. The token goes on the command line, never into a file.
 pub fn open_in_terminal(cmd: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -165,10 +179,31 @@ pub fn open_in_terminal(cmd: &str) -> std::result::Result<(), String> {
             Err(e) => Err(e.to_string()),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let words = plain_words(cmd).ok_or("The login command cannot be opened in a terminal")?;
+        if crate::process::command("wt.exe")
+            .arg("new-tab")
+            .args(&words)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // cmd /k keeps the window open after ssh ends, so its last message stays readable.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/k {}", words.join(" ")))
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = cmd;
-        Err("Open in Terminal is only on macOS for now".to_string())
+        Err("Open in Terminal is only on macOS and Windows for now".to_string())
     }
 }
 
@@ -263,6 +298,32 @@ mod tests {
             command_file_content("ssh -p 2222 ibssh_abc@h"),
             "#!/bin/sh\nexec ssh -p 2222 ibssh_abc@h\n"
         );
+    }
+
+    #[test]
+    fn plain_words_take_only_a_command_that_needs_no_quoting() {
+        assert_eq!(
+            plain_words("ssh -p 2222 ibssh_a-B9@ssh.example.test"),
+            Some(vec!["ssh", "-p", "2222", "ibssh_a-B9@ssh.example.test"])
+        );
+        assert_eq!(
+            plain_words("ssh ibssh_x@152.236.1.51"),
+            Some(vec!["ssh", "ibssh_x@152.236.1.51"])
+        );
+        for bad in [
+            "",
+            "ssh x@h & calc",
+            "ssh x@h; calc",
+            "ssh \"x@h\"",
+            "ssh %PATH%@h",
+            "ssh x@h|more",
+            "ssh ^x@h",
+            "ssh x@h > out",
+            "ssh !x!@h",
+            "ssh (x)@h",
+        ] {
+            assert_eq!(plain_words(bad), None, "{bad}");
+        }
     }
 
     #[test]

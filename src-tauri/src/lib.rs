@@ -109,7 +109,12 @@ pub fn run() {
                     }
                 }
             }
-            core.set_start_at_login(launch.is_enabled().unwrap_or(false));
+            let at_login = launch.is_enabled().unwrap_or(false);
+            #[cfg(windows)]
+            if at_login {
+                login::quote_windows_run_entry(&handle.package_info().name);
+            }
+            core.set_start_at_login(at_login);
             app.manage(core.clone());
             tray::build(&handle, core.clone())?;
             // Opened by hand: show where the app lives. Started at login: stay in the menu bar.

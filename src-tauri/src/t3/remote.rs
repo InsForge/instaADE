@@ -175,7 +175,6 @@ pub fn parse_probe(stdout: &str) -> ProbeAnswer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn setup_script_pins_version() {
@@ -225,12 +224,17 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn setup_script_is_valid_sh() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("setup.sh");
         std::fs::write(&p, setup_script("0.1.10")).unwrap();
-        let st = Command::new("/bin/sh").arg("-n").arg(&p).status().unwrap();
+        let st = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .arg(&p)
+            .status()
+            .unwrap();
         assert!(st.success());
     }
 
@@ -245,6 +249,8 @@ mod tests {
     fn probe_asset_is_python() {
         assert!(PROBE.starts_with("#!/usr/bin/env python3\n"));
         assert!(PROBE.contains("statev2.sqlite"));
+        // A CRLF checkout (Windows) would break the script on the sandbox.
+        assert!(!PROBE.contains('\r'));
     }
 
     #[test]

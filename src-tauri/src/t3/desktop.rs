@@ -2,10 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
-use crate::process::{RunError, run_bounded};
+use crate::process::{RunError, command, run_bounded};
 
 pub const DOWNLOAD_URL: &str = "https://github.com/pingdotgg/t3code/releases/latest";
 
@@ -43,7 +42,7 @@ pub fn version(cli: &Path) -> Result<String> {
 }
 
 fn version_within(cli: &Path, timeout: Duration) -> Result<String> {
-    let mut cmd = Command::new(cli);
+    let mut cmd = command(cli);
     cmd.arg("--version");
     let (code, stdout, _) = match run_bounded(cmd, timeout) {
         Ok(c) => c,

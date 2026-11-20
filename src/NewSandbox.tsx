@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import type { FormEvent } from "react";
 import type { createSandbox } from "./api";
+import { thisComputer } from "./common";
 import type { Run } from "./common";
 import Progress from "./Progress";
 import type { AppState, SleepChoice } from "./types";
@@ -149,7 +150,7 @@ export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: 
           </div>
 
           <p className="info">
-            Installs T3{state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on this Mac. Then the sandbox opens in T3 Code.
+            Installs T3{state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on {thisComputer()}. Then the sandbox opens in T3 Code.
           </p>
 
           {state.progress && (

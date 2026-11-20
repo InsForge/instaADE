@@ -31,8 +31,18 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
+            os: macos-latest
+            bundle: dmg
+            ext: dmg
           - target: x86_64-apple-darwin
-    runs-on: macos-latest
+            os: macos-latest
+            bundle: dmg
+            ext: dmg
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bundle: nsis
+            ext: exe
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -45,11 +55,14 @@ jobs:
           key: ${{ matrix.target }}
       - run: bun install --frozen-lockfile
       - name: Write the notary key
+        if: runner.os == 'macOS'
         env:
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
       # Tauri signs with the Developer ID certificate, then notarizes and staples the app.
-      - run: bun tauri build --target ${{ matrix.target }} --bundles dmg
+      - name: Build the signed .dmg
+        if: runner.os == 'macOS'
+        run: bun tauri build --target ${{ matrix.target }} --bundles dmg
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -57,8 +70,13 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/notary.p8
+      # The Windows installer is not signed yet: SmartScreen asks once before it runs.
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        run: bun tauri build --target ${{ matrix.target }} --bundles nsis
       # A missing secret builds an unsigned app, which macOS reports as damaged. Never publish one.
       - name: Check the app is signed and notarized
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           shopt -s nullglob
@@ -77,16 +95,16 @@ jobs:
             xcrun stapler validate "${apps[0]}"
             hdiutil detach "$mnt" >/dev/null
           done
-      - name: Upload the .dmg
+      - name: Upload the .${{ matrix.ext }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           shopt -s nullglob
-          files=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          files=(src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/*.${{ matrix.ext }})
           if [ ${#files[@]} -eq 0 ]; then
-            echo "no .dmg was built" >&2
+            echo "no .${{ matrix.ext }} was built" >&2
             exit 1
           fi
           gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
