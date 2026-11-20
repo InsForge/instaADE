@@ -60,9 +60,9 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 
 ## Adding an ADE
 
-- Sandbox side: `src-tauri/src/t3/remote.rs` holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
-- Desktop side: `src-tauri/src/t3/desktop.rs` finds T3 Code and reads its version. `open_in_t3` in `src-tauri/src/app.rs` opens it.
-- Flow: `src-tauri/src/sandbox/connect.rs` installs, pairs and marks a sandbox connected. `src-tauri/src/sandbox/sync.rs` keeps the versions in step.
+- Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
+- ADE module: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
+- Flow: `src-tauri/src/sandbox/connect.rs` installs, pairs and marks a sandbox connected with the ADE's id. `src-tauri/src/sandbox/sync.rs` keeps the versions in step. `open_in_ade` in `src-tauri/src/app.rs` opens it.
 - UI text such as "Open in T3 Code" is in `src/` (`Details.tsx`, `SandboxMenu.tsx`, `Setup.tsx`, `Progress.tsx`).
 - A new ADE needs an install script, a version check, a pairing or connect step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`.
 

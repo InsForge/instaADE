@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use url::Url;
 
+use crate::ade::{self, Ade, Open};
 use crate::agents::{self, Agent};
 use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, Template};
 use crate::auth::{self, Provider, Session};
@@ -29,21 +30,19 @@ use crate::sandbox::view::{
 };
 use crate::sandbox::{self, SandboxError, connect, lifecycle};
 use crate::ssh::{self, SshTokenStore};
-use crate::t3::desktop;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
 const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instabox-bridge/releases/latest";
-/// Opens the T3 Code app without a pairing link.
-const T3_APP_URL: &str = "t3code://";
 const RELEASES_PAGE: &str = "https://github.com/InsForge/instabox-bridge/releases/latest";
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
-/// Account data and the desktop T3 version are read this often.
+/// Account data and the desktop ADE versions are read this often.
 pub const FULL_REFRESH: Duration = Duration::from_secs(300);
 
 /// Called with the whole state after every change.
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
-/// Opens a URL in the default handler (browser, or T3 Code for `t3code://`).
+/// Opens a URL in the default handler (browser, or an ADE's app for its links, such as
+/// T3 Code for `t3code://`).
 pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
@@ -86,6 +85,30 @@ pub struct ProgressView {
     pub error: Option<ErrorView>,
 }
 
+/// An ADE whose desktop app runs on this computer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdeView {
+    pub id: Ade,
+    pub name: &'static str,
+    pub short_name: &'static str,
+    /// The desktop app's version; None when it is not found on this computer.
+    pub version: Option<String>,
+    pub download_url: &'static str,
+}
+
+impl AdeView {
+    fn new(ade: Ade, version: Option<String>) -> AdeView {
+        AdeView {
+            id: ade,
+            name: ade.name(),
+            short_name: ade.short_name(),
+            version,
+            download_url: ade.download_url(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
@@ -103,8 +126,10 @@ pub struct AppState {
     pub orgs: Vec<OrgView>,
     pub org_id: Option<String>,
     pub tier: String,
-    /// The desktop T3 Code's version.
+    /// The desktop T3 Code's version, for the UI. The same as T3's entry in `ades`.
     pub t3: Option<String>,
+    /// The ADEs that run on this computer, with the versions found here.
+    pub ades: Vec<AdeView>,
     pub sandboxes: Vec<SandboxView>,
     pub sizes: Vec<SizeChoice>,
     pub sleep_choices: Vec<SleepChoice>,
@@ -124,11 +149,11 @@ pub struct Data {
     pub templates: Vec<Template>,
     pub machines: Vec<Machine>,
     pub snapshots: Vec<Snapshot>,
-    /// The T3 version this app last saw on each sandbox.
-    pub t3_versions: HashMap<String, String>,
-    /// Sandboxes whose T3 is behind the desktop's and could not be updated (busy or failed).
+    /// The ADE version this app last saw on each sandbox.
+    pub ade_versions: HashMap<String, String>,
+    /// Sandboxes whose ADE is behind the desktop's and could not be updated (busy or failed).
     pub update_pending: HashSet<String>,
-    /// Sandboxes whose T3 is newer than the desktop's: this computer's T3 Code is behind.
+    /// Sandboxes whose ADE is newer than the desktop's: the app on this computer is behind.
     pub desktop_behind: HashSet<String>,
     /// Sandboxes the signed-in user connected from this computer. Only these get commands
     /// without a user action.
@@ -140,9 +165,18 @@ pub struct Data {
 impl Data {
     /// The sandbox runs `version` now.
     pub fn set_version(&mut self, id: &str, version: &str) {
-        self.t3_versions.insert(id.to_string(), version.to_string());
+        self.ade_versions
+            .insert(id.to_string(), version.to_string());
         self.update_pending.remove(id);
         self.desktop_behind.remove(id);
+    }
+
+    /// The ADE of sandbox `id`: the one it is marked with, else the default.
+    pub fn ade_of(&self, id: &str) -> Ade {
+        self.machines
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(Ade::default, machine_ade)
     }
 
     /// The user whose connected set applies: the one it was loaded for, else the account's.
@@ -178,7 +212,7 @@ impl Data {
             }
             Decision::Defer => {
                 if let Some(v) = &o.remote_version {
-                    self.t3_versions.insert(id.to_string(), v.clone());
+                    self.ade_versions.insert(id.to_string(), v.clone());
                 }
                 self.desktop_behind.remove(id);
                 self.update_pending.insert(id.to_string());
@@ -186,7 +220,7 @@ impl Data {
             // The sandbox is ahead: never move it back, and do not offer [Update].
             Decision::Older => {
                 if let Some(v) = &o.remote_version {
-                    self.t3_versions.insert(id.to_string(), v.clone());
+                    self.ade_versions.insert(id.to_string(), v.clone());
                 }
                 self.update_pending.remove(id);
                 self.desktop_behind.insert(id.to_string());
@@ -253,6 +287,11 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
     view::size_choices(own.unwrap_or(&me.allowed_specs))
 }
 
+/// The ADE a machine is marked with, else the default.
+fn machine_ade(m: &Machine) -> Ade {
+    view::marked_ade(&m.metadata).unwrap_or_default()
+}
+
 fn template_is_linux(templates: &[Template], id: &str) -> bool {
     templates
         .iter()
@@ -280,7 +319,7 @@ pub fn sandbox_views(d: &Data, org_id: Option<&str>, now: DateTime<Utc>) -> Vec<
         .into_iter()
         .map(|m| {
             let mut v = view::view(m, now);
-            v.t3_version = d.t3_versions.get(&m.id).cloned();
+            v.t3_version = d.ade_versions.get(&m.id).cloned();
             v.update_pending = d.update_pending.contains(&m.id);
             v.desktop_behind = d.desktop_behind.contains(&m.id);
             v.connected = d.connected.contains(&m.id);
@@ -310,20 +349,22 @@ pub fn snapshot_views(
         .collect()
 }
 
-/// True when the desktop T3 version moved from one known version to another.
+/// True when a desktop ADE version moved from one known version to another.
 /// The first read is not a change.
 pub fn version_changed(prev: Option<&str>, new: Option<&str>) -> bool {
     matches!((prev, new), (Some(p), Some(n)) if p != n)
 }
 
-/// The sandboxes to sync after a desktop version change: running and connected from this
-/// computer, in any of the user's orgs. A sandbox someone else connected is left alone.
-pub fn sync_targets(d: &Data) -> Vec<String> {
+/// The sandboxes to sync after a change of `ade`'s desktop version: running, connected from
+/// this computer and of that ADE, in any of the user's orgs. A sandbox someone else connected
+/// is left alone.
+pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
     d.machines
         .iter()
         .filter(|m| view::view_state(&m.state) == ViewState::Running)
         .filter(|m| d.connected.contains(&m.id))
         .filter(|m| template_is_linux(&d.templates, &m.template.id))
+        .filter(|m| machine_ade(m) == ade)
         .map(|m| m.id.clone())
         .collect()
 }
@@ -404,9 +445,11 @@ pub fn newer_release(current: &str, body: &str) -> Option<UpdateInfo> {
     })
 }
 
-/// URLs the UI may ask the app to open.
+/// URLs the UI may ask the app to open: https, and the links of every ADE's app.
 pub fn allowed_url(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "https" | "t3code"))
+    Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https" || ade::ALL.iter().any(|a| a.url_scheme() == u.scheme())
+    })
 }
 
 pub fn parse_provider(s: &str) -> Option<Provider> {
@@ -454,10 +497,30 @@ impl AppState {
         self.org_id = org_id;
     }
 
+    /// The version of `ade`'s desktop app found on this computer.
+    pub fn desktop(&self, ade: Ade) -> Option<&str> {
+        self.ades
+            .iter()
+            .find(|a| a.id == ade)
+            .and_then(|a| a.version.as_deref())
+    }
+
+    /// Records the version of `ade`'s desktop app found on this computer; None: not found.
+    pub fn set_desktop(&mut self, ade: Ade, version: Option<String>) {
+        if ade == Ade::T3 {
+            self.t3 = version.clone();
+        }
+        match self.ades.iter_mut().find(|a| a.id == ade) {
+            Some(a) => a.version = version,
+            None => self.ades.push(AdeView::new(ade, version)),
+        }
+    }
+
     /// The state after sign-out: what belongs to the account is gone.
     pub fn signed_out(&self) -> AppState {
         AppState {
             t3: self.t3.clone(),
+            ades: self.ades.clone(),
             start_at_login: self.start_at_login,
             update: self.update.clone(),
             ..AppState::default()
@@ -483,19 +546,37 @@ impl Inner {
         self.state.apply(&self.data, Utc::now());
     }
 
-    /// Records the desktop T3 version just read. A move from one known version to another
-    /// gives the sandboxes to bring along.
-    fn set_desktop_version(&mut self, t3: Option<String>) -> Option<SyncJob> {
-        let job = version_changed(self.state.t3.as_deref(), t3.as_deref())
-            .then(|| t3.clone())
+    /// Records the desktop version of `ade` just read. For an ADE that pins the desktop
+    /// version, a move from one known version to another gives the sandboxes to bring along.
+    fn set_desktop_version(&mut self, ade: Ade, version: Option<String>) -> Option<SyncJob> {
+        let changed = version_changed(self.state.desktop(ade), version.as_deref());
+        let job = (changed && ade.pins_local_version())
+            .then(|| version.clone())
             .flatten()
             .map(|v| SyncJob {
+                ade,
                 version: v,
-                ids: sync_targets(&self.data),
+                ids: sync_targets(&self.data, ade),
                 account: self.account,
             });
-        self.state.t3 = t3;
+        self.state.set_desktop(ade, version);
         job
+    }
+
+    /// `set_desktop_version` for each ADE read.
+    fn set_desktop_versions(&mut self, found: Vec<(Ade, Option<String>)>) -> Vec<SyncJob> {
+        found
+            .into_iter()
+            .filter_map(|(ade, v)| self.set_desktop_version(ade, v))
+            .collect()
+    }
+
+    /// The desktop version to bring sandbox `ade` in step with: known, and only for an ADE
+    /// that pins it.
+    fn sync_version(&self, ade: Ade) -> Option<String> {
+        ade.pins_local_version()
+            .then(|| self.state.desktop(ade).map(str::to_string))
+            .flatten()
     }
 
     /// Ends the progress, and the copy of its error in `state.error`.
@@ -526,8 +607,9 @@ impl Inner {
     }
 }
 
-/// A desktop version change: the version to bring these sandboxes to.
+/// A desktop version change: the version of `ade` to bring these sandboxes to.
 pub struct SyncJob {
+    pub ade: Ade,
     pub version: String,
     pub ids: Vec<String>,
     /// The account count when the job was made; a job for an older account is dropped.
@@ -540,6 +622,8 @@ pub struct CreateArgs {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub auto_suspend_after_seconds: Option<i64>,
+    /// The ADE to set up; None: the default.
+    pub ade: Option<Ade>,
 }
 
 /// What an account change puts in place of the current account.
@@ -600,14 +684,20 @@ impl Gate for FlowGate {
     }
 }
 
-async fn detect_t3() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let cli = desktop::locate()?;
-        desktop::version(&cli).ok()
-    })
-    .await
-    .ok()
-    .flatten()
+async fn detect(ade: Ade) -> Option<String> {
+    tokio::task::spawn_blocking(move || ade.detect())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The desktop version of each ADE that runs on this computer; None: not found.
+async fn detect_local() -> Vec<(Ade, Option<String>)> {
+    let mut found = Vec::new();
+    for ade in ade::local() {
+        found.push((ade, detect(ade).await));
+    }
+    found
 }
 
 fn anyhow_view(e: &anyhow::Error) -> ErrorView {
@@ -640,6 +730,10 @@ impl Core {
         home: PathBuf,
     ) -> Core {
         // The connected set is per user: it loads once the account is known (refresh).
+        let mut state = AppState::default();
+        for ade in ade::local() {
+            state.set_desktop(ade, None);
+        }
         Core {
             base,
             keys,
@@ -652,7 +746,7 @@ impl Core {
             #[cfg(test)]
             hook: Mutex::new(None),
             inner: Mutex::new(Inner {
-                state: AppState::default(),
+                state,
                 data: Data::default(),
                 session: None,
                 client: None,
@@ -942,8 +1036,12 @@ impl Core {
     // ---- launch and refresh ----
 
     pub async fn start(self: &Arc<Self>) {
-        let t3 = detect_t3().await;
-        self.update(|i| i.state.t3 = t3);
+        let found = detect_local().await;
+        self.update(|i| {
+            for (ade, v) in found {
+                i.state.set_desktop(ade, v);
+            }
+        });
         let since = self.account();
         let base = self.base.clone();
         let session = tokio::task::spawn_blocking(move || Session::load(&base))
@@ -960,9 +1058,11 @@ impl Core {
     }
 
     /// Reads machines, and with `full` also the account, templates, snapshots and the
-    /// desktop T3 version. Lists only; nothing here runs a command on a sandbox.
-    pub async fn refresh(self: &Arc<Self>, full: bool) -> Option<SyncJob> {
-        let (client, account, no_me) = self.signed_in_with(|i| i.data.me.is_none()).ok()?;
+    /// desktop ADE versions. Lists only; nothing here runs a command on a sandbox.
+    pub async fn refresh(self: &Arc<Self>, full: bool) -> Vec<SyncJob> {
+        let Ok((client, account, no_me)) = self.signed_in_with(|i| i.data.me.is_none()) else {
+            return Vec::new();
+        };
         let full = full || no_me;
         let machines = client.machines().await;
         let account_reads = if full {
@@ -972,7 +1072,7 @@ impl Core {
                 client.templates(),
                 client.snapshots()
             );
-            Some((me, orgs, templates, snapshots, detect_t3().await))
+            Some((me, orgs, templates, snapshots, detect_local().await))
         } else {
             None
         };
@@ -985,7 +1085,7 @@ impl Core {
         };
         let connected = self.load_connected(user, account).await;
         // When the account changed while the reads were in flight, they are not its data.
-        let job = self.update_in(account, |i| {
+        let jobs = self.update_in(account, |i| {
             let mut failure: Option<ErrorView> = None;
             if let Some((user, set, problem)) = connected {
                 i.data.use_connected(user, set);
@@ -1001,8 +1101,8 @@ impl Core {
                 }
                 Err(e) => failure = Some(e.into()),
             }
-            let mut version = None;
-            if let Some((me, orgs, templates, snapshots, t3)) = account_reads {
+            let mut found = Vec::new();
+            if let Some((me, orgs, templates, snapshots, desktop)) = account_reads {
                 match me {
                     Ok(v) => i.data.me = Some(v),
                     Err(e) => failure = Some(e.into()),
@@ -1016,18 +1116,18 @@ impl Core {
                 if let Ok(v) = snapshots {
                     i.data.snapshots = v;
                 }
-                version = Some(t3);
+                found = desktop;
             }
             i.rebuild();
             // A failed poll is silent; only a failed full read shows.
             if let (true, Some(e)) = (was_full, failure) {
                 i.state.error = Some(e);
             }
-            let job = version.and_then(|t3| i.set_desktop_version(t3));
+            let jobs = i.set_desktop_versions(found);
             i.session_flags();
-            job
+            jobs
         });
-        job.flatten()
+        jobs.unwrap_or_default()
     }
 
     /// The connected set of `user` from disk, when it is not the one in use.
@@ -1049,25 +1149,23 @@ impl Core {
         })
     }
 
-    /// Looks for T3 Code on this computer now (the "Check again" button), instead of
-    /// waiting for the next full refresh.
-    pub async fn refresh_t3(self: &Arc<Self>) -> Res<()> {
-        let t3 = detect_t3().await;
-        let job = self.update(|i| i.set_desktop_version(t3));
-        self.spawn_sync(job);
+    /// Looks for the ADEs' desktop apps on this computer now (the "Check again" button),
+    /// instead of waiting for the next full refresh.
+    pub async fn refresh_ades(self: &Arc<Self>) -> Res<()> {
+        let found = detect_local().await;
+        let jobs = self.update(|i| i.set_desktop_versions(found));
+        self.spawn_sync(jobs);
         Ok(())
     }
 
     /// `refresh`, then syncs the sandboxes after a desktop version change in the background.
     pub async fn refresh_and_sync(self: &Arc<Self>, full: bool) {
-        let job = self.refresh(full).await;
-        self.spawn_sync(job);
+        let jobs = self.refresh(full).await;
+        self.spawn_sync(jobs);
     }
 
-    fn spawn_sync(self: &Arc<Self>, job: Option<SyncJob>) {
-        if let Some(job) = job
-            && !job.ids.is_empty()
-        {
+    fn spawn_sync(self: &Arc<Self>, jobs: Vec<SyncJob>) {
+        for job in jobs.into_iter().filter(|j| !j.ids.is_empty()) {
             let core = self.clone();
             tokio::spawn(async move { core.sync_all(job).await });
         }
@@ -1080,7 +1178,7 @@ impl Core {
             return;
         };
         for id in &job.ids {
-            let r = sandbox::sync::sync(&client, id, &job.version).await;
+            let r = sandbox::sync::sync(&client, job.ade, id, &job.version).await;
             self.record_sync(id, &job.version, r.as_ref().ok(), job.account);
         }
     }
@@ -1213,19 +1311,25 @@ impl Core {
 
     // ---- sandbox actions ----
 
-    async fn desktop_version(&self) -> Res<String> {
-        if let Some(v) = self.lock().state.t3.clone() {
-            return Ok(v);
+    async fn desktop_version(&self, ade: Ade) -> Res<String> {
+        if let Some(v) = self.lock().state.desktop(ade) {
+            return Ok(v.to_string());
         }
-        match detect_t3().await {
+        match detect(ade).await {
             Some(v) => {
-                self.update(|i| i.state.t3 = Some(v.clone()));
+                self.update(|i| i.state.set_desktop(ade, Some(v.clone())));
                 Ok(v)
             }
-            None => Err(ErrorView::other(
-                "T3 Code is not installed. Install it first.",
-            )),
+            None => Err(ErrorView::other(format!(
+                "{} is not installed. Install it first.",
+                ade.name()
+            ))),
         }
+    }
+
+    /// The ADE for an action on sandbox `id`: the one asked for, else the sandbox's own.
+    fn ade_for(&self, id: &str, asked: Option<Ade>) -> Ade {
+        asked.unwrap_or_else(|| self.lock().data.ade_of(id))
     }
 
     pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<()> {
@@ -1233,7 +1337,8 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let version = match self.desktop_version().await {
+        let ade = a.ade.unwrap_or_default();
+        let version = match self.desktop_version(ade).await {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
         };
@@ -1249,56 +1354,62 @@ impl Core {
         };
         self.begin_progress("create", "creating", None, account);
         let r =
-            connect::create_and_connect(&client, &req, &version, self.progress_cb(account)).await;
+            connect::create_and_connect(&client, ade, &req, &version, self.progress_cb(account))
+                .await;
         self.finish_connect(r, &version, account).await
     }
 
-    /// Connects an existing sandbox: wakes it, installs T3 (never an older one), pairs,
-    /// then opens T3 Code with the pairing link.
-    pub async fn connect_sandbox(self: &Arc<Self>, id: &str) -> Res<()> {
+    /// Connects an existing sandbox: wakes it, installs the ADE (never an older version),
+    /// pairs, then opens the ADE's app with the pairing link.
+    pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let version = match self.desktop_version().await {
+        let ade = self.ade_for(id, ade);
+        let version = match self.desktop_version(ade).await {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
         };
         self.begin_progress("connect", "connecting", Some(id.to_string()), account);
-        let r = connect::connect_existing(&client, id, &version, self.progress_cb(account)).await;
+        let r =
+            connect::connect_existing(&client, ade, id, &version, self.progress_cb(account)).await;
         self.finish_connect(r, &version, account).await
     }
 
-    /// Open in T3 Code. A connected sandbox: wake it, sync its T3, open the app (no setup,
-    /// no new pairing). An unconnected one goes through the connect flow.
-    pub async fn open_in_t3(self: &Arc<Self>, id: &str) -> Res<()> {
+    /// Open in the ADE's app. A connected sandbox: wake it, sync its ADE, open the app (no
+    /// setup, no new pairing). An unconnected one goes through the connect flow.
+    pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
         let snapshot = self.signed_in_with(|i| {
             let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
-            (connected, i.state.t3.clone())
+            let ade = asked.unwrap_or_else(|| i.data.ade_of(id));
+            (connected, ade, i.sync_version(ade))
         });
-        let (client, account, version) = match snapshot {
-            Ok((client, account, (true, version))) => (client, account, version),
-            _ => return self.connect_sandbox(id).await,
+        let (client, account, ade, version) = match snapshot {
+            Ok((client, account, (true, ade, version))) => (client, account, ade, version),
+            _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
             sandbox::ensure_running(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
             if let Some(v) = &version {
-                let out = sandbox::sync::sync(&client, id, v).await;
+                let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            self.open_for(account, T3_APP_URL)
+            let Open::Pair(p) = ade.open();
+            self.open_for(account, p.app_url)
         };
         self.act(account, r).await
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
-    pub async fn pair_again(self: &Arc<Self>, id: &str) -> Res<()> {
+    pub async fn pair_again(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
+        let ade = self.ade_for(id, ade);
         let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
-            let link = connect::pair_again(&client, id)
+            let link = connect::pair_again(&client, ade, id)
                 .await
                 .map_err(ErrorView::from)?;
             linked.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1400,14 +1511,15 @@ impl Core {
         self.step("finish");
         let out = match r {
             Ok(c) => {
-                // A sandbox that kept a newer T3 is not moved to the desktop's: the desktop is
-                // behind. One that kept an older T3 because T3 was busy offers the update.
+                // A sandbox that kept a newer version is not moved to the desktop's: the
+                // desktop is behind. One that kept an older version because the ADE was busy
+                // offers the update.
                 self.update_in(account, |i| {
                     i.state.progress = None;
-                    i.data.set_version(&c.machine_id, &c.t3_version);
+                    i.data.set_version(&c.machine_id, &c.version);
                     if c.update_pending {
                         i.data.update_pending.insert(c.machine_id.clone());
-                    } else if c.t3_version != version {
+                    } else if c.version != version {
                         i.data.desktop_behind.insert(c.machine_id.clone());
                     }
                     i.rebuild();
@@ -1454,20 +1566,23 @@ impl Core {
         .await
     }
 
-    /// Wakes the sandbox. A connected one also gets its T3 brought in step with the desktop.
+    /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
-        // Only a sandbox connected from this computer gets its T3 synced after a resume.
-        let (client, account, version) = self.signed_in_with(|i| {
-            i.data
+        // Only a sandbox connected from this computer gets its ADE synced after a resume.
+        let (client, account, (ade, version)) = self.signed_in_with(|i| {
+            let ade = i.data.ade_of(id);
+            let version = i
+                .data
                 .connected
                 .contains(id)
-                .then(|| i.state.t3.clone())
-                .flatten()
+                .then(|| i.sync_version(ade))
+                .flatten();
+            (ade, version)
         })?;
         let r = async {
             match &version {
                 Some(v) => {
-                    let o = lifecycle::resume(&client, id, v)
+                    let o = lifecycle::resume(&client, ade, id, v)
                         .await
                         .map_err(ErrorView::from)?;
                     if let Some(o) = o {
@@ -1495,7 +1610,7 @@ impl Core {
             .await;
         if r.is_ok() {
             self.update_in(account, |i| {
-                i.data.t3_versions.remove(id);
+                i.data.ade_versions.remove(id);
                 i.data.update_pending.remove(id);
                 i.data.desktop_behind.remove(id);
                 // A progress of this sandbox can only retry a sandbox that is gone.
@@ -1530,11 +1645,13 @@ impl Core {
         .await
     }
 
-    pub async fn reinstall_t3(self: &Arc<Self>, id: &str) -> Res<()> {
+    /// Sets the ADE up again on the sandbox at the desktop version.
+    pub async fn reinstall(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
+        let ade = self.ade_for(id, ade);
         let r = async {
-            let v = self.desktop_version().await?;
-            lifecycle::reinstall(&client, id, &v)
+            let v = self.desktop_version(ade).await?;
+            lifecycle::reinstall(&client, ade, id, &v)
                 .await
                 .map_err(ErrorView::from)?;
             self.record_version(id, &v, account);
@@ -1743,7 +1860,7 @@ mod tests {
                 snap("s3", "ready", "mac", None),
                 snap("s4", "ready", "agent-browser", Some("org-team")),
             ],
-            t3_versions: HashMap::from([("a".to_string(), "0.1.10".to_string())]),
+            ade_versions: HashMap::from([("a".to_string(), "0.1.10".to_string())]),
             update_pending: HashSet::from(["e".to_string()]),
             desktop_behind: HashSet::from(["g".to_string()]),
             connected: HashSet::from(["a".to_string(), "b".to_string(), "e".to_string()]),
@@ -1775,7 +1892,7 @@ mod tests {
         s.apply(&d, now());
         s.signed_in = true;
         s.sign_in_code = None;
-        s.t3 = Some("0.1.10".into());
+        s.set_desktop(Ade::T3, Some("0.1.10".into()));
         s.mcp = McpStatus {
             claude_code: Some(true),
             codex: Some(false),
@@ -1820,6 +1937,7 @@ mod tests {
             "orgId",
             "tier",
             "t3",
+            "ades",
             "sandboxes",
             "sizes",
             "sleepChoices",
@@ -1928,7 +2046,7 @@ mod tests {
             .push(machine("h", "org-me", "agent-browser", "stopped", true));
         // a (org-me) and b (org-team) are running and connected. e: suspended. f/g: running
         // but not connected. h: stopped. c, d: not Linux.
-        assert_eq!(sync_targets(&d), ["a", "b"]);
+        assert_eq!(sync_targets(&d, Ade::T3), ["a", "b"]);
         assert!(version_changed(Some("0.1.9"), Some("0.1.10")));
         assert!(!version_changed(Some("0.1.10"), Some("0.1.10")));
         assert!(!version_changed(None, Some("0.1.10")), "first read");
@@ -2003,11 +2121,11 @@ mod tests {
             .push(machine("t", "org-me", "agent-browser", "running", true));
         let t = view_of(&d, "t");
         assert!(!t.connected);
-        assert!(!sync_targets(&d).contains(&"t".to_string()));
+        assert!(!sync_targets(&d, Ade::T3).contains(&"t".to_string()));
         // Once this computer connects it, it is a sync target.
         d.connected.insert("t".into());
         assert!(view_of(&d, "t").connected);
-        assert!(sync_targets(&d).contains(&"t".to_string()));
+        assert!(sync_targets(&d, Ade::T3).contains(&"t".to_string()));
     }
 
     // A closed local port: a test that reaches the network fails here, never at the real API.
@@ -2027,11 +2145,11 @@ mod tests {
         ))
     }
 
-    fn connected_result(id: &str, t3_version: &str) -> Connected {
+    fn connected_result(id: &str, version: &str) -> Connected {
         Connected {
             machine_id: id.into(),
             link: "t3code://pair?pairingUrl=x".into(),
-            t3_version: t3_version.into(),
+            version: version.into(),
             update_pending: false,
         }
     }
@@ -2192,6 +2310,7 @@ mod tests {
         assert_eq!(p3.kind, "create");
         assert_eq!(p3.machine_id.as_deref(), Some("m1"));
         let err = ErrorView::from(SandboxError::Setup {
+            ade: Ade::T3,
             stderr_tail: "boom".into(),
         });
         let failed = fail_progress(Some(&p3), &err).unwrap();
@@ -2206,6 +2325,7 @@ mod tests {
             step: "installing".into(),
             machine_id: Some(id.into()),
             error: Some(ErrorView::from(SandboxError::Setup {
+                ade: Ade::T3,
                 stderr_tail: "tar: bad".into(),
             })),
         }
@@ -2314,14 +2434,85 @@ mod tests {
         let mut i = core.lock();
         i.data = data();
         assert!(
-            i.set_desktop_version(Some("0.1.10".into())).is_none(),
+            i.set_desktop_version(Ade::T3, Some("0.1.10".into()))
+                .is_none(),
             "first read"
         );
-        let job = i.set_desktop_version(Some("0.1.11".into())).unwrap();
+        let job = i
+            .set_desktop_version(Ade::T3, Some("0.1.11".into()))
+            .unwrap();
         assert_eq!(job.version, "0.1.11");
         assert_eq!(job.ids, ["a", "b"]);
-        assert!(i.set_desktop_version(None).is_none());
+        assert!(i.set_desktop_version(Ade::T3, None).is_none());
         assert_eq!(i.state.t3, None);
+    }
+
+    #[test]
+    fn ades_hold_the_desktop_versions_and_t3_mirrors_its_own() {
+        let core = core_with(Arc::new(MemoryConnectedStore::default()));
+        let s = core.state();
+        if cfg!(any(target_os = "macos", windows)) {
+            // Listed from the start; nothing is found before the first look.
+            assert_eq!(s.ades, vec![AdeView::new(Ade::T3, None)]);
+        }
+        assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
+
+        let mut s = AppState::default();
+        s.set_desktop(Ade::T3, Some("0.1.10".into()));
+        assert_eq!(s.t3.as_deref(), Some("0.1.10"));
+        assert_eq!(s.desktop(Ade::T3), Some("0.1.10"));
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            j["ades"],
+            serde_json::json!([{
+                "id": "t3", "name": "T3 Code", "shortName": "T3", "version": "0.1.10",
+                "downloadUrl": "https://github.com/pingdotgg/t3code/releases/latest"
+            }])
+        );
+        s.set_desktop(Ade::T3, None);
+        assert_eq!(s.ades.len(), 1, "one entry per ADE");
+        assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
+        s.set_desktop(Ade::T3, Some("0.1.11".into()));
+        let out = s.signed_out();
+        assert_eq!(out.ades, s.ades, "desktop facts stay");
+        assert_eq!(out.t3.as_deref(), Some("0.1.11"));
+    }
+
+    #[test]
+    fn a_sandbox_ade_comes_from_its_mark() {
+        let mut d = data();
+        // a carries the mark v0.1.x wrote; f has none; "x" is not listed.
+        assert_eq!(d.ade_of("a"), Ade::T3);
+        assert_eq!(d.ade_of("f"), Ade::default());
+        assert_eq!(d.ade_of("x"), Ade::default());
+        d.machines[0]
+            .metadata
+            .insert("instabox-bridge".into(), "other".into());
+        assert_eq!(d.ade_of("a"), Ade::default(), "an unknown id");
+        let views = sandbox_views(&data(), Some("org-me"), now());
+        let ades: Vec<Option<Ade>> = views.iter().map(|v| v.ade).collect();
+        assert_eq!(ids(&views), ["a", "e", "f", "g"]);
+        assert_eq!(ades, [Some(Ade::T3), Some(Ade::T3), None, None]);
+    }
+
+    #[test]
+    fn the_sync_version_is_the_known_desktop_version() {
+        let core = core_with(Arc::new(MemoryConnectedStore::default()));
+        let mut i = core.lock();
+        assert_eq!(i.sync_version(Ade::T3), None, "not found yet");
+        i.state.set_desktop(Ade::T3, Some("0.1.10".into()));
+        assert!(Ade::T3.pins_local_version());
+        assert_eq!(i.sync_version(Ade::T3).as_deref(), Some("0.1.10"));
+    }
+
+    #[test]
+    fn every_ade_link_may_be_opened() {
+        for a in ade::ALL {
+            let Open::Pair(p) = a.open();
+            assert!(allowed_url(p.app_url), "{a:?}");
+            assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
+        }
+        assert!(!allowed_url("t3codex://x"));
     }
 
     #[tokio::test]
@@ -2471,7 +2662,7 @@ mod tests {
             i.data = data();
             i.data.connected_user = Some(7);
             i.rebuild();
-            i.state.t3 = Some("0.1.10".into());
+            i.state.set_desktop(Ade::T3, Some("0.1.10".into()));
             i.state.start_at_login = true;
         });
         assert!(core.state().signed_in);
@@ -2489,6 +2680,7 @@ mod tests {
         assert!(core.lock().data.connected.is_empty(), "no connected set");
         assert!(connected.load(7).contains("a"), "kept on disk for user 7");
         assert_eq!(s.t3.as_deref(), Some("0.1.10"), "desktop facts stay");
+        assert_eq!(s.desktop(Ade::T3), Some("0.1.10"));
         assert!(s.start_at_login);
         assert!(
             !emitted.lock().unwrap().last().unwrap().signed_in,
@@ -2826,7 +3018,7 @@ mod tests {
         let (_server, base) = pairing_server(Duration::ZERO).await;
         let core = core_on(base.clone(), Arc::new(FailingConnected));
         sign_in_as(&core, &base, 7);
-        core.pair_again("m1").await.unwrap();
+        core.pair_again("m1", None).await.unwrap();
         let e = core.state().error.expect("error shown");
         assert!(e.message.contains("disk full"), "{e:?}");
     }
@@ -2838,7 +3030,7 @@ mod tests {
         let core = core_on(base.clone(), store.clone());
         sign_in_as(&core, &base, 7);
         let c = core.clone();
-        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        let call = tokio::spawn(async move { c.pair_again("m1", None).await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         core.sign_out().await.unwrap();
         let _ = call.await.unwrap();
@@ -2937,7 +3129,7 @@ mod tests {
         let core = core_on(base.clone(), Arc::new(MemoryConnectedStore::default()));
         sign_in_as(&core, &base, 7);
         let c = core.clone();
-        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        let call = tokio::spawn(async move { c.pair_again("m1", None).await });
         tokio::time::sleep(Duration::from_millis(150)).await;
         core.sign_out().await.unwrap();
         sign_in_as(&core, &base, 8);
@@ -3044,7 +3236,7 @@ mod tests {
         );
         sign_in_as(&core, &base, 7);
         let c = core.clone();
-        let call = tokio::spawn(async move { c.pair_again("m1").await });
+        let call = tokio::spawn(async move { c.pair_again("m1", None).await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         core.sign_out().await.unwrap();
         sign_in_as(&core, &base, 8);
@@ -3268,7 +3460,7 @@ mod tests {
             );
             let d = core.lock().data.clone();
             c.check(
-                !d.t3_versions.contains_key("t"),
+                !d.ade_versions.contains_key("t"),
                 format!("ok={ok}: a T3 version was recorded"),
             );
             c.check(

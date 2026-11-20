@@ -1,11 +1,15 @@
 //! The commands the UI calls. Each one parses its arguments and hands off to `Core`.
 //! Errors are `ErrorView` values the UI can branch on.
+//!
+//! An optional `ade` argument picks the ADE (`"t3"`). Without it a command uses the
+//! sandbox's own ADE, or the default (T3) for a new one.
 
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 
+use crate::ade::Ade;
 use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
@@ -45,6 +49,7 @@ pub async fn create_sandbox(
     vcpus: u32,
     memMiB: u32,
     auto_suspend_after_seconds: Option<i64>,
+    ade: Option<Ade>,
 ) -> Res<()> {
     core.inner()
         .clone()
@@ -54,13 +59,14 @@ pub async fn create_sandbox(
             vcpus,
             mem_mib: memMiB,
             auto_suspend_after_seconds,
+            ade,
         })
         .await
 }
 
 #[tauri::command]
-pub async fn connect_sandbox(core: Shared<'_>, id: String) -> Res<()> {
-    core.inner().clone().connect_sandbox(&id).await
+pub async fn connect_sandbox(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+    core.inner().clone().connect_sandbox(&id, ade).await
 }
 
 /// Closes a failed create or connect.
@@ -69,23 +75,23 @@ pub fn dismiss_progress(core: Shared<'_>) {
     core.dismiss_progress();
 }
 
-/// Looks for T3 Code on this computer again, now.
+/// Looks for the ADEs' desktop apps (T3 Code) on this computer again, now.
 #[tauri::command]
 pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
-    core.inner().clone().refresh_t3().await
+    core.inner().clone().refresh_ades().await
 }
 
-/// Opens T3 Code on the sandbox. A connected sandbox is woken and synced; an unconnected
-/// one is connected first.
+/// Opens the sandbox in the ADE's app (T3 Code). A connected sandbox is woken and synced;
+/// an unconnected one is connected first.
 #[tauri::command]
-pub async fn open_in_t3(core: Shared<'_>, id: String) -> Res<()> {
-    core.inner().clone().open_in_t3(&id).await
+pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+    core.inner().clone().open_in_ade(&id, ade).await
 }
 
-/// A new pairing link for a connected sandbox, opened in T3 Code.
+/// A new pairing link for a connected sandbox, opened in the ADE's app.
 #[tauri::command]
-pub async fn pair_again(core: Shared<'_>, id: String) -> Res<()> {
-    core.inner().clone().pair_again(&id).await
+pub async fn pair_again(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+    core.inner().clone().pair_again(&id, ade).await
 }
 
 #[tauri::command]
@@ -114,9 +120,10 @@ pub async fn set_auto_sleep(core: Shared<'_>, id: String, seconds: i64) -> Res<(
     core.inner().clone().set_auto_sleep(&id, seconds).await
 }
 
+/// Sets the ADE (T3) up again on the sandbox.
 #[tauri::command]
-pub async fn reinstall_t3(core: Shared<'_>, id: String) -> Res<()> {
-    core.inner().clone().reinstall_t3(&id).await
+pub async fn reinstall_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+    core.inner().clone().reinstall(&id, ade).await
 }
 
 #[tauri::command]

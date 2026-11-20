@@ -1,14 +1,28 @@
 //! Turns API `Machine` records into the view the UI shows, and builds the size and sleep choices.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::ade::Ade;
 use crate::api::types::{Machine, MachineSpec, Me, Template};
 
 /// The server's idle time when a machine sets none, and the free plan's fixed one.
 const DEFAULT_SLEEP_SECONDS: i64 = 1800;
+/// The metadata key that marks a sandbox as connected. Its value is the ADE's id.
 pub(crate) const BRIDGE_KEY: &str = "instabox-bridge";
-pub(crate) const BRIDGE_VALUE: &str = "t3";
+
+/// The ADE a sandbox is marked as connected to. Sandboxes connected by v0.1.x hold `t3`.
+/// None when there is no mark or its value is not a known ADE id.
+pub fn marked_ade(metadata: &BTreeMap<String, String>) -> Option<Ade> {
+    metadata.get(BRIDGE_KEY).and_then(|v| Ade::from_id(v))
+}
+
+/// Marks a sandbox's metadata as connected to `ade`. Other keys stay.
+pub fn mark(metadata: &mut BTreeMap<String, String>, ade: Ade) {
+    metadata.insert(BRIDGE_KEY.to_string(), ade.id().to_string());
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +69,8 @@ pub struct SandboxView {
     pub state: ViewState,
     pub size: String,
     pub connected: bool,
+    /// The ADE the sandbox is marked as connected to.
+    pub ade: Option<Ade>,
     pub t3_version: Option<String>,
     pub free: bool,
     pub auto_sleep: AutoSleep,
@@ -135,7 +151,8 @@ pub fn view(m: &Machine, now: DateTime<Utc>) -> SandboxView {
         name: m.name.clone(),
         state,
         size: size_label(&m.spec),
-        connected: m.metadata.get(BRIDGE_KEY).map(String::as_str) == Some(BRIDGE_VALUE),
+        connected: marked_ade(&m.metadata).is_some(),
+        ade: marked_ade(&m.metadata),
         t3_version: None,
         free: m.free,
         auto_sleep,
@@ -279,6 +296,27 @@ mod tests {
         let v = view(&m, now());
         assert!(v.connected);
         assert_eq!(v.t3_version, None);
+        assert_eq!(v.ade, Some(Ade::T3));
+    }
+
+    #[test]
+    fn the_mark_holds_the_ade_id_and_keeps_other_keys() {
+        let mut md = BTreeMap::from([("a".to_string(), "1".to_string())]);
+        assert_eq!(marked_ade(&md), None);
+        mark(&mut md, Ade::T3);
+        // The same mark v0.1.x wrote, so its sandboxes stay connected.
+        assert_eq!(
+            md,
+            BTreeMap::from([
+                ("a".to_string(), "1".to_string()),
+                ("instabox-bridge".to_string(), "t3".to_string()),
+            ])
+        );
+        assert_eq!(marked_ade(&md), Some(Ade::T3));
+        md.insert("instabox-bridge".into(), "other".into());
+        assert_eq!(marked_ade(&md), None);
+        let j = serde_json::to_value(view(&machine("running"), now())).unwrap();
+        assert_eq!(j["ade"], serde_json::Value::Null);
     }
 
     #[test]

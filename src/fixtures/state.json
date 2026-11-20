@@ -19,6 +19,15 @@
   "orgId": "org-me",
   "tier": "free",
   "t3": "0.1.10",
+  "ades": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "shortName": "T3",
+      "version": "0.1.10",
+      "downloadUrl": "https://github.com/pingdotgg/t3code/releases/latest"
+    }
+  ],
   "sandboxes": [
     {
       "id": "a",
@@ -26,6 +35,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": true,
+      "ade": "t3",
       "t3Version": "0.1.10",
       "free": true,
       "autoSleep": {
@@ -43,6 +53,7 @@
       "state": "paused",
       "size": "4 vCPU / 8 GB",
       "connected": true,
+      "ade": "t3",
       "t3Version": null,
       "free": false,
       "autoSleep": {
@@ -60,6 +71,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": false,
+      "ade": null,
       "t3Version": null,
       "free": false,
       "autoSleep": {
@@ -77,6 +89,7 @@
       "state": "running",
       "size": "4 vCPU / 8 GB",
       "connected": false,
+      "ade": null,
       "t3Version": null,
       "free": false,
       "autoSleep": {

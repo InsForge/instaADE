@@ -10,6 +10,9 @@ export type ViewState =
   | "error"
   | "deleting";
 
+/** An ADE's id. */
+export type AdeId = "t3";
+
 export type ErrorKind =
   | "freeLimit"
   | "cooldown"
@@ -43,6 +46,8 @@ export interface SandboxView {
   state: ViewState;
   size: string;
   connected: boolean;
+  /** The ADE the sandbox is marked as connected to. */
+  ade: AdeId | null;
   t3Version: string | null;
   free: boolean;
   autoSleep: { seconds: number | null; label: string };
@@ -63,6 +68,16 @@ export interface SizeChoice {
 export interface SleepChoice {
   seconds: number;
   label: string;
+}
+
+/** An ADE whose desktop app runs on this computer. */
+export interface AdeView {
+  id: AdeId;
+  name: string;
+  shortName: string;
+  /** The desktop app's version; null when it is not found on this computer. */
+  version: string | null;
+  downloadUrl: string;
 }
 
 export interface SnapshotView {
@@ -93,8 +108,9 @@ export interface AppState {
   orgs: OrgView[];
   orgId: string | null;
   tier: string;
-  /** The desktop T3 Code version. */
+  /** The desktop T3 Code version. The same as T3's entry in ades. */
   t3: string | null;
+  ades: AdeView[];
   sandboxes: SandboxView[];
   sizes: SizeChoice[];
   sleepChoices: SleepChoice[];

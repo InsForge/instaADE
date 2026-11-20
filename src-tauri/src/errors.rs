@@ -13,7 +13,9 @@ pub enum ErrorKind {
     FreeLimit,
     /// `minutes` says how long.
     Cooldown,
-    T3Busy,
+    /// The ADE is busy on the sandbox. The UI knows it as `t3Busy`.
+    #[serde(rename = "t3Busy")]
+    AdeBusy,
     Setup,
     SignedOut,
     Timeout,
@@ -80,10 +82,12 @@ impl From<SandboxError> for ErrorView {
                 minutes: Some(minutes),
                 ..ErrorView::new(ErrorKind::Cooldown, message)
             },
-            SandboxError::T3Busy => ErrorView::new(ErrorKind::T3Busy, message),
+            SandboxError::AdeBusy(_) => ErrorView::new(ErrorKind::AdeBusy, message),
             SandboxError::Setup { .. } => ErrorView::new(ErrorKind::Setup, message),
             SandboxError::Timeout => ErrorView::new(ErrorKind::Timeout, message),
-            SandboxError::FixedOnFree | SandboxError::NewerThanDesktop => ErrorView::other(message),
+            SandboxError::FixedOnFree | SandboxError::NewerThanDesktop(_) => {
+                ErrorView::other(message)
+            }
             SandboxError::Api(a) => ErrorView::from(a),
         }
     }
@@ -92,6 +96,7 @@ impl From<SandboxError> for ErrorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ade::Ade;
 
     fn api_err(status: u16, code: &str) -> api::Error {
         api::Error {
@@ -114,10 +119,11 @@ mod tests {
         assert_eq!(v.message, "Cooling down, ready in about 12 min");
 
         assert_eq!(
-            ErrorView::from(SandboxError::T3Busy).kind,
-            ErrorKind::T3Busy
+            ErrorView::from(SandboxError::AdeBusy(Ade::T3)).kind,
+            ErrorKind::AdeBusy
         );
         let v = ErrorView::from(SandboxError::Setup {
+            ade: Ade::T3,
             stderr_tail: "boom".into(),
         });
         assert_eq!(v.kind, ErrorKind::Setup);
@@ -153,7 +159,7 @@ mod tests {
 
     #[test]
     fn json_is_camel_case_and_omits_empty_fields() {
-        let v = serde_json::to_value(ErrorView::from(SandboxError::T3Busy)).unwrap();
+        let v = serde_json::to_value(ErrorView::from(SandboxError::AdeBusy(Ade::T3))).unwrap();
         assert_eq!(v["kind"], "t3Busy");
         assert!(v.get("minutes").is_none() && v.get("code").is_none());
         let v = serde_json::to_value(ErrorView::from(SandboxError::FreeLimit)).unwrap();

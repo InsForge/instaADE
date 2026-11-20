@@ -1,3 +1,4 @@
+pub mod ade;
 pub mod agents;
 pub mod api;
 pub mod app;
@@ -11,7 +12,6 @@ pub mod mcp;
 pub mod process;
 pub mod sandbox;
 pub mod ssh;
-pub mod t3;
 pub mod tray;
 
 use std::sync::Arc;
