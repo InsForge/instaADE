@@ -26,6 +26,7 @@ const sample: AppState = {
   orgId: "org-me",
   tier: "free",
   t3: "0.1.10",
+  ades: [{ id: "t3", name: "T3 Code", shortName: "T3", version: "0.1.10", downloadUrl: T3_DOWNLOAD_URL }],
   sandboxes: [],
   sizes: [
     { vcpus: 2, memMiB: 4096, label: "2 vCPU / 4 GB" },
@@ -46,6 +47,7 @@ const box: SandboxView = {
   state: "running",
   size: "4 vCPU / 8 GB",
   connected: true,
+  ade: "t3",
   t3Version: "0.1.10",
   free: true,
   autoSleep: { seconds: 1800, label: "After 30 min" },

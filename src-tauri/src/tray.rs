@@ -8,6 +8,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, LogicalPosition, Manager, Rect, WebviewWindow, Window};
 
+use crate::ade::Ade;
 use crate::app::{AppState, Core};
 use crate::sandbox::view::ViewState;
 
@@ -20,6 +21,8 @@ pub struct TrayRow {
     pub id: String,
     pub label: String,
     pub connected: bool,
+    /// The ADE its Open item opens.
+    pub ade: Ade,
     pub action: Option<TrayAction>,
 }
 
@@ -40,12 +43,12 @@ pub fn row_label(name: &str, state: ViewState) -> String {
     format!("{dot} {name}")
 }
 
-/// The submenu item that opens T3 Code. An unconnected sandbox is connected first.
-pub fn open_label(connected: bool) -> &'static str {
+/// The submenu item that opens the ADE's app. An unconnected sandbox is connected first.
+pub fn open_label(ade: Ade, connected: bool) -> String {
     if connected {
-        "Open in T3 Code"
+        format!("Open in {}", ade.name())
     } else {
-        "Connect to T3 Code"
+        format!("Connect to {}", ade.name())
     }
 }
 
@@ -57,6 +60,7 @@ pub fn tray_rows(state: &AppState) -> Vec<TrayRow> {
             id: s.id.clone(),
             label: row_label(&s.name, s.state),
             connected: s.connected,
+            ade: s.ade.unwrap_or_default(),
             action: match s.state {
                 ViewState::Running => Some(TrayAction::Pause),
                 ViewState::Paused | ViewState::Stopped => Some(TrayAction::Resume),
@@ -255,7 +259,7 @@ fn build_menu(app: &AppHandle, rows: &[TrayRow]) -> tauri::Result<Menu<tauri::Wr
         sub.append(&item(
             app,
             format!("open:{}", r.id),
-            open_label(r.connected),
+            &open_label(r.ade, r.connected),
         )?)?;
         menu.append(&sub)?;
     }
@@ -300,7 +304,7 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                         let _ = match verb.as_str() {
                             "pause" => core.pause(&sandbox).await,
                             "resume" => core.resume(&sandbox).await,
-                            "open" => core.open_in_t3(&sandbox).await,
+                            "open" => core.open_in_ade(&sandbox, None).await,
                             _ => Ok(()),
                         };
                     });
@@ -349,6 +353,7 @@ mod tests {
             state,
             size: "4 vCPU / 8 GB".into(),
             connected: true,
+            ade: Some(Ade::T3),
             t3_version: None,
             free: false,
             auto_sleep: AutoSleep {
@@ -383,15 +388,17 @@ mod tests {
 
     #[test]
     fn open_item_follows_connected() {
-        assert_eq!(open_label(true), "Open in T3 Code");
-        assert_eq!(open_label(false), "Connect to T3 Code");
+        assert_eq!(open_label(Ade::T3, true), "Open in T3 Code");
+        assert_eq!(open_label(Ade::T3, false), "Connect to T3 Code");
         let mut r = row("a", ViewState::Running);
         r.connected = false;
+        r.ade = None;
         let state = AppState {
             sandboxes: vec![r],
             ..AppState::default()
         };
         assert!(!tray_rows(&state)[0].connected);
+        assert_eq!(tray_rows(&state)[0].ade, Ade::T3, "the default ADE");
         assert_eq!(row_label("x", ViewState::Stopped), "\u{25CB} x");
     }
 

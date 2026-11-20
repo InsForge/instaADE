@@ -9,6 +9,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::time::Instant;
 
+use crate::ade::Ade;
 use crate::api::{self, Action, Client, Machine, Operation};
 
 /// Why a create, wake or connect did not finish. `Display` is written for people.
@@ -18,14 +19,17 @@ pub enum SandboxError {
         minutes: i64,
     },
     FreeLimit,
-    T3Busy,
+    /// The ADE is busy on the sandbox, so its setup waits.
+    AdeBusy(Ade),
     Setup {
+        ade: Ade,
         stderr_tail: String,
     },
     Timeout,
     FixedOnFree,
-    /// The sandbox runs a newer T3 than the desktop; the app never moves it back.
-    NewerThanDesktop,
+    /// The sandbox runs a newer version of the ADE than the desktop; the app never moves it
+    /// back.
+    NewerThanDesktop(Ade),
     Api(api::Error),
 }
 
@@ -36,20 +40,23 @@ impl fmt::Display for SandboxError {
                 write!(f, "Cooling down, ready in about {minutes} min")
             }
             SandboxError::FreeLimit => write!(f, "The free plan has one sandbox"),
-            SandboxError::T3Busy => write!(
+            SandboxError::AdeBusy(ade) => write!(
                 f,
-                "T3 is busy on this sandbox. Try again when the agent is idle."
+                "{} is busy on this sandbox. Try again when the agent is idle.",
+                ade.short_name()
             ),
-            SandboxError::Setup { stderr_tail } => {
-                write!(f, "Setting up T3 failed:\n{stderr_tail}")
+            SandboxError::Setup { ade, stderr_tail } => {
+                write!(f, "Setting up {} failed:\n{stderr_tail}", ade.short_name())
             }
             SandboxError::Timeout => write!(f, "The sandbox took too long to get ready"),
             SandboxError::FixedOnFree => {
                 write!(f, "Auto sleep is fixed at 30 minutes on the free plan")
             }
-            SandboxError::NewerThanDesktop => write!(
+            SandboxError::NewerThanDesktop(ade) => write!(
                 f,
-                "This sandbox runs a newer T3 than this computer. Update T3 Code here first."
+                "This sandbox runs a newer {} than this computer. Update {} here first.",
+                ade.short_name(),
+                ade.name()
             ),
             SandboxError::Api(e) => write!(f, "{}", e.message),
         }
@@ -223,6 +230,26 @@ mod tests {
             retryable,
             retry_after: Some(60),
         }
+    }
+
+    #[test]
+    fn t3_messages_read_word_for_word() {
+        assert_eq!(
+            SandboxError::AdeBusy(Ade::T3).to_string(),
+            "T3 is busy on this sandbox. Try again when the agent is idle."
+        );
+        assert_eq!(
+            SandboxError::Setup {
+                ade: Ade::T3,
+                stderr_tail: "boom".into()
+            }
+            .to_string(),
+            "Setting up T3 failed:\nboom"
+        );
+        assert_eq!(
+            SandboxError::NewerThanDesktop(Ade::T3).to_string(),
+            "This sandbox runs a newer T3 than this computer. Update T3 Code here first."
+        );
     }
 
     #[test]

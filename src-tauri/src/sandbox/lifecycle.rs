@@ -1,22 +1,18 @@
 //! Sandbox actions behind the UI's buttons: pause, resume, delete, resize,
-//! auto sleep and reinstall T3. Each mutating call uses one Idempotency-Key.
+//! auto sleep and reinstall the ADE. Each mutating call uses one Idempotency-Key.
 
+use crate::ade::{Ade, SETUP_EXIT_BUSY, parse_probe};
 use crate::api::{Action, Client, ExecRequest, PatchResult, UpdateMachineRequest};
 use crate::sandbox::connect::{SETUP_TIMEOUT_SECS, setup_failure};
 use crate::sandbox::sync::{SyncOutcome, sync};
-use crate::sandbox::view::{BRIDGE_KEY, BRIDGE_VALUE};
+use crate::sandbox::view::marked_ade;
 use crate::sandbox::{
     SandboxError, WAKE_WAIT, cooldown_or_api, ensure_running, new_key, retry_transient, wait_op,
 };
-use crate::t3::desktop::parse_version;
-use crate::t3::remote::{PROBE_SCRIPT, SETUP_EXIT_BUSY, VERSION_SCRIPT, parse_probe, setup_script};
 
 const FREE_AUTO_SLEEP_SECS: i64 = 1800;
 const QUERY_TIMEOUT_SECS: u32 = 30;
 const STOP_TIMEOUT_SECS: u32 = 60;
-// The setup script starts an inactive service and waits for it, so stop it first.
-const STOP_SCRIPT: &str =
-    "sudo systemctl stop t3-instabox; sudo systemctl reset-failed t3-instabox 2>/dev/null || true";
 
 /// Suspends the sandbox and waits until it is suspended.
 pub async fn pause(client: &Client, id: &str) -> Result<(), SandboxError> {
@@ -40,18 +36,19 @@ async fn map_cooldown(client: &Client, id: &str, e: crate::api::Error) -> Sandbo
     cooldown_or_api(e, machine.as_ref())
 }
 
-/// Wakes (or starts) the sandbox. When it is connected, also brings its T3 in step
-/// with the desktop and returns that decision. `None` means not connected.
+/// Wakes (or starts) the sandbox. When it is connected to `ade`, also brings the ADE in step
+/// with the desktop and returns that decision. `None` means not connected to `ade`.
 pub async fn resume(
     client: &Client,
+    ade: Ade,
     id: &str,
     desktop_version: &str,
 ) -> Result<Option<SyncOutcome>, SandboxError> {
     let machine = ensure_running(client, id).await?;
-    if machine.metadata.get(BRIDGE_KEY).map(String::as_str) != Some(BRIDGE_VALUE) {
+    if marked_ade(&machine.metadata) != Some(ade) {
         return Ok(None);
     }
-    sync(client, id, desktop_version).await.map(Some)
+    sync(client, ade, id, desktop_version).await.map(Some)
 }
 
 /// Deletes the sandbox and waits for the operation. The client sends X-Confirm-Delete.
@@ -128,40 +125,42 @@ async fn run(
         .await?)
 }
 
-/// Runs the setup script again at `desktop_version`, whatever the sandbox has now.
-/// Never while T3 is busy. Wakes the sandbox first.
+/// Runs the ADE's setup script again at `desktop_version`, whatever the sandbox has now.
+/// Never while the ADE is busy. Wakes the sandbox first.
 pub async fn reinstall(
     client: &Client,
+    ade: Ade,
     id: &str,
     desktop_version: &str,
 ) -> Result<(), SandboxError> {
     ensure_running(client, id).await?;
-    // Never move a sandbox to an older T3, so this stops before the probe, stop and setup.
-    let found = run(client, id, VERSION_SCRIPT, QUERY_TIMEOUT_SECS).await?;
+    // Never move a sandbox to an older version, so this stops before the probe, stop and setup.
+    let found = run(client, id, ade.version_script(), QUERY_TIMEOUT_SECS).await?;
     if let (Ok(desktop), Some(Ok(remote))) = (
         semver::Version::parse(desktop_version),
-        parse_version(&found.stdout).map(|v| semver::Version::parse(&v)),
+        ade.parse_version(&found.stdout)
+            .map(|v| semver::Version::parse(&v)),
     ) && remote > desktop
     {
-        return Err(SandboxError::NewerThanDesktop);
+        return Err(SandboxError::NewerThanDesktop(ade));
     }
-    let probe = run(client, id, PROBE_SCRIPT, QUERY_TIMEOUT_SECS).await?;
+    let probe = run(client, id, &ade.probe().path(), QUERY_TIMEOUT_SECS).await?;
     if parse_probe(&probe.stdout).busy {
-        return Err(SandboxError::T3Busy);
+        return Err(SandboxError::AdeBusy(ade));
     }
-    run(client, id, STOP_SCRIPT, STOP_TIMEOUT_SECS).await?;
+    run(client, id, ade.stop_script(), STOP_TIMEOUT_SECS).await?;
     let setup = run(
         client,
         id,
-        &setup_script(desktop_version),
+        &ade.setup_script(desktop_version),
         SETUP_TIMEOUT_SECS,
     )
     .await?;
     match setup.exit_code {
-        _ if setup.timed_out => Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+        _ if setup.timed_out => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         0 => Ok(()),
-        SETUP_EXIT_BUSY => Err(SandboxError::T3Busy),
-        _ => Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+        SETUP_EXIT_BUSY => Err(SandboxError::AdeBusy(ade)),
+        _ => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
     }
 }
 
@@ -486,7 +485,9 @@ mod tests {
         )
         .await;
         exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
-        let d = resume(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(
             d.unwrap().decision,
             crate::sandbox::sync::Decision::UpToDate
@@ -498,7 +499,9 @@ mod tests {
         let server = MockServer::start().await;
         mount_machine(&server, "running", false, serde_json::json!({})).await;
         exec_mock(&server, "", "", "", 0, 0).await;
-        let d = resume(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d, None);
     }
 
@@ -518,10 +521,10 @@ mod tests {
         .await;
         exec_mock(&server, STOP, "", "", 0, 0).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
-        assert_eq!(e, SandboxError::T3Busy);
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
     }
 
     #[tokio::test]
@@ -532,10 +535,10 @@ mod tests {
         exec_mock(&server, PROBE, "garbage", "", 0, 1).await;
         exec_mock(&server, STOP, "", "", 0, 0).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
-        assert_eq!(e, SandboxError::T3Busy);
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
     }
 
     async fn reinstall_server(setup_code: i32, stderr: &str) -> MockServer {
@@ -551,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn reinstall_stops_then_runs_setup_in_order() {
         let server = reinstall_server(0, "").await;
-        reinstall(&client(&server), "m1", "0.1.11").await.unwrap();
+        reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         let bodies: Vec<String> = server
             .received_requests()
             .await
@@ -576,10 +581,10 @@ mod tests {
         exec_mock(&server, PROBE, "", "", 0, 0).await;
         exec_mock(&server, STOP, "", "", 0, 0).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
-        assert_eq!(e, SandboxError::NewerThanDesktop);
+        assert_eq!(e, SandboxError::NewerThanDesktop(Ade::T3));
         assert_eq!(
             e.to_string(),
             "This sandbox runs a newer T3 than this computer. Update T3 Code here first."
@@ -590,10 +595,10 @@ mod tests {
     #[tokio::test]
     async fn reinstall_setup_busy_exit_is_t3_busy() {
         let server = reinstall_server(3, "busy").await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
-        assert_eq!(e, SandboxError::T3Busy);
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
     }
 
     #[tokio::test]
@@ -612,12 +617,13 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
         assert_eq!(
             e,
             SandboxError::Setup {
+                ade: Ade::T3,
                 stderr_tail: "Timed out after 600 s\ncurl: (28) slow".into()
             }
         );
@@ -630,10 +636,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let server = reinstall_server(1, &stderr).await;
-        let e = reinstall(&client(&server), "m1", "0.1.11")
+        let e = reinstall(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap_err();
-        let SandboxError::Setup { stderr_tail } = e else {
+        let SandboxError::Setup {
+            ade: Ade::T3,
+            stderr_tail,
+        } = e
+        else {
             panic!("wrong error");
         };
         assert_eq!(stderr_tail.lines().count(), 20);

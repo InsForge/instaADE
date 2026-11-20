@@ -1,16 +1,13 @@
-//! Create a sandbox (or take an existing one), install T3, pair it, publish its port
+//! Create a sandbox (or take an existing one), install an ADE, pair it, publish its port
 //! and mark it connected.
 
+use crate::ade::{Ade, Open, SETUP_EXIT_BUSY};
 use crate::api::{
     Client, CreateMachineRequest, ExecRequest, ExecResult, MachineSpec, UpdateMachineRequest,
 };
-use crate::sandbox::view::{BRIDGE_KEY, BRIDGE_VALUE};
+use crate::sandbox::view::mark;
 use crate::sandbox::{
     CREATE_WAIT, SandboxError, ensure_running, new_key, retry_transient, wait_op,
-};
-use crate::t3::desktop::parse_version;
-use crate::t3::remote::{
-    PAIR_SCRIPT, SETUP_EXIT_BUSY, VERSION_SCRIPT, pairing_link, parse_pair_code, setup_script,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,14 +40,13 @@ pub enum Step {
 pub struct Connected {
     pub machine_id: String,
     pub link: String,
-    /// The T3 version the sandbox runs: the desktop's after a setup, or its own (newer, or
+    /// The ADE version the sandbox runs: the desktop's after a setup, or its own (newer, or
     /// older with the update pending).
-    pub t3_version: String,
-    /// The sandbox kept its older T3 because T3 was busy: offer the update later.
+    pub version: String,
+    /// The sandbox kept its older version because the ADE was busy: offer the update later.
     pub update_pending: bool,
 }
 
-const T3_PORT: u16 = 3774;
 const STDERR_LINES: usize = 20;
 pub(crate) const SETUP_TIMEOUT_SECS: u32 = 600;
 const PAIR_TIMEOUT_SECS: u32 = 60;
@@ -62,7 +58,7 @@ pub(crate) fn tail_lines(s: &str) -> String {
 
 /// The `Setup` error of a failed exec, never empty: "Timed out after N s" when the exec
 /// timed out, then the last lines of stderr; with neither, the exit code.
-pub(crate) fn setup_failure(r: &ExecResult, timeout_secs: u32) -> SandboxError {
+pub(crate) fn setup_failure(ade: Ade, r: &ExecResult, timeout_secs: u32) -> SandboxError {
     let mut lines = Vec::new();
     if r.timed_out {
         lines.push(format!("Timed out after {timeout_secs} s"));
@@ -75,6 +71,7 @@ pub(crate) fn setup_failure(r: &ExecResult, timeout_secs: u32) -> SandboxError {
         lines.push(format!("The command exited with code {}", r.exit_code));
     }
     SandboxError::Setup {
+        ade,
         stderr_tail: lines.join("\n"),
     }
 }
@@ -114,6 +111,7 @@ async fn check_free_limit(client: &Client, org_id: Option<&str>) -> Result<(), S
 
 pub async fn create_and_connect(
     client: &Client,
+    ade: Ade,
     req: &NewSandbox,
     desktop_version: &str,
     progress: impl Fn(Step),
@@ -140,11 +138,12 @@ pub async fn create_and_connect(
     let op = retry_transient(|| client.create(&body, &key)).await?;
     progress(Step::Created(op.machine_id.clone()));
     let machine = wait_op(client, &op, CREATE_WAIT).await?;
-    install_and_pair(client, &machine.id, desktop_version, &progress).await
+    install_and_pair(client, ade, &machine.id, desktop_version, &progress).await
 }
 
 pub async fn connect_existing(
     client: &Client,
+    ade: Ade,
     machine_id: &str,
     desktop_version: &str,
     progress: impl Fn(Step),
@@ -153,26 +152,27 @@ pub async fn connect_existing(
         progress(Step::Waking);
     }
     ensure_running(client, machine_id).await?;
-    install_and_pair(client, machine_id, desktop_version, &progress).await
+    install_and_pair(client, ade, machine_id, desktop_version, &progress).await
 }
 
 async fn install_and_pair(
     client: &Client,
+    ade: Ade,
     id: &str,
     desktop_version: &str,
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
-    // Never move a sandbox to an older T3: when it is ahead of the desktop, only pair.
+    // Never move a sandbox to an older version: when it is ahead of the desktop, only pair.
     let found = client
         .exec(
             id,
             &ExecRequest {
-                cmd: VERSION_SCRIPT.to_string(),
+                cmd: ade.version_script().to_string(),
                 timeout_seconds: Some(30),
             },
         )
         .await?;
-    let remote = parse_version(&found.stdout);
+    let remote = ade.parse_version(&found.stdout);
     let ahead = remote_is_newer(desktop_version, remote.as_deref());
     let mut update_pending = false;
     if !ahead {
@@ -181,26 +181,26 @@ async fn install_and_pair(
             .exec(
                 id,
                 &ExecRequest {
-                    cmd: setup_script(desktop_version),
+                    cmd: ade.setup_script(desktop_version),
                     timeout_seconds: Some(SETUP_TIMEOUT_SECS),
                 },
             )
             .await?;
         match setup.exit_code {
-            _ if setup.timed_out => return Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+            _ if setup.timed_out => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
             0 => {}
-            // T3 runs and is busy, so its update waits. Pairing needs no restart: pair with
-            // the running T3 and offer the update later.
+            // The ADE runs and is busy, so its update waits. Pairing needs no restart: pair
+            // with the running one and offer the update later.
             SETUP_EXIT_BUSY if remote.is_some() => update_pending = true,
-            SETUP_EXIT_BUSY => return Err(SandboxError::T3Busy),
-            _ => return Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+            SETUP_EXIT_BUSY => return Err(SandboxError::AdeBusy(ade)),
+            _ => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         }
     }
     progress(Step::Pairing);
-    let link = pair_link(client, id).await?;
+    let link = pair_link(client, ade, id).await?;
     // The mark goes last: only a fully set up sandbox counts as connected.
     let mut metadata = client.machine(id).await?.metadata;
-    metadata.insert(BRIDGE_KEY.to_string(), BRIDGE_VALUE.to_string());
+    mark(&mut metadata, ade);
     let update = UpdateMachineRequest {
         metadata: Some(metadata),
         ..Default::default()
@@ -211,7 +211,7 @@ async fn install_and_pair(
     Ok(Connected {
         machine_id: id.to_string(),
         link,
-        t3_version: match remote {
+        version: match remote {
             Some(r) if ahead || update_pending => r,
             _ => desktop_version.to_string(),
         },
@@ -219,7 +219,7 @@ async fn install_and_pair(
     })
 }
 
-/// True when the sandbox reports a T3 newer than the desktop's. Unreadable means no.
+/// True when the sandbox reports a version newer than the desktop's. Unreadable means no.
 fn remote_is_newer(desktop: &str, remote: Option<&str>) -> bool {
     match (
         semver::Version::parse(desktop),
@@ -230,39 +230,42 @@ fn remote_is_newer(desktop: &str, remote: Option<&str>) -> bool {
     }
 }
 
-/// A fresh pairing link: one `t3 pair`, then the published port. The sandbox must be running.
-async fn pair_link(client: &Client, id: &str) -> Result<String, SandboxError> {
+/// A fresh pairing link: one run of the ADE's pair script, then the published port. The
+/// sandbox must be running.
+async fn pair_link(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
+    let Open::Pair(p) = ade.open();
     let pair = client
         .exec(
             id,
             &ExecRequest {
-                cmd: PAIR_SCRIPT.to_string(),
+                cmd: p.script.to_string(),
                 timeout_seconds: Some(PAIR_TIMEOUT_SECS),
             },
         )
         .await?;
     let code = if pair.exit_code == 0 && !pair.timed_out {
-        parse_pair_code(&pair.stdout)
+        (p.code)(&pair.stdout)
     } else {
         None
     };
     let Some(code) = code else {
         if pair.timed_out || !pair.stderr.trim().is_empty() {
-            return Err(setup_failure(&pair, PAIR_TIMEOUT_SECS));
+            return Err(setup_failure(ade, &pair, PAIR_TIMEOUT_SECS));
         }
         return Err(SandboxError::Setup {
-            stderr_tail: "T3 did not return a pairing code".to_string(),
+            ade,
+            stderr_tail: format!("{} did not return a pairing code", ade.short_name()),
         });
     };
-    let port = client.publish_port(id, T3_PORT).await?;
-    Ok(pairing_link(&port.url, &code))
+    let port = client.publish_port(id, p.port).await?;
+    Ok((p.link)(&port.url, &code))
 }
 
-/// Pairs T3 Code again on a connected sandbox: wakes it, makes a new pairing link.
-/// No setup and no metadata change.
-pub async fn pair_again(client: &Client, id: &str) -> Result<String, SandboxError> {
+/// Pairs the ADE's desktop app again with a connected sandbox: wakes it, makes a new
+/// pairing link. No setup and no metadata change.
+pub async fn pair_again(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
     ensure_running(client, id).await?;
-    pair_link(client, id).await
+    pair_link(client, ade, id).await
 }
 
 #[cfg(test)]
@@ -441,7 +444,7 @@ mod tests {
         .await;
         tail(&server, ok_setup(), serde_json::json!({})).await;
         let steps = Mutex::new(Vec::new());
-        let out = create_and_connect(&client(&server), &req(), "9.9.9", |s| {
+        let out = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |s| {
             steps.lock().unwrap().push(s)
         })
         .await
@@ -547,7 +550,7 @@ mod tests {
     async fn newer_remote_t3_skips_setup_and_still_pairs() {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
-        let out = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
         assert!(out.link.starts_with("t3code://pair?pairingUrl="));
@@ -559,13 +562,10 @@ mod tests {
     async fn older_remote_t3_runs_setup() {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v9.0.0\n", ok_setup(), 1).await;
-        let out = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
-        assert_eq!(
-            (out.t3_version.as_str(), out.update_pending),
-            ("9.9.9", false)
-        );
+        assert_eq!((out.version.as_str(), out.update_pending), ("9.9.9", false));
         drop(server);
     }
 
@@ -580,13 +580,13 @@ mod tests {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v9.0.0\n", exec_answer(3, "busy", false), 1).await;
         let steps = Mutex::new(Vec::new());
-        let out = connect_existing(&client(&server), "m1", "9.9.9", |s| {
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |s| {
             steps.lock().unwrap().push(s)
         })
         .await
         .unwrap();
         assert!(out.link.starts_with("t3code://pair?pairingUrl="));
-        assert_eq!(out.t3_version, "9.0.0", "keeps its own T3 for now");
+        assert_eq!(out.version, "9.0.0", "keeps its own T3 for now");
         assert!(out.update_pending);
         assert!(steps.lock().unwrap().contains(&Step::Done));
         let c = calls(&server).await;
@@ -601,12 +601,13 @@ mod tests {
     async fn a_timed_out_setup_says_so() {
         let server = MockServer::start().await;
         running_with_remote(&server, "", exec_answer(124, "", true), 1).await;
-        let e = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap_err();
         assert_eq!(
             e,
             SandboxError::Setup {
+                ade: Ade::T3,
                 stderr_tail: "Timed out after 600 s".into()
             }
         );
@@ -623,16 +624,22 @@ mod tests {
             timed_out,
         };
         let msg = |e: SandboxError| match e {
-            SandboxError::Setup { stderr_tail } => stderr_tail,
+            SandboxError::Setup {
+                ade: Ade::T3,
+                stderr_tail,
+            } => stderr_tail,
             other => panic!("{other:?}"),
         };
         assert_eq!(
-            msg(setup_failure(&r(124, "curl: slow\n", true), 600)),
+            msg(setup_failure(Ade::T3, &r(124, "curl: slow\n", true), 600)),
             "Timed out after 600 s\ncurl: slow"
         );
-        assert_eq!(msg(setup_failure(&r(1, "boom", false), 600)), "boom");
         assert_eq!(
-            msg(setup_failure(&r(7, " \n", false), 600)),
+            msg(setup_failure(Ade::T3, &r(1, "boom", false), 600)),
+            "boom"
+        );
+        assert_eq!(
+            msg(setup_failure(Ade::T3, &r(7, " \n", false), 600)),
             "The command exited with code 7"
         );
     }
@@ -641,7 +648,7 @@ mod tests {
     async fn pair_again_makes_no_setup_and_no_patch() {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v9.9.9\n", ok_setup(), 0).await;
-        let link = pair_again(&client(&server), "m1").await.unwrap();
+        let link = pair_again(&client(&server), Ade::T3, "m1").await.unwrap();
         assert!(link.starts_with("t3code://pair?pairingUrl="));
         let c = calls(&server).await;
         assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
@@ -676,7 +683,7 @@ mod tests {
         )
         .await;
         tail(&server, ok_setup(), serde_json::json!({})).await;
-        let out = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
         assert_eq!(out.machine_id, "m1");
@@ -709,11 +716,14 @@ mod tests {
             serde_json::json!({}),
         )
         .await;
-        let e = create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        let e = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap_err();
         match e {
-            SandboxError::Setup { stderr_tail } => {
+            SandboxError::Setup {
+                ade: Ade::T3,
+                stderr_tail,
+            } => {
                 let lines: Vec<&str> = stderr_tail.lines().collect();
                 assert_eq!(lines.len(), 20);
                 assert_eq!(lines[0], "line 11");
@@ -745,10 +755,10 @@ mod tests {
             serde_json::json!({}),
         )
         .await;
-        let e = create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        let e = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap_err();
-        assert_eq!(e, SandboxError::T3Busy);
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
     }
 
     #[tokio::test]
@@ -773,7 +783,7 @@ mod tests {
             )),
         )
         .await;
-        let e = create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        let e = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap_err();
         assert_eq!(e, SandboxError::FreeLimit);
@@ -811,7 +821,7 @@ mod tests {
         )
         .await;
         tail(&server, ok_setup(), serde_json::json!({})).await;
-        create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap();
     }
@@ -840,7 +850,7 @@ mod tests {
             ),
         )
         .await;
-        let e = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap_err();
         assert_eq!(e, SandboxError::Cooldown { minutes: 7 });
@@ -870,7 +880,7 @@ mod tests {
             ),
         )
         .await;
-        let e = connect_existing(&client(&server), "m1", "9.9.9", |_| {})
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap_err();
         assert_eq!(e, SandboxError::Cooldown { minutes: 2 });
@@ -888,7 +898,7 @@ mod tests {
         )
         .await;
         tail(&server, ok_setup(), serde_json::json!({"a": "1"})).await;
-        create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap();
         let reqs = server.received_requests().await.unwrap();
@@ -915,7 +925,7 @@ mod tests {
         tail(&server, ok_setup(), serde_json::json!({})).await;
         let mut r = req();
         r.source = Source::Snapshot("snap1".into());
-        create_and_connect(&client(&server), &r, "9.9.9", |_| {})
+        create_and_connect(&client(&server), Ade::T3, &r, "9.9.9", |_| {})
             .await
             .unwrap();
         let reqs = server.received_requests().await.unwrap();
@@ -976,7 +986,7 @@ mod tests {
         )
         .await;
         tail(&server, ok_setup(), serde_json::json!({})).await;
-        create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap();
         let reqs = server.received_requests().await.unwrap();
@@ -1008,7 +1018,7 @@ mod tests {
         )
         .await;
         let seen = Mutex::new(Vec::new());
-        let _ = create_and_connect(&client(&server), &req(), "9.9.9", |s| {
+        let _ = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |s| {
             if let Step::Created(id) = &s {
                 seen.lock().unwrap().push(id.clone());
             }
@@ -1027,7 +1037,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let e = create_and_connect(&client(&server), &req(), "9.9.9", |_| {})
+        let e = create_and_connect(&client(&server), Ade::T3, &req(), "9.9.9", |_| {})
             .await
             .unwrap_err();
         assert!(matches!(e, SandboxError::Api(_)));

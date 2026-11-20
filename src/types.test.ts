@@ -15,6 +15,7 @@ describe("AppState fixture", () => {
         "orgId",
         "tier",
         "t3",
+        "ades",
         "sandboxes",
         "sizes",
         "sleepChoices",

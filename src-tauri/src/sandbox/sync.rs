@@ -1,14 +1,11 @@
-//! Keeps a connected sandbox's T3 in step with the desktop's T3.
+//! Keeps a connected sandbox's ADE in step with the desktop's.
 
 use semver::Version;
 
+use crate::ade::{Ade, ProbeAnswer, SETUP_EXIT_BUSY, parse_probe};
 use crate::api::{Client, ExecRequest, ExecResult};
 use crate::sandbox::SandboxError;
 use crate::sandbox::connect::{SETUP_TIMEOUT_SECS, setup_failure};
-use crate::t3::desktop::parse_version;
-use crate::t3::remote::{
-    PROBE_SCRIPT, ProbeAnswer, SETUP_EXIT_BUSY, VERSION_SCRIPT, parse_probe, setup_script,
-};
 
 const QUERY_TIMEOUT_SECS: u32 = 30;
 
@@ -16,9 +13,9 @@ const QUERY_TIMEOUT_SECS: u32 = 30;
 pub enum Decision {
     /// Versions match (or the desktop version is unreadable). Nothing to do.
     UpToDate,
-    /// The sandbox is behind and T3 is idle. Update it.
+    /// The sandbox is behind and the ADE is idle. Update it.
     Update,
-    /// The sandbox is behind but T3 is busy. Try again later.
+    /// The sandbox is behind but the ADE is busy. Try again later.
     Defer,
     /// The sandbox is ahead of the desktop. Never move it back.
     Older,
@@ -58,17 +55,18 @@ async fn run(client: &Client, id: &str, cmd: &str, secs: u32) -> Result<ExecResu
         .await?)
 }
 
-/// Brings the sandbox's T3 up to `desktop_version` when it is behind and idle.
+/// Brings the sandbox's ADE up to `desktop_version` when it is behind and idle.
 /// The sandbox must be running and connected: this does not wake it. Callers run
 /// it on connect and on user request, never on a timer, because every call execs
-/// on the sandbox and would keep it awake. A busy T3 gives `Ok(Defer)`, not an error.
+/// on the sandbox and would keep it awake. A busy ADE gives `Ok(Defer)`, not an error.
 pub async fn sync(
     client: &Client,
+    ade: Ade,
     machine_id: &str,
     desktop_version: &str,
 ) -> Result<SyncOutcome, SandboxError> {
-    let out = run(client, machine_id, VERSION_SCRIPT, QUERY_TIMEOUT_SECS).await?;
-    let remote = parse_version(&out.stdout);
+    let out = run(client, machine_id, ade.version_script(), QUERY_TIMEOUT_SECS).await?;
+    let remote = ade.parse_version(&out.stdout);
     // Equal or newer: no reason to ask the probe.
     let idle = ProbeAnswer {
         busy: false,
@@ -82,7 +80,7 @@ pub async fn sync(
     if matches!(first, Decision::UpToDate | Decision::Older) {
         return Ok(outcome(first));
     }
-    let out = run(client, machine_id, PROBE_SCRIPT, QUERY_TIMEOUT_SECS).await?;
+    let out = run(client, machine_id, &ade.probe().path(), QUERY_TIMEOUT_SECS).await?;
     let decision = decide(
         desktop_version,
         remote.as_deref(),
@@ -94,15 +92,15 @@ pub async fn sync(
     let setup = run(
         client,
         machine_id,
-        &setup_script(desktop_version),
+        &ade.setup_script(desktop_version),
         SETUP_TIMEOUT_SECS,
     )
     .await?;
     match setup.exit_code {
-        _ if setup.timed_out => Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+        _ if setup.timed_out => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         0 => Ok(outcome(Decision::Update)),
         SETUP_EXIT_BUSY => Ok(outcome(Decision::Defer)),
-        _ => Err(setup_failure(&setup, SETUP_TIMEOUT_SECS)),
+        _ => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
     }
 }
 
@@ -199,7 +197,9 @@ mod tests {
         exec_mock(&server, VERSION, "t3 v0.1.11\n", "", 0, 1).await;
         exec_mock(&server, PROBE, "", "", 0, 0).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let d = sync(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d.decision, Decision::UpToDate);
     }
 
@@ -209,7 +209,9 @@ mod tests {
         exec_mock(&server, VERSION, "0.1.12\n", "", 0, 1).await;
         exec_mock(&server, PROBE, "", "", 0, 0).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let d = sync(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d.decision, Decision::Older);
     }
 
@@ -227,7 +229,9 @@ mod tests {
         )
         .await;
         exec_mock(&server, SETUP, "", "", 0, 1).await;
-        let d = sync(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d.decision, Decision::Update);
     }
 
@@ -245,7 +249,9 @@ mod tests {
         )
         .await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
-        let d = sync(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d.decision, Decision::Defer);
         assert_eq!(d.remote_version.as_deref(), Some("0.1.10"));
     }
@@ -256,7 +262,9 @@ mod tests {
         exec_mock(&server, VERSION, "0.1.10\n", "", 0, 1).await;
         exec_mock(&server, PROBE, "{\"busy\":false}\n", "", 0, 1).await;
         exec_mock(&server, SETUP, "", "T3 is busy, update deferred", 3, 1).await;
-        let d = sync(&client(&server), "m1", "0.1.11").await.unwrap();
+        let d = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
         assert_eq!(d.decision, Decision::Defer);
     }
 
@@ -274,10 +282,13 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let e = sync(&client(&server), "m1", "0.1.11").await.unwrap_err();
+        let e = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap_err();
         assert_eq!(
             e,
             SandboxError::Setup {
+                ade: Ade::T3,
                 stderr_tail: "Timed out after 600 s".into()
             }
         );
@@ -289,10 +300,13 @@ mod tests {
         exec_mock(&server, VERSION, "", "", 0, 1).await;
         exec_mock(&server, PROBE, "{\"busy\":false}\n", "", 0, 1).await;
         exec_mock(&server, SETUP, "", "line1\nboom", 1, 1).await;
-        let e = sync(&client(&server), "m1", "0.1.11").await.unwrap_err();
+        let e = sync(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap_err();
         assert_eq!(
             e,
             SandboxError::Setup {
+                ade: Ade::T3,
                 stderr_tail: "line1\nboom".into()
             }
         );

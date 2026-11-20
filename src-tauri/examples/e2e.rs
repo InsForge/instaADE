@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use instabox_bridge_lib::ade::Ade;
 use instabox_bridge_lib::api::{Client, ExecRequest, Machine, MachineSpec};
 use instabox_bridge_lib::app::api_base;
 use instabox_bridge_lib::auth::{MemoryStore, Session};
@@ -22,10 +23,9 @@ use instabox_bridge_lib::sandbox::lifecycle;
 use instabox_bridge_lib::sandbox::sync::Decision;
 use instabox_bridge_lib::sandbox::view::view;
 use instabox_bridge_lib::ssh::{self, MemorySshStore};
-use instabox_bridge_lib::t3::desktop;
-use instabox_bridge_lib::t3::remote::PROBE_SCRIPT;
 
 const PREFIX: &str = "bridge-e2e-";
+const ADE: Ade = Ade::T3;
 const DEFAULT_NAME: &str = "bridge-e2e-1";
 const START: MachineSpec = MachineSpec {
     vcpus: 2,
@@ -240,9 +240,9 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
     );
 
     let t = Instant::now();
-    let name = "desktop T3 version (t3::desktop)";
-    let cli = c.must(name, t, desktop::locate().ok_or("T3 CLI not found"))?;
-    let desktop_v = c.must(name, t, desktop::version(&cli))?;
+    let name = "desktop T3 version (ade::t3)";
+    let cli = c.must(name, t, ADE.locate().ok_or("T3 CLI not found"))?;
+    let desktop_v = c.must(name, t, ADE.local_version(&cli))?;
     c.check(name, true, t, format!("t3 {desktop_v}"));
 
     // 2. Create and connect.
@@ -257,7 +257,7 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
     let t = Instant::now();
     let label = format!("create_and_connect Standard {sandbox}");
     let name = label.as_str();
-    let res = connect::create_and_connect(&client, &req, &desktop_v, |s| {
+    let res = connect::create_and_connect(&client, ADE, &req, &desktop_v, |s| {
         steps.lock().unwrap().push((s, Instant::now()))
     })
     .await;
@@ -284,11 +284,11 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
     let link_ok = connected.link.starts_with("t3code://pair");
     c.check(
         name,
-        link_ok && connected.t3_version == desktop_v,
+        link_ok && connected.version == desktop_v,
         t,
         format!(
             "link starts with t3code://pair: {link_ok}; t3 {}; {timings}",
-            connected.t3_version
+            connected.version
         ),
     );
     let id = connected.machine_id.clone();
@@ -328,7 +328,11 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
 
     let t = Instant::now();
     let name = "lifecycle::resume + version check";
-    let outcome = c.must(name, t, lifecycle::resume(&client, &id, &desktop_v).await)?;
+    let outcome = c.must(
+        name,
+        t,
+        lifecycle::resume(&client, ADE, &id, &desktop_v).await,
+    )?;
     let took = t.elapsed();
     let m = c.must(name, t, client.machine(&id).await)?;
     c.record(
@@ -393,7 +397,7 @@ async fn run(client: Client, c: Arc<Checks>, sandbox: String) -> Result<(), Stri
     c.must(
         name,
         t,
-        lifecycle::reinstall(&client, &id, &desktop_v).await,
+        lifecycle::reinstall(&client, ADE, &id, &desktop_v).await,
     )?;
     let took = t.elapsed();
     let (_, out) = c.must(
@@ -431,7 +435,7 @@ async fn exec_checks(client: &Client, c: &Checks, id: &str, desktop_v: &str, whe
     let name = format!("t3 --version = desktop ({when})");
     match sh(client, id, "t3 --version").await {
         Ok((code, out)) => {
-            let v = desktop::parse_version(&out);
+            let v = ADE.parse_version(&out);
             c.check(
                 &name,
                 code == 0 && v.as_deref() == Some(desktop_v),
@@ -443,8 +447,9 @@ async fn exec_checks(client: &Client, c: &Checks, id: &str, desktop_v: &str, whe
     }
 
     let t = Instant::now();
+    let probe = ADE.probe().path();
     let name = format!("probe file mode 755 ({when})");
-    match sh(client, id, &format!("stat -c '%a %U' {PROBE_SCRIPT}")).await {
+    match sh(client, id, &format!("stat -c '%a %U' {probe}")).await {
         Ok((code, out)) => c.check(
             &name,
             code == 0 && out.starts_with("755 "),
@@ -456,7 +461,7 @@ async fn exec_checks(client: &Client, c: &Checks, id: &str, desktop_v: &str, whe
 
     let t = Instant::now();
     let name = format!("probe prints busy false ({when})");
-    match sh(client, id, PROBE_SCRIPT).await {
+    match sh(client, id, &probe).await {
         Ok((code, out)) => c.check(
             &name,
             code == 0 && out.contains("\"busy\": false"),
