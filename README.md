@@ -107,11 +107,15 @@ cd src-tauri && cargo test
 
 ### Build an installer
 
-```bash
-bun tauri build --bundles dmg
-```
+Only needed to test installing.
 
-Only needed to test installing. The file lands in `src-tauri/target/release/bundle/dmg/`. On Windows, `bun tauri build --bundles nsis` makes the installer in `src-tauri/target/release/bundle/nsis/`.
+```bash
+# macOS: src-tauri/target/release/bundle/dmg/
+bun tauri build --bundles dmg
+
+# Windows: src-tauri/target/release/bundle/nsis/
+bun tauri build --bundles nsis
+```
 
 ## Contributing
 

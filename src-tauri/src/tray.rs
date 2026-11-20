@@ -97,7 +97,7 @@ pub fn popover_origin(icon: Bounds, window: (f64, f64), screen: Bounds) -> (f64,
         .max(min)
         .min(max.max(min));
     let y = if icon.y + icon.h / 2.0 < screen.y + screen.h / 2.0 {
-        icon.y + icon.h + GAP
+        (icon.y + icon.h + GAP).min((screen.y + screen.h - window.1 - EDGE).max(screen.y + EDGE))
     } else {
         (icon.y - window.1 - GAP).max(screen.y + EDGE)
     };
@@ -168,7 +168,8 @@ fn place_in_corner(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()>
     let Some(screen) = app.primary_monitor()? else {
         return Ok(());
     };
-    let scale = screen.scale_factor();
+    // The window's own scale: `set_position` converts the logical point back with it.
+    let scale = window.scale_factor()?;
     let area = screen.work_area();
     let pos = area.position.to_logical::<f64>(scale);
     let size = area.size.to_logical::<f64>(scale);
@@ -496,6 +497,24 @@ mod tests {
         let icon = Bounds {
             x: 900.0,
             y: 578.0,
+            w: 24.0,
+            h: 36.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), screen).1, 8.0);
+    }
+
+    #[test]
+    fn a_short_screen_keeps_the_popover_bottom_on_screen() {
+        // A taskbar at the top of a short screen: the popover opens below the icon.
+        let screen = Bounds {
+            x: 0.0,
+            y: 0.0,
+            w: 1093.0,
+            h: 614.0,
+        };
+        let icon = Bounds {
+            x: 900.0,
+            y: 0.0,
             w: 24.0,
             h: 36.0,
         };

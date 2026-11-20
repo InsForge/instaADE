@@ -42,6 +42,10 @@ pub fn mark(path: &Path) -> std::io::Result<()> {
 /// already quoted or is not this program's.
 pub fn quoted_run_command(value: &str, exe: &str) -> Option<String> {
     let rest = value.strip_prefix(exe)?;
+    // The path must end where the arguments begin: `<exe>.bak` is another program.
+    if rest.starts_with(|c: char| !c.is_whitespace()) {
+        return None;
+    }
     Some(format!("\"{exe}\"{rest}"))
 }
 
@@ -102,6 +106,11 @@ mod tests {
             quoted_run_command(r"C:\Other\app.exe --at-login", exe),
             None
         );
+        assert_eq!(
+            quoted_run_command(&format!("{exe}.bak --at-login"), exe),
+            None
+        );
+        assert_eq!(quoted_run_command(exe, exe), Some(format!("\"{exe}\"")));
     }
 
     #[test]
