@@ -1,0 +1,2 @@
+# The probe runs on Linux sandboxes: keep its LF line ends in a Windows checkout.
+src-tauri/assets/* text eol=lf
