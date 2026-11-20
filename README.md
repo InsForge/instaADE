@@ -55,11 +55,6 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 - More ADEs: Orca, cmux, Superset and others
 - Windows
 
-## Known limits
-
-- A sandbox stays awake while T3 Code is connected to it. Pause it when you are done.
-- GitHub on a sandbox is manual: run `gh auth login` there, for example from **Open in Terminal**.
-
 ## Adding an ADE
 
 - Sandbox side: `src-tauri/src/t3/remote.rs` holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
