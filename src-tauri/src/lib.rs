@@ -88,13 +88,24 @@ pub fn run() {
             match login::startup(!cfg!(debug_assertions), marked, enabled) {
                 login::Startup::Keep => {}
                 login::Startup::Rewrite => {
-                    let _ = launch.enable();
+                    if let Err(e) = launch.enable() {
+                        eprintln!("start at login: could not update the login item: {e}");
+                    }
                 }
                 login::Startup::TurnOn => {
-                    // Marker first: without it, every launch would turn the item on again,
-                    // also after the person turned it off.
-                    if marker.as_deref().is_some_and(|m| login::mark(m).is_ok()) {
-                        let _ = launch.enable();
+                    // Marked only once the item is on, so a failed attempt is tried again next
+                    // launch. A default that cannot be marked is undone, so it never turns the
+                    // item back on after the person turned it off.
+                    if let Some(m) = marker.as_deref() {
+                        match launch.enable() {
+                            Ok(()) => {
+                                if let Err(e) = login::mark(m) {
+                                    eprintln!("start at login: could not save the default: {e}");
+                                    let _ = launch.disable();
+                                }
+                            }
+                            Err(e) => eprintln!("start at login: could not turn it on: {e}"),
+                        }
                     }
                 }
             }
