@@ -17,7 +17,7 @@ use crate::process::{RunError, run_bounded};
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "mcp-key";
-const KEY_NAME: &str = "Instabox Bridge MCP";
+const KEY_NAME: &str = "Instabox MCP";
 const KEY_SCOPES: [&str; 4] = [
     "machines:read",
     "machines:write",
@@ -471,7 +471,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/keys"))
             .and(body_json(serde_json::json!({
-                "name": "Instabox Bridge MCP",
+                "name": "Instabox MCP",
                 "scopes": ["machines:read", "machines:write", "machines:delete", "images:read"],
                 "expiresInDays": 365
             })))

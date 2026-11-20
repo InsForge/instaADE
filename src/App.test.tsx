@@ -702,17 +702,16 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
 
 // ---- settings ----
 
-test("settings: update, account, this Mac and agents", async () => {
+test("settings: update, account and this Mac", async () => {
   show(
     {
-      mcp: { claudeCode: null, codex: false },
       orgs: [...sample.orgs, { id: "org-team", name: "team", tier: "pro", personal: false }],
       update: { version: "0.2.0", url: "https://example.com/v0.2.0" },
     },
     [{}],
   );
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
-  expect(screen.getByText("A new version of Instabox Bridge is ready.")).toBeTruthy();
+  expect(screen.getByText("A new version of Instabox is ready.")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Download" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.com/v0.2.0" });
 
@@ -728,10 +727,6 @@ test("settings: update, account, this Mac and agents", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Check again" }));
   expect(invoke).toHaveBeenCalledWith("refresh_t3");
 
-  expect(screen.getByText("Not installed")).toBeTruthy();
-  await userEvent.click(screen.getByRole("button", { name: "Add" }));
-  expect(invoke).toHaveBeenCalledWith("add_mcp", { client: "codex" });
-
   await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
   expect(invoke).toHaveBeenCalledWith("sign_out");
 
@@ -739,11 +734,13 @@ test("settings: update, account, this Mac and agents", async () => {
   expect(screen.getByText("dev-1")).toBeTruthy();
 });
 
-test("settings: an added agent reads Added", async () => {
-  show({ mcp: { claudeCode: true, codex: true } }, [{}]);
+test("settings: no section for agents on this Mac, whatever their MCP state", async () => {
+  show({ mcp: { claudeCode: true, codex: false } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
-  expect(screen.getAllByText("Added").length).toBe(2);
+  expect(screen.queryByText("Let agents on this Mac manage sandboxes")).toBeNull();
   expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+  expect(screen.queryByText("Added")).toBeNull();
+  expect(calls("add_mcp").length).toBe(0);
 });
 
 // ---- first run ----

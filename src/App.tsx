@@ -131,7 +131,7 @@ export default function App() {
     header = (
       <header className="top">
         <Mark />
-        <span className="top-title">Instabox Bridge</span>
+        <span className="top-title">Instabox</span>
         <button className="icon-btn hd" aria-label="Settings" title={state.update ? "Update available" : undefined} onClick={() => go({ name: "settings" })}>
           <Gear />
           {state.update && <span className="badge" aria-hidden="true" />}

@@ -1,44 +1,120 @@
-# Instabox Bridge
+<div align="center">
+  <a href="https://instabox.sh">
+    <img src="src-tauri/icons/128x128@2x.png" alt="Instabox" width="96">
+  </a>
 
-Instabox Bridge connects instabox cloud sandboxes to the T3 Code desktop app. You create an instabox sandbox or pick one you have. The app puts T3 on it at your T3 Code's version and pairs it for you. You then manage the sandbox from the app window and the menu bar.
+  <h1>Instabox</h1>
 
-## Requirements
+  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar.</p>
 
-- macOS
-- T3 Code desktop app
-- An instabox account
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+    <a href="https://github.com/InsForge/instabox-bridge/releases/latest"><img src="https://img.shields.io/github/v/release/InsForge/instabox-bridge" alt="Latest release"></a>
+    <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform: macOS">
+  </p>
+</div>
 
-## Download
+<p align="center">
+  <img src="docs/images/list.png" alt="Sandbox list" width="250">
+  <img src="docs/images/menu.png" alt="Sandbox actions" width="250">
+  <img src="docs/images/details.png" alt="Sandbox details" width="250">
+</p>
 
-Get the latest `.dmg` from [GitHub Releases](../../releases). Pick the aarch64 (Apple silicon) file or the x64 (Intel) file. Release builds are signed and notarized by Apple, so they open like any downloaded app.
+## Getting Started
 
-## What it does on your sandbox
+You need macOS, an [instabox](https://instabox.sh) account and a supported ADE. Today that is the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app.
 
-- Installs T3 under `/opt/t3`.
-- Adds a `t3-instabox` service.
-- Adds an activity probe, so the sandbox sleeps only when T3 is idle.
+1. Download the latest `.dmg` from [Releases](https://github.com/InsForge/instabox-bridge/releases/latest): `aarch64` for Apple silicon, `x64` for Intel.
+2. Drag Instabox to Applications and open it. It is signed and notarized, so it opens normally.
+3. Click the Instabox icon in the menu bar.
+4. Sign in with GitHub or Google.
+5. Click **New sandbox**, pick a size, then click **Create sandbox**.
+6. Confirm the new environment in T3 Code.
 
-## Known limits
+## Features
 
-- A sandbox with T3 Code connected does not auto-sleep.
-- cmux, Superset and Orca come later.
-- Windows comes later.
+- Create a sandbox or connect one you already have
+- Set up your ADE on the sandbox and pair it with the app on your Mac
+- Pause, resume, resize and set auto sleep
+- Copy the SSH command or open it in Terminal
+- Sign in to Claude Code or Codex on the sandbox
+- Starts at login (turn it off in Settings)
+
+## Supported ADEs
+
+### T3 Code
+
+Instabox installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
+
+- T3 under `/opt/t3`
+- A `t3-instabox` service that runs the T3 server
+- An activity probe, so the sandbox sleeps only when T3 is idle
+
+## Roadmap
+
+- More ADEs: Orca, cmux, Superset and others
+- Windows
+
+## Adding an ADE
+
+- Sandbox side: `src-tauri/src/t3/remote.rs` holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe.
+- Mac side: `src-tauri/src/t3/desktop.rs` finds T3 Code and reads its version. `open_in_t3` in `src-tauri/src/app.rs` opens it.
+- Flow: `src-tauri/src/sandbox/connect.rs` installs, pairs and marks a sandbox connected. `src-tauri/src/sandbox/sync.rs` keeps the versions in step.
+- UI text such as "Open in T3 Code" is in `src/` (`Details.tsx`, `SandboxMenu.tsx`, `Setup.tsx`, `Progress.tsx`).
+- A new ADE needs an install script, a version check, a pairing or connect step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`.
+
+Pull requests that add an ADE are welcome.
 
 ## Development
 
-```sh
+### Prerequisites
+
+- macOS
+- [Bun](https://bun.sh)
+- Rust via [rustup](https://rustup.rs)
+- Xcode Command Line Tools (`xcode-select --install`)
+
+### Setup
+
+```bash
 bun install
-bun tauri dev
+```
+
+### Run with hot reload
+
+1. Quit any installed copy of Instabox. Only one instance runs at a time.
+2. Run `bun tauri dev`.
+3. Click the Instabox icon in the menu bar.
+4. Edit the code. UI changes reload at once, and Rust changes rebuild the app.
+
+**Tips:**
+
+- Set `INSTABOX_API_URL` to point the app at another API.
+- Set `INSTABOX_API_KEY` to sign in with an API key instead of the browser.
+- You do not need a `.dmg` to see a change.
+- A dev build never turns on Start at login by itself.
+
+### Tests
+
+```bash
 bun run test
 cd src-tauri && cargo test
 ```
 
-Set `INSTABOX_API_KEY` to use a dev key. Set `INSTABOX_API_URL` to point the app at another API.
+### Build a .dmg
 
-## Credits
+```bash
+bun tauri build --bundles dmg
+```
 
-Parts are adapted from t3boat by Pau Kraft (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Only needed to test installing. The file lands in `src-tauri/target/release/bundle/dmg/`.
+
+## Contributing
+
+**Pull requests**: Welcome. To add an ADE, start with [Adding an ADE](#adding-an-ade).
+
+**Issues**: Open an [issue](https://github.com/InsForge/instabox-bridge/issues) for bugs or ideas.
 
 ## License
 
-MIT
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

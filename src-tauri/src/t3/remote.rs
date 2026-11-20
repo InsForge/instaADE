@@ -12,7 +12,7 @@ const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
 pub const SETUP_EXIT_BUSY: i32 = 3;
 
 pub const PAIR_SCRIPT: &str =
-    r#"t3 pair --base-dir "$HOME/.t3-instabox/$(cat /etc/machine-id)" --label 'Instabox Bridge'"#;
+    r#"t3 pair --base-dir "$HOME/.t3-instabox/$(cat /etc/machine-id)" --label 'Instabox'"#;
 pub const VERSION_SCRIPT: &str = "t3 --version 2>/dev/null || true";
 pub const PROBE_SCRIPT: &str = "/usr/local/lib/instabox/activity.d/t3";
 
