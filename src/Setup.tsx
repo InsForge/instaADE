@@ -1,66 +1,74 @@
 import { refreshT3, signIn, T3_DOWNLOAD_URL } from "./api";
-import { ExternalLink } from "./ErrorNotice";
-import type { Run } from "./SandboxList";
+import { openExternal } from "./common";
+import type { Run } from "./common";
+import { Alert, Check, Logo } from "./icons";
 import type { AppState } from "./types";
 
-interface Props {
-  state: AppState;
-  run: Run;
-  onCreate: () => void;
+/** T3 Code is not on this Mac: shown on first run and at the top of the list. */
+export function T3Missing({ run }: { run: Run }) {
+  return (
+    <div className="warn-card">
+      <div className="warn-head">
+        <span className="warn-icon">
+          <Alert />
+        </span>
+        <div className="warn-text">
+          <span className="strong">T3 Code is not on this Mac</span>
+          <span className="small soft">Bridge opens sandboxes in T3 Code. Install it first.</span>
+        </div>
+      </div>
+      <div className="warn-buttons">
+        <button className="btn" onClick={() => run(() => refreshT3())}>
+          Check again
+        </button>
+        <button className="btn primary" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
+          Download T3 Code
+        </button>
+      </div>
+    </div>
+  );
 }
 
-export default function Setup({ state, run, onCreate }: Props) {
+export default function Setup({ state, run }: { state: AppState; run: Run }) {
   const t3Ok = state.t3 !== null;
-  const signedIn = state.signedIn;
   return (
-    <section className="card setup">
-      <h1>Set up Instabox Bridge</h1>
-      <ol className="checks">
-        <li>
-          <span className="num">1</span>
-          <span className="label">T3 Code</span>
-          {t3Ok ? (
-            <span className="success">✓ Found v{state.t3}</span>
-          ) : (
-            <span className="row-actions">
-              <ExternalLink url={T3_DOWNLOAD_URL}>Download T3 Code</ExternalLink>
-              <button className="btn small" onClick={() => run(() => refreshT3())}>
-                Check again
-              </button>
-            </span>
-          )}
-        </li>
-        <li>
-          <span className="num">2</span>
-          <span className="label">Instabox</span>
-          {signedIn ? (
-            <span className="success">✓ Signed in{state.login ? ` as ${state.login}` : ""}</span>
-          ) : (
-            <span className="row-actions">
-              <button className="btn" onClick={() => run(() => signIn("github"))}>
-                Sign in with GitHub
-              </button>
-              <button className="btn" onClick={() => run(() => signIn("google"))}>
-                Sign in with Google
-              </button>
-            </span>
-          )}
-        </li>
-        {!signedIn && state.signInCode && (
-          <li className="sub">
-            Waiting for sign-in in your browser. Your code is <strong className="code">{state.signInCode}</strong>
-          </li>
-        )}
-        <li>
-          <span className="num">3</span>
-          <span className="label">Done</span>
-          {t3Ok && signedIn && (
-            <button className="btn primary" onClick={onCreate}>
-              Create your first sandbox
+    <>
+      <div className="setup">
+        <div className="brand-block">
+          <Logo />
+          <div className="brand-text">
+            <span className="brand-name">Instabox Bridge</span>
+            <span className="muted">Run T3 Code on an instabox sandbox.</span>
+          </div>
+        </div>
+        {!t3Ok && <T3Missing run={run} />}
+        {state.signedIn ? (
+          <p className="signed-in">
+            <Check />
+            Signed in{state.login ? ` as ${state.login}` : ""}
+          </p>
+        ) : (
+          <div className="sign-in">
+            <button className={`btn lg${t3Ok ? " primary" : ""}`} onClick={() => run(() => signIn("github"))}>
+              Sign in with GitHub
             </button>
-          )}
-        </li>
-      </ol>
-    </section>
+            <button className="btn lg" onClick={() => run(() => signIn("google"))}>
+              Sign in with Google
+            </button>
+            {state.signInCode && (
+              <p className="sign-in-code" role="status">
+                Waiting for sign-in in your browser. Your code is <strong className="code">{state.signInCode}</strong>
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+      {t3Ok && (
+        <div className="foot found">
+          <Check />
+          <span>T3 Code {state.t3} found on this Mac</span>
+        </div>
+      )}
+    </>
   );
 }
