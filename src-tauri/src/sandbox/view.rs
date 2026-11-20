@@ -60,7 +60,6 @@ pub struct SandboxView {
     pub auto_sleep: AutoSleep,
     pub run_left_minutes: Option<i64>,
     pub cooldown_minutes: Option<i64>,
-    pub t3_code_connected: bool,
     /// The sandbox could not be brought to the desktop T3 version (busy, ahead, or a failed sync).
     pub update_pending: bool,
     /// The sandbox's T3 is newer than the desktop's: T3 Code on this computer is behind.
@@ -142,7 +141,6 @@ pub fn view(m: &Machine, now: DateTime<Utc>) -> SandboxView {
         auto_sleep,
         run_left_minutes,
         cooldown_minutes,
-        t3_code_connected: false,
         update_pending: false,
         desktop_behind: false,
     }
@@ -259,7 +257,7 @@ mod tests {
         let v = view(&machine("suspended"), now());
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(j["state"], "paused");
-        assert_eq!(j["t3CodeConnected"], false);
+        assert_eq!(j["desktopBehind"], false);
         assert!(j.get("runLeftMinutes").is_some());
     }
 
@@ -280,7 +278,6 @@ mod tests {
         m.metadata.insert("instabox-bridge".into(), "t3".into());
         let v = view(&m, now());
         assert!(v.connected);
-        assert!(!v.t3_code_connected);
         assert_eq!(v.t3_version, None);
     }
 

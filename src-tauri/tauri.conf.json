@@ -10,14 +10,19 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "Instabox Bridge",
-        "width": 900,
-        "height": 640,
-        "minWidth": 720,
-        "minHeight": 520
+        "width": 360,
+        "height": 600,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true
       }
     ],
     "security": { "csp": null }

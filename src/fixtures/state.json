@@ -34,7 +34,6 @@
       },
       "runLeftMinutes": 100,
       "cooldownMinutes": null,
-      "t3CodeConnected": true,
       "updatePending": false,
       "desktopBehind": false
     },
@@ -52,7 +51,6 @@
       },
       "runLeftMinutes": null,
       "cooldownMinutes": null,
-      "t3CodeConnected": false,
       "updatePending": true,
       "desktopBehind": false
     },
@@ -70,7 +68,6 @@
       },
       "runLeftMinutes": null,
       "cooldownMinutes": null,
-      "t3CodeConnected": false,
       "updatePending": false,
       "desktopBehind": false
     },
@@ -88,7 +85,6 @@
       },
       "runLeftMinutes": null,
       "cooldownMinutes": null,
-      "t3CodeConnected": false,
       "updatePending": false,
       "desktopBehind": true
     }

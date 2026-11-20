@@ -1,4 +1,4 @@
-//! Find the local T3 Code install, read its version, and tell if the app runs.
+//! Find the local T3 Code install and read its version.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -9,8 +9,7 @@ use crate::process::{RunError, run_bounded};
 
 pub const DOWNLOAD_URL: &str = "https://github.com/pingdotgg/t3code/releases/latest";
 
-/// A stuck `t3 --version` or `ps` counts as not found or not running after this long, so it
-/// cannot hang startup or the refresh loop.
+/// A stuck `t3 --version` counts as not found after this long, so it cannot hang startup.
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Path of the T3 CLI, if it exists.
@@ -62,31 +61,6 @@ fn version_within(cli: &Path, timeout: Duration) -> Result<String> {
     parse_version(&text).with_context(|| format!("unrecognized version output: {}", text.trim()))
 }
 
-/// True when `exe_path` is the main executable of the T3 Code app (stable or beta).
-pub fn is_t3_app(exe_path: &str) -> bool {
-    let p = exe_path.trim();
-    [
-        ("/T3 Code.app/Contents/MacOS/", "T3 Code"),
-        ("/T3 Code (Beta).app/Contents/MacOS/", "T3 Code (Beta)"),
-    ]
-    .iter()
-    .any(|(dir, exe)| p.find(dir).is_some_and(|i| &p[i + dir.len()..] == *exe))
-}
-
-/// True when the T3 Code desktop app runs. Always false off macOS, and false when `ps`
-/// does not answer within 5 s.
-pub fn running() -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    let mut cmd = Command::new("/bin/ps");
-    cmd.args(["-axo", "comm="]);
-    match run_bounded(cmd, LOCAL_TIMEOUT) {
-        Ok((Some(0), out, _)) => String::from_utf8_lossy(&out).lines().any(is_t3_app),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,20 +109,6 @@ mod tests {
         assert!(e.to_string().contains("did not answer"), "{e}");
         let (_dir, cli) = fake_t3("echo 't3 v0.1.10'");
         assert_eq!(version_within(&cli, LOCAL_TIMEOUT).unwrap(), "0.1.10");
-    }
-
-    #[test]
-    fn detects_app_paths() {
-        assert!(is_t3_app(
-            "/Applications/T3 Code.app/Contents/MacOS/T3 Code"
-        ));
-        assert!(is_t3_app(
-            "/Applications/T3 Code (Beta).app/Contents/MacOS/T3 Code (Beta)"
-        ));
-        assert!(!is_t3_app(
-            "/Applications/T3 Code.app/Contents/Frameworks/T3 Code Helper (Renderer).app/Contents/MacOS/T3 Code Helper (Renderer)"
-        ));
-        assert!(!is_t3_app("/Applications/Safari.app/Contents/MacOS/Safari"));
     }
 
     #[test]

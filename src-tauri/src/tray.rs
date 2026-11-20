@@ -1,10 +1,12 @@
-//! The menu-bar tray: one item per sandbox, then Open and Quit.
+//! The menu-bar tray. A left click opens the popover window under the icon; a right click
+//! shows a menu with one item per sandbox, then Open and Quit.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, LogicalPosition, Manager, Rect, WebviewWindow, Window};
 
 use crate::app::{AppState, Core};
 use crate::sandbox::view::ViewState;
@@ -68,12 +70,119 @@ pub fn tray_rows(state: &AppState) -> Vec<TrayRow> {
 #[derive(Default)]
 pub struct TrayMemo(Mutex<Option<Vec<TrayRow>>>);
 
-pub fn show_main(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
+/// When the popover last hid because it lost focus.
+#[derive(Default)]
+pub struct HiddenAt(Mutex<Option<Instant>>);
+
+/// A rectangle in logical points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bounds {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Space between the popover and the icon, and between the popover and the screen edge.
+const GAP: f64 = 4.0;
+const EDGE: f64 = 8.0;
+
+/// The popover's top-left corner: centered under the icon, kept on the icon's screen.
+pub fn popover_origin(icon: Bounds, window: (f64, f64), screen: Bounds) -> (f64, f64) {
+    let min = screen.x + EDGE;
+    let max = screen.x + screen.w - window.0 - EDGE;
+    let x = (icon.x + icon.w / 2.0 - window.0 / 2.0)
+        .max(min)
+        .min(max.max(min));
+    (x, icon.y + icon.h + GAP)
+}
+
+/// A click on the icon also takes focus from an open popover, which hides it first. Without
+/// this check the same click would open it again.
+pub fn hid_just_now(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|t| now.duration_since(t) < Duration::from_millis(300))
+}
+
+fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<()> {
+    let p = icon.position.to_physical::<f64>(1.0);
+    let Some(screen) = app.monitor_from_point(p.x, p.y)?.or(app.primary_monitor()?) else {
+        return Ok(());
+    };
+    let scale = screen.scale_factor();
+    let pos = icon.position.to_logical::<f64>(scale);
+    let size = icon.size.to_logical::<f64>(scale);
+    if size.width == 0.0 {
+        // The icon is not laid out yet; the window keeps its last place.
+        return Ok(());
     }
+    let spos = screen.position().to_logical::<f64>(scale);
+    let ssize = screen.size().to_logical::<f64>(scale);
+    let win = window
+        .outer_size()?
+        .to_logical::<f64>(window.scale_factor()?);
+    let (x, y) = popover_origin(
+        Bounds {
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+        },
+        (win.width, win.height),
+        Bounds {
+            x: spos.x,
+            y: spos.y,
+            w: ssize.width,
+            h: ssize.height,
+        },
+    );
+    window.set_position(LogicalPosition::new(x, y))
+}
+
+/// Shows the popover under the icon. `icon` is the clicked icon's place; None looks it up.
+pub fn show_popover(app: &AppHandle, icon: Option<Rect>) {
+    let Some(w) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+    let icon = icon.or_else(|| {
+        app.tray_by_id(TRAY_ID)
+            .and_then(|t| t.rect().ok().flatten())
+    });
+    if let Some(icon) = icon {
+        let _ = place(app, &w, icon);
+    }
+    let _ = w.show();
+    let _ = w.set_focus();
+}
+
+fn toggle_popover(app: &AppHandle, icon: Rect) {
+    let Some(w) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+    if w.is_visible().unwrap_or(false) {
+        let _ = w.hide();
+        return;
+    }
+    let last = *app
+        .state::<HiddenAt>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !hid_just_now(last, Instant::now()) {
+        show_popover(app, Some(icon));
+    }
+}
+
+/// The popover closes when the user clicks anywhere else.
+pub fn hide_on_blur(window: &Window) {
+    if window.label() != MAIN_WINDOW {
+        return;
+    }
+    let _ = window.hide();
+    let app = window.app_handle();
+    *app.state::<HiddenAt>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
 fn item(app: &AppHandle, id: String, text: &str) -> tauri::Result<MenuItem<tauri::Wry>> {
@@ -112,11 +221,23 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
     let menu = build_menu(app, &[])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .tooltip("Instabox Bridge")
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                rect,
+                ..
+            } = event
+            {
+                toggle_popover(tray.app_handle(), rect);
+            }
+        })
         .on_menu_event(move |app, event| {
             let id = event.id().as_ref().to_string();
             match id.as_str() {
-                "show" => show_main(app),
+                "show" => show_popover(app, None),
                 "quit" => app.exit(0),
                 other => {
                     let Some((verb, sandbox)) = other.split_once(':') else {
@@ -136,9 +257,9 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                 }
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
+    // Template image: macOS tints it for light and dark menu bars.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    builder = builder.icon(icon).icon_as_template(true);
     builder.build(app)?;
     Ok(())
 }
@@ -182,7 +303,6 @@ mod tests {
             },
             run_left_minutes: None,
             cooldown_minutes: None,
-            t3_code_connected: false,
             update_pending: false,
             desktop_behind: false,
         }
@@ -219,5 +339,62 @@ mod tests {
         };
         assert!(!tray_rows(&state)[0].connected);
         assert_eq!(row_label("x", ViewState::Stopped), "\u{25CB} x");
+    }
+
+    const SCREEN: Bounds = Bounds {
+        x: 0.0,
+        y: 0.0,
+        w: 1440.0,
+        h: 900.0,
+    };
+
+    #[test]
+    fn popover_is_centered_under_the_icon() {
+        let icon = Bounds {
+            x: 700.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), SCREEN), (532.0, 28.0));
+    }
+
+    #[test]
+    fn popover_stays_on_the_icon_screen() {
+        let right = Bounds {
+            x: 1420.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(popover_origin(right, (360.0, 600.0), SCREEN).0, 1072.0);
+        let left = Bounds {
+            x: 2.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(popover_origin(left, (360.0, 600.0), SCREEN).0, 8.0);
+        let second = Bounds {
+            x: 1440.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let icon = Bounds {
+            x: 3340.0,
+            y: 0.0,
+            w: 24.0,
+            h: 24.0,
+        };
+        assert_eq!(popover_origin(icon, (360.0, 600.0), second).0, 2992.0);
+    }
+
+    #[test]
+    fn a_click_right_after_a_blur_does_not_reopen() {
+        let now = Instant::now();
+        assert!(!hid_just_now(None, now));
+        assert!(hid_just_now(Some(now), now + Duration::from_millis(100)));
+        assert!(!hid_just_now(Some(now), now + Duration::from_millis(400)));
     }
 }
