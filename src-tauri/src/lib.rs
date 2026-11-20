@@ -24,20 +24,27 @@ use crate::connected::FileConnectedStore;
 use crate::mcp::KeyringKeyStore;
 use crate::ssh::KeyringSshStore;
 
+/// The argument the login item passes, so a start at login does not open the popover.
+const AT_LOGIN: &str = "--at-login";
+
 pub fn run() {
     let app = tauri::Builder::default()
-        // Single instance first: a second launch focuses the running window.
+        // Single instance first: a second launch opens the running popover.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::show_main(app);
+            tray::show_popover(app, None);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![AT_LOGIN]),
         ))
         .manage(tray::TrayMemo::default())
+        .manage(tray::HiddenAt::default())
         .setup(|app| {
             let handle = app.handle().clone();
+            // A menu-bar app: no Dock icon.
+            #[cfg(target_os = "macos")]
+            let _ = handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let opener: Opener = {
                 let h = handle.clone();
                 Arc::new(move |url| {
@@ -71,6 +78,15 @@ pub fn run() {
             core.set_start_at_login(handle.autolaunch().is_enabled().unwrap_or(false));
             app.manage(core.clone());
             tray::build(&handle, core.clone())?;
+            // Opened by hand: show where the app lives. Started at login: stay in the menu bar.
+            if !std::env::args().any(|a| a == AT_LOGIN) {
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Give the menu bar time to lay out the icon.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tray::show_popover(&h, None);
+                });
+            }
 
             let starter = core.clone();
             tauri::async_runtime::spawn(async move { starter.start().await });
@@ -82,12 +98,14 @@ pub fn run() {
             }));
             Ok(())
         })
-        // Closing the window keeps the app in the menu bar.
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            // Closing the popover keeps the app in the menu bar.
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            WindowEvent::Focused(false) => tray::hide_on_blur(window),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
@@ -120,7 +138,7 @@ pub fn run() {
     app.run(|_app, _event| {
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = _event {
-            tray::show_main(_app);
+            tray::show_popover(_app, None);
         }
     });
 }
