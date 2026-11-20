@@ -6,6 +6,7 @@ pub mod commands;
 pub mod connected;
 pub mod errors;
 pub mod gate;
+pub mod login;
 pub mod mcp;
 pub mod process;
 pub mod sandbox;
@@ -76,12 +77,28 @@ pub fn run() {
                 dirs::home_dir().unwrap_or_default(),
             ));
             let launch = handle.autolaunch();
-            let at_login = launch.is_enabled().unwrap_or(false);
-            if at_login {
-                // Rewrites the login item, so one an older build made gets `--at-login`.
-                let _ = launch.enable();
+            // Without a config dir there is nowhere to save the marker, so no default.
+            let marker = handle
+                .path()
+                .app_config_dir()
+                .ok()
+                .map(|d| d.join(login::DEFAULT_MARKER));
+            let marked = marker.as_ref().is_none_or(|m| m.exists());
+            let enabled = launch.is_enabled().unwrap_or(false);
+            match login::startup(!cfg!(debug_assertions), marked, enabled) {
+                login::Startup::Keep => {}
+                login::Startup::Rewrite => {
+                    let _ = launch.enable();
+                }
+                login::Startup::TurnOn => {
+                    // Marker first: without it, every launch would turn the item on again,
+                    // also after the person turned it off.
+                    if marker.as_deref().is_some_and(|m| login::mark(m).is_ok()) {
+                        let _ = launch.enable();
+                    }
+                }
             }
-            core.set_start_at_login(at_login);
+            core.set_start_at_login(launch.is_enabled().unwrap_or(false));
             app.manage(core.clone());
             tray::build(&handle, core.clone())?;
             // Opened by hand: show where the app lives. Started at login: stay in the menu bar.
@@ -139,7 +156,7 @@ pub fn run() {
             commands::open_url,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building Instabox Bridge");
+        .expect("error while building Instabox");
 
     app.run(|_app, _event| {
         #[cfg(target_os = "macos")]
