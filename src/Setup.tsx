@@ -34,7 +34,7 @@ export function T3Missing({ run }: { run: Run }) {
         </span>
         <div className="warn-text">
           <span className="strong">T3 Code is not on this Mac</span>
-          <span className="small soft">Bridge opens sandboxes in T3 Code. Install it first.</span>
+          <span className="small soft">Instabox opens sandboxes in T3 Code. Install it first.</span>
         </div>
       </div>
       <div className="warn-buttons">
@@ -55,7 +55,7 @@ export default function Setup({ state, run }: { state: AppState; run: Run }) {
         <div className="brand-block">
           <Logo />
           <div className="brand-text">
-            <h1 className="brand-name">Instabox Bridge</h1>
+            <h1 className="brand-name">Instabox</h1>
             <span className="muted">Run T3 Code on an instabox sandbox.</span>
           </div>
         </div>

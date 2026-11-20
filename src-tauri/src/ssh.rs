@@ -20,7 +20,7 @@ pub fn account_changed() -> Error {
 }
 
 const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
-const TOKEN_NAME: &str = "Instabox Bridge";
+const TOKEN_NAME: &str = "Instabox";
 const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const REUSE_MARGIN_HOURS: i64 = 24;
 
@@ -230,7 +230,7 @@ mod tests {
 
     fn body_for(t: &SshToken) -> serde_json::Value {
         serde_json::json!({
-            "id": "k1", "name": "Instabox Bridge", "host": t.host, "port": t.port,
+            "id": "k1", "name": "Instabox", "host": t.host, "port": t.port,
             "token": t.token, "command": t.command, "expiresAt": t.expires_at,
         })
     }
@@ -296,7 +296,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/machines/m1/ssh-tokens"))
             .and(body_json(
-                serde_json::json!({"name": "Instabox Bridge", "ttlSeconds": 2592000}),
+                serde_json::json!({"name": "Instabox", "ttlSeconds": 2592000}),
             ))
             .respond_with(ResponseTemplate::new(201).set_body_json(body_for(&fresh)))
             .expect(1)
