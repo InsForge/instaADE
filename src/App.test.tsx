@@ -613,6 +613,40 @@ test("details: a resize starts at the current size and asks before the restart",
   expect(invoke).toHaveBeenCalledWith("resize", { id: "a", vcpus: 2, memMiB: 4096 });
 });
 
+test("details: an applied resize shows no pending change, before or after the new size arrives", async () => {
+  const { state } = show({ tier: "pro" }, [{ free: false, size: "4 vCPU / 8 GB" }]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  await userEvent.selectOptions(screen.getByLabelText("Size"), "2 vCPU / 4 GB");
+  await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+  await waitFor(() => expect(screen.queryByText("Restarts the sandbox")).toBeNull());
+  act(() => emit({ ...state, sandboxes: [{ ...state.sandboxes[0], size: "2 vCPU / 4 GB" }] }));
+  expect((screen.getByLabelText("Size") as HTMLSelectElement).value).toBe("2 vCPU / 4 GB");
+  expect(screen.queryByText("Restarts the sandbox")).toBeNull();
+});
+
+test("details: a failed resize goes back to the current size", async () => {
+  show({ tier: "pro" }, [{ free: false, size: "4 vCPU / 8 GB" }], {
+    resize: () => {
+      throw { kind: "api", message: "no room" };
+    },
+  });
+  await userEvent.click(await screen.findByText("dev-1"));
+  const select = screen.getByLabelText("Size") as HTMLSelectElement;
+  await userEvent.selectOptions(select, "2 vCPU / 4 GB");
+  await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+  await waitFor(() => expect(select.value).toBe("4 vCPU / 8 GB"));
+  expect(screen.queryByText("Restarts the sandbox")).toBeNull();
+});
+
+test("progress buttons never submit the New sandbox form", async () => {
+  show({ progress: { kind: "create", step: "creating", machineId: null, error: { kind: "api", message: "boom" } } });
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  await userEvent.type(screen.getByLabelText("Name"), "typed");
+  for (const b of screen.getAllByRole("button", { name: "Dismiss" })) await userEvent.click(b);
+  expect(calls("dismiss_progress").length).toBeGreaterThan(0);
+  expect(calls("create_sandbox").length).toBe(0);
+});
+
 test("details: auto sleep applies on change; the free plan cannot change it", async () => {
   show({ tier: "pro", sleepChoices: paidSleep }, [{ free: false }]);
   await userEvent.click(await screen.findByText("dev-1"));

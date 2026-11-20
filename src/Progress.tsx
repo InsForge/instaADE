@@ -55,21 +55,25 @@ export default function Progress({ state, run, onConnect }: Props) {
   const unconnected = unconnectedFor(p.error, state.sandboxes);
   const tone = errorTone(p.error);
   return (
-    <div className={`progress line wrap ${tone === "danger" ? "red" : tone === "warn" ? "amber" : "muted"}`} role="alert">
+    <div
+      className={`progress line wrap ${tone === "danger" ? "red" : tone === "warn" ? "amber" : "muted"}`}
+      role={tone === "info" ? "status" : "alert"}
+    >
       <span className={`line-text${p.error.kind === "setup" ? " pre" : ""}`}>{errorCopy(p.error)}</span>
+      {/* type="button": the New sandbox form shows this too, and these must not submit it. */}
       <span className="line-buttons">
         {machineId && (
           // Retry connects the sandbox that already exists. It never creates another.
-          <button className="btn sm" onClick={() => onConnect(machineId)}>
+          <button type="button" className="btn sm" onClick={() => onConnect(machineId)}>
             Retry
           </button>
         )}
         {unconnected && (
-          <button className="btn sm" onClick={() => onConnect(unconnected.id)}>
+          <button type="button" className="btn sm" onClick={() => onConnect(unconnected.id)}>
             Connect
           </button>
         )}
-        <button className="btn sm" onClick={() => run(() => dismissProgress())}>
+        <button type="button" className="btn sm" onClick={() => run(() => dismissProgress())}>
           Dismiss
         </button>
       </span>

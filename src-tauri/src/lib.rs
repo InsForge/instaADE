@@ -75,7 +75,13 @@ pub fn run() {
                 emit,
                 dirs::home_dir().unwrap_or_default(),
             ));
-            core.set_start_at_login(handle.autolaunch().is_enabled().unwrap_or(false));
+            let launch = handle.autolaunch();
+            let at_login = launch.is_enabled().unwrap_or(false);
+            if at_login {
+                // Rewrites the login item, so one an older build made gets `--at-login`.
+                let _ = launch.enable();
+            }
+            core.set_start_at_login(at_login);
             app.manage(core.clone());
             tray::build(&handle, core.clone())?;
             // Opened by hand: show where the app lives. Started at login: stay in the menu bar.

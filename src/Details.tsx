@@ -96,6 +96,13 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
   const [copied, setCopied] = useState(false);
   // Resize starts at the sandbox's own size, so Apply shows only once another is picked.
   const [newSize, setNewSize] = useState(s.size);
+  // The size just applied, until the sandbox reports it.
+  const [applied, setApplied] = useState<string | null>(null);
+  useEffect(() => {
+    setNewSize(s.size);
+    setApplied(null);
+  }, [s.size]);
+  const resizePending = newSize !== s.size && newSize !== applied && !free;
   // The auto sleep just picked, until the command settles.
   const [sleepPick, setSleepPick] = useState<number | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -211,7 +218,7 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
                   ))}
                 </select>
               </div>
-              {newSize !== s.size && !free && (
+              {resizePending && (
                 <div className="group-row">
                   <span className="small amber">Restarts the sandbox</span>
                   <span className="row-buttons">
@@ -222,8 +229,14 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
                       className="btn primary"
                       onClick={() => {
                         const z = state.sizes.find((x) => x.label === newSize);
-                        if (z) void run(() => resize(s.id, z.vcpus, z.memMiB));
-                        setNewSize(s.size);
+                        if (!z) return;
+                        const before = s.size;
+                        setApplied(newSize);
+                        void run(() => resize(s.id, z.vcpus, z.memMiB)).then((ok) => {
+                          if (ok) return;
+                          setApplied(null);
+                          setNewSize(before);
+                        });
                       }}
                     >
                       Apply

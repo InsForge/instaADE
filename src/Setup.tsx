@@ -55,7 +55,7 @@ export default function Setup({ state, run }: { state: AppState; run: Run }) {
         <div className="brand-block">
           <Logo />
           <div className="brand-text">
-            <span className="brand-name">Instabox Bridge</span>
+            <h1 className="brand-name">Instabox Bridge</h1>
             <span className="muted">Run T3 Code on an instabox sandbox.</span>
           </div>
         </div>
