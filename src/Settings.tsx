@@ -1,15 +1,8 @@
-import { addMcp, setStartAtLogin, signOut, switchOrg } from "./api";
+import { setStartAtLogin, signOut, switchOrg } from "./api";
 import { CheckT3Button } from "./Setup";
-import type { McpClient } from "./api";
 import { cap, openExternal } from "./common";
 import type { Run } from "./common";
-import { Check } from "./icons";
 import type { AppState } from "./types";
-
-const CLIENTS: { id: McpClient; label: string }[] = [
-  { id: "claudeCode", label: "Claude Code" },
-  { id: "codex", label: "Codex" },
-];
 
 export default function Settings({ state, run }: { state: AppState; run: Run }) {
   const update = state.update;
@@ -18,7 +11,7 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
       <div className="stack">
         {update && (
           <div className="update">
-            <span className="small soft">A new version of Instabox Bridge is ready.</span>
+            <span className="small soft">A new version of Instabox is ready.</span>
             <button className="btn primary" onClick={() => openExternal(update.url)}>
               Download
             </button>
@@ -70,32 +63,6 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
                 <span />
               </button>
             </div>
-          </div>
-        </section>
-
-        <section className="section">
-          <h2 className="section-label">Let agents on this Mac manage sandboxes</h2>
-          <div className="group">
-            {CLIENTS.map((c) => {
-              const v = state.mcp[c.id];
-              return (
-                <div key={c.id} className={`group-row${v === false ? "" : " plain"}`}>
-                  <span>{c.label}</span>
-                  {v === null ? (
-                    <span className="small muted">Not installed</span>
-                  ) : v ? (
-                    <span className="ok">
-                      <Check />
-                      Added
-                    </span>
-                  ) : (
-                    <button className="btn" onClick={() => run(() => addMcp(c.id))}>
-                      Add
-                    </button>
-                  )}
-                </div>
-              );
-            })}
           </div>
         </section>
       </div>
