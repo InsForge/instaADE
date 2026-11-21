@@ -84,6 +84,8 @@ Pull requests that add an ADE are welcome.
 
 ## Development
 
+For the code layout, the checks to run before a pull request, preview builds and releases, see [DEVELOPMENT.md](DEVELOPMENT.md). Coding agents load the same guide through the `instabox-development` skill.
+
 ### Prerequisites
 
 - macOS or Windows
