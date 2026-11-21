@@ -996,7 +996,7 @@ test("picking an ADE switches the background and the row actions, and is remembe
   expect(localStorage.getItem(modeKey("alex"))).toBe("instabox");
 });
 
-test("cmux rows: Open runs open_in_t3 with cmux, Install sets it up, both ask to confirm in cmux", async () => {
+test("cmux rows: Open runs open_in_t3 with cmux, Install sets it up, neither adds a notice", async () => {
   picked("cmux");
   show(mac, [
     { id: "a", name: "dev-1", ades: ["t3"] },
@@ -1006,11 +1006,14 @@ test("cmux rows: Open runs open_in_t3 with cmux, Install sets it up, both ask to
   const install = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
   await userEvent.click(install.getByRole("button", { name: "Install cmux" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
-  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+  // cmux asks in its own window. The popover adds no notice once the action is done.
+  await act(async () => {});
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 
   await userEvent.click(within(rowOf("web")).getByRole("button", { name: "Open in cmux" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "cmux" });
-  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
   expect((within(rowOf("busy")).getByRole("button", { name: "Open in cmux" }) as HTMLButtonElement).disabled).toBe(true);
 
   // The menu offers the same, with no T3 pairing or reinstall.
@@ -1076,7 +1079,8 @@ test("a new sandbox in cmux mode sets cmux up", async () => {
   await userEvent.type(screen.getByLabelText("Name"), "dev-2");
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "cmux" }));
-  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
 // ---- first run and the default mode ----

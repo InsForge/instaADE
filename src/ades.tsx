@@ -52,7 +52,8 @@ export function readyText(state: AppState, s: SandboxView, id: AdeId): string {
   return `Ready for ${adeName(state, id)}`;
 }
 
-/** Shown once after a connect or create opens the ADE: what to confirm there. */
-export function confirmText(state: AppState, id: AdeId): string {
-  return id === "t3" ? "Confirm the new environment in T3 Code" : `Confirm the workspace in ${adeName(state, id)}`;
+/** Shown once after a connect or create opens T3 Code: what to confirm there. Other ADEs
+ * show nothing. */
+export function confirmText(id: AdeId): string | null {
+  return id === "t3" ? "Confirm the new environment in T3 Code" : null;
 }

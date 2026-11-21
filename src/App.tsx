@@ -120,18 +120,18 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
   const back = () => go({ name: "list" });
   /** Sets the ADE up on the sandbox, then opens it: confirm there. */
   const connect = (id: string, ade: AdeId) => {
-    void run(() => connectSandbox(id, ade)).then((ok) => ok && setNotice(confirmText(state, ade)));
+    void run(() => connectSandbox(id, ade)).then((ok) => ok && setNotice(confirmText(ade)));
   };
   /** Opens the sandbox in the ADE. A link ADE (cmux) asks to confirm every time; T3 only when it paired just now. */
   const open = (id: string, ade: AdeId) => {
     const s = state.sandboxes.find((x) => x.id === id);
     const ready = !!s && hasAde(s, ade) && (!pairs(ade) || s.connected);
-    void run(() => openInAde(id, ade)).then((ok) => ok && (!pairs(ade) || !ready) && setNotice(confirmText(state, ade)));
+    void run(() => openInAde(id, ade)).then((ok) => ok && (!pairs(ade) || !ready) && setNotice(confirmText(ade)));
   };
   const create = (args: CreateArgs, size: string) => {
     setPending({ name: args.name, size });
     go({ name: "list" });
-    void run(() => createSandbox(args)).then((ok) => ok && args.ade && setNotice(confirmText(state, args.ade)));
+    void run(() => createSandbox(args)).then((ok) => ok && args.ade && setNotice(confirmText(args.ade)));
   };
   const toggleMenu = (id: string, anchor: HTMLElement) =>
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));
