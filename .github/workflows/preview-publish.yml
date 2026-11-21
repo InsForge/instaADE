@@ -33,6 +33,7 @@ jobs:
     outputs:
       pr: ${{ steps.check.outputs.pr }}
       sha: ${{ steps.check.outputs.sha }}
+      at: ${{ steps.check.outputs.at }}
     steps:
       # main, for the list of authors.
       - uses: actions/checkout@v4
@@ -65,6 +66,8 @@ jobs:
               --body "This preview was not signed: $author is not in .github/PREVIEW_AUTHORS."
             exit 0
           fi
+          # A person taking the label off from now on cancels this build (see publish).
+          echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           # Take the label now, so it covers this build only. A removal by this token starts
           # no workflow, so the cleanup job does not run for it.
           if ! gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/preview-build" >/dev/null; then
@@ -124,13 +127,9 @@ jobs:
   publish:
     needs: [resolve, sign]
     runs-on: ubuntu-latest
-    # One pull request's publish and cleanup run one at a time, so a cleanup never finishes
-    # before an upload it should have deleted.
-    concurrency:
-      group: preview-pr-${{ needs.resolve.outputs.pr }}
-      cancel-in-progress: false
     permissions:
       contents: write
+      issues: read
       pull-requests: write
       actions: read
     steps:
@@ -150,20 +149,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.resolve.outputs.pr }}
           SHA: ${{ needs.resolve.outputs.sha }}
+          AT: ${{ needs.resolve.outputs.at }}
         run: |
-          # Signing takes minutes: check again that the pull request is open at the built commit.
-          info=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,headRefOid)
-          if [ "$(jq -r .state <<<"$info")" != "OPEN" ]; then
-            echo "#$PR closed while the preview was signed. Nothing to publish."
-            exit 0
-          fi
-          if [ "$(jq -r .headRefOid <<<"$info")" != "$SHA" ]; then
-            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
-              --body "A newer commit arrived while the preview of ${SHA::7} was signed, so it was not published. Add the preview-build label again to build the newer commit."
-            exit 0
-          fi
+          short=${SHA::7}
           prefix="Instabox-Preview-pr$PR-"
-          mv windows/preview.exe "files/$prefix${SHA::7}-x64-setup.exe"
+          # This build is cancelled once the pull request closes, or once a person takes the
+          # label off after this build took it. It is checked before and after the upload, so
+          # a cleanup that finishes during the upload still wins.
+          cancelled() {
+            state=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state --jq .state)
+            if [ "$state" != "OPEN" ]; then
+              return 0
+            fi
+            removed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/events" \
+              --jq ".[] | select(.event == \"unlabeled\" and .label.name == \"preview-build\" and .actor.login != \"github-actions[bot]\" and .created_at >= \"$AT\") | .id")
+            [ -n "$removed" ]
+          }
+          if cancelled; then
+            echo "#$PR closed or lost its label while the preview was signed. Nothing to publish."
+            exit 0
+          fi
+          head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$SHA" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+              --body "A newer commit arrived while the preview of $short was signed, so it was not published. Add the preview-build label again to build the newer commit."
+            exit 0
+          fi
+          mv windows/preview.exe "files/$prefix$short-x64-setup.exe"
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Another pull request's publish may create it at the same time.
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main --prerelease --latest=false \
@@ -171,14 +183,21 @@ jobs:
               --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. Instabox Preview installs next to Instabox and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs." ||
               gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
+          # Older commits of this pull request go. A file of this commit is replaced.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
-            { grep "^$prefix" || true; } |
+            { grep "^$prefix" | grep -v "^$prefix$short-" || true; } |
             while read -r name; do
               gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
             done
-          gh release upload "$TAG" files/* --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" files/* --repo "$GITHUB_REPOSITORY" --clobber
+          if cancelled; then
+            for f in files/*; do
+              gh release delete-asset "$TAG" "$(basename "$f")" --repo "$GITHUB_REPOSITORY" --yes || true
+            done
+            echo "#$PR closed or lost its label during the upload. Its files are deleted."
+            exit 0
+          fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
-          short=${SHA::7}
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Instabox Preview for $short is ready.
 
           - macOS, Apple silicon: $base/$prefix$short-arm64.dmg
@@ -192,9 +211,6 @@ jobs:
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'closed' || github.event.label.name == 'preview-build')
     runs-on: ubuntu-latest
-    concurrency:
-      group: preview-pr-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
     permissions:
       contents: write
     steps:
