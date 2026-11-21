@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import { HeroCube } from "./hero/HeroCube";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import symbol from "./assets/main-view/instabox-symbol.svg";
 import AdeSwitcher from "./AdeSwitcher";
 import type { Mode } from "./ades";
@@ -7,6 +6,9 @@ import { themeOf } from "./hero/AppBackground";
 import HeroAtmosphere from "./hero/HeroAtmosphere";
 import { useHeroSettings } from "./hero/HeroSettings";
 import type { AppState } from "./types";
+
+// The cube is a browser preview layout only, so the desktop build leaves out its renderer.
+const HeroCube = import.meta.env.DEV ? lazy(() => import("./hero/HeroCube").then((m) => ({ default: m.HeroCube }))) : null;
 
 interface Props {
   state: AppState;
@@ -49,10 +51,12 @@ export default function MainHeader({ state, mode, switcherOpen, onSwitcherOpenCh
         </div>
         <AdeSwitcher state={state} mode={mode} open={switcherOpen} onOpenChange={onSwitcherOpenChange} onChoose={onChoose} />
       </header>
-      {showHero && (
+      {showHero && HeroCube && (
         <div className="main-hero" style={settings.style}>
           <HeroAtmosphere ade={theme} patternSettings={settings.values} />
-          <HeroCube ade={theme} />
+          <Suspense fallback={null}>
+            <HeroCube ade={theme} />
+          </Suspense>
         </div>
       )}
     </>

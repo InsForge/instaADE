@@ -1,34 +1,34 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import type { Ade } from '../ade';
-import HeroSettings, { useHeroSettings } from './HeroSettings';
+import { heroSettingsDefaults, useHeroSettings } from './HeroSettings';
 
+let settings: ReturnType<typeof useHeroSettings>;
 function Preview({ ade }: { ade: Ade }) {
-  const settings = useHeroSettings(ade);
-  return <div className="popover"><header data-testid="hero" style={settings.style}><HeroSettings ade={ade} settings={settings} /></header></div>;
+  settings = useHeroSettings(ade);
+  return <header data-testid="hero" style={settings.style} />;
 }
-const adjust = (label: string, value: number) => fireEvent.change(screen.getByRole('slider', { name: label }), { target: { value: String(value) } });
+const adjust = (key: keyof typeof heroSettingsDefaults, value: number) => act(() => settings.change(key, value));
+const reset = () => act(() => settings.reset());
 const value = (name: string) => screen.getByTestId('hero').style.getPropertyValue(name);
 beforeEach(() => localStorage.clear());
 afterEach(() => { cleanup(); localStorage.clear(); });
 
-test('opacity is live, independent per ADE, persists after remount, and resets only the current ADE', async () => {
+test('opacity is live, independent per ADE, persists after remount, and resets only the current ADE', () => {
   const view = render(<Preview ade="cmux" />);
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  adjust('Background opacity', 35);
+  adjust('backgroundOpacity', 35);
   expect(value('--hero-background-opacity')).toBe('0.35');
   expect(value('--hero-cube-opacity')).toBe('1');
   view.rerender(<Preview ade="orca" />);
   expect(value('--hero-background-opacity')).toBe('1');
-  adjust('Background opacity', 60);
+  adjust('backgroundOpacity', 60);
   view.rerender(<Preview ade="cmux" />);
   expect(value('--hero-background-opacity')).toBe('0.35');
+  expect(settings.saved).toBe(true);
   view.unmount();
   const remount = render(<Preview ade="cmux" />);
   expect(value('--hero-background-opacity')).toBe('0.35');
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  await userEvent.click(screen.getByRole('button', { name: 'Reset' }));
+  reset();
   expect(value('--hero-background-opacity')).toBe('0.4');
   expect(value('--hero-fade-start')).toBe('0%');
   expect(value('--hero-fade-end')).toBe('100%');
@@ -37,17 +37,12 @@ test('opacity is live, independent per ADE, persists after remount, and resets o
   expect(value('--hero-background-opacity')).toBe('0.6');
 });
 
-test('fade bounds stay ordered and Escape returns focus to the settings trigger', async () => {
+test('fade bounds stay ordered', () => {
   render(<Preview ade="paradev" />);
-  const trigger = screen.getByRole('button', { name: 'Hero settings' });
-  await userEvent.click(trigger);
-  adjust('Fade starts', 95);
+  adjust('fadeStart', 95);
   expect(value('--hero-fade-end')).toBe('100%');
-  adjust('Fully faded', 20);
+  adjust('fadeEnd', 20);
   expect(value('--hero-fade-start')).toBe('15%');
-  await userEvent.keyboard('{Escape}');
-  expect(screen.queryByRole('dialog')).toBeNull();
-  expect(document.activeElement).toBe(trigger);
 });
 
 test('malformed stored values fall back or clamp to valid ranges', () => {
@@ -62,47 +57,39 @@ test('malformed stored values fall back or clamp to valid ranges', () => {
   expect(value('--hero-background-opacity')).toBe('0.4');
 });
 
-test('Paradev applies the opacity preset once and preserves pattern tuning across ADEs and reloads', async () => {
+test('Paradev applies the opacity preset once and preserves pattern tuning across ADEs and reloads', () => {
   localStorage.setItem('instabox.hero-preview.v1', JSON.stringify({ paradev: { backgroundOpacity: 90, cubeOpacity: 70, fadeStart: 25 }, cmux: { backgroundOpacity: 35 } }));
   const view = render(<Preview ade="paradev" />);
   expect(value('--hero-background-opacity')).toBe('0.48');
   expect(value('--hero-cube-opacity')).toBe('1');
   expect(value('--hero-fade-start')).toBe('25%');
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  adjust('Pixel size', 4);
-  adjust('Pattern horizontal position', -25);
-  adjust('Pattern vertical position', 30);
-  adjust('Pattern opacity', 65);
-  adjust('Pattern density', 150);
-  adjust('Animation speed', 0);
-  adjust('Background opacity', 50);
+  adjust('pixelSize', 4);
+  adjust('pixelX', -25);
+  adjust('pixelY', 30);
+  adjust('pixelOpacity', 65);
+  adjust('pixelDensity', 150);
+  adjust('pixelSpeed', 0);
+  adjust('backgroundOpacity', 50);
   view.rerender(<Preview ade="cmux" />);
   expect(value('--hero-background-opacity')).toBe('0.35');
-  expect(screen.queryByRole('slider', { name: 'Pixel size' })).toBeNull();
   view.unmount();
   render(<Preview ade="paradev" />);
   expect(value('--hero-background-opacity')).toBe('0.5');
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  for (const [name, expected] of [['Pattern horizontal position', '-25'], ['Pattern vertical position', '30'], ['Pixel size', '4'], ['Pattern opacity', '65'], ['Pattern density', '150'], ['Animation speed', '0']]) {
-    expect((screen.getByRole('slider', { name }) as HTMLInputElement).value).toBe(expected);
-  }
-  await userEvent.click(screen.getByRole('button', { name: 'Reset' }));
+  expect(settings.values).toMatchObject({ pixelX: -25, pixelY: 30, pixelSize: 4, pixelOpacity: 65, pixelDensity: 150, pixelSpeed: 0 });
+  reset();
   expect(value('--hero-background-opacity')).toBe('0.48');
-  expect((screen.getByRole('slider', { name: 'Pixel size' }) as HTMLInputElement).value).toBe('2');
   expect(value('--hero-fade-start')).toBe('61%');
   expect(value('--hero-fade-end')).toBe('100%');
-  expect((screen.getByRole('slider', { name: 'Pattern horizontal position' }) as HTMLInputElement).value).toBe('68');
-  expect((screen.getByRole('slider', { name: 'Pattern vertical position' }) as HTMLInputElement).value).toBe('22');
+  expect(settings.values).toMatchObject({ pixelSize: 2, pixelX: 68, pixelY: 22 });
 });
 
-test('Orca controls update the preview, persist independently, and reset with the current ADE', async () => {
+test('Orca settings update the preview, persist independently, and reset with the current ADE', () => {
   const view = render(<Preview ade="orca" />);
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  adjust('Orca speed', 200);
-  adjust('Orca size', 150);
-  adjust('Orca visibility', 30);
-  adjust('Orca vertical position', 65);
-  await userEvent.click(screen.getByRole('button', { name: 'Pause Orca animation' }));
+  adjust('orcaSpeed', 200);
+  adjust('orcaScale', 150);
+  adjust('orcaOpacity', 30);
+  adjust('orcaY', 65);
+  adjust('orcaPaused', 1);
   expect(value('--orca-duration')).toBe('14s');
   expect(value('--orca-distant-width')).toBe('174px');
   expect(value('--orca-width')).toBe('315px');
@@ -110,20 +97,16 @@ test('Orca controls update the preview, persist independently, and reset with th
   expect(value('--orca-y')).toBe('65%');
   expect(value('--orca-play-state')).toBe('paused');
   view.rerender(<Preview ade="cmux" />);
-  expect(screen.queryByRole('group', { name: 'Orca animation' })).toBeNull();
-  adjust('Background opacity', 25);
+  adjust('backgroundOpacity', 25);
   view.unmount();
 
   const remount = render(<Preview ade="orca" />);
   expect(value('--orca-duration')).toBe('14s');
   expect(value('--orca-opacity')).toBe('0.3');
   expect(value('--orca-play-state')).toBe('paused');
-  await userEvent.click(screen.getByRole('button', { name: 'Hero settings' }));
-  const pause = screen.getByRole('button', { name: 'Pause Orca animation' });
-  expect(pause.getAttribute('aria-pressed')).toBe('true');
-  await userEvent.click(pause);
+  adjust('orcaPaused', 0);
   expect(value('--orca-play-state')).toBe('running');
-  await userEvent.click(screen.getByRole('button', { name: 'Reset' }));
+  reset();
   expect(value('--orca-duration')).toBe('28s');
   expect(value('--orca-width')).toBe('273px');
   expect(value('--orca-opacity')).toBe('0.2');

@@ -1,9 +1,7 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { createPortal } from 'react-dom';
-import { ADES, adeName, type Ade } from '../ade';
+import { ADES, type Ade } from '../ade';
 import { normalizeParadevSettings, paradevPatternDefaults } from './paradev-pixels';
-import './hero-settings.css';
 
 const STORAGE_KEY = 'instabox.hero-preview.v1';
 export const heroSettingsDefaults = {
@@ -113,55 +111,4 @@ export function useHeroSettings(ade: Ade) {
     '--orca-y': `${values.orcaY}%`,
   } as CSSProperties;
   return { values, style, change, reset, saved };
-}
-
-export default function HeroSettings({ ade, settings }: { ade: Ade; settings: ReturnType<typeof useHeroSettings> }) {
-  const [open, setOpen] = useState(false);
-  const trigger = useRef<HTMLButtonElement>(null);
-  const panel = useRef<HTMLDivElement>(null);
-  const id = useId();
-  const container = trigger.current?.closest<HTMLElement>('.popover');
-  const close = () => { setOpen(false); trigger.current?.focus({ preventScroll: true }); };
-  useEffect(() => { if (open) panel.current?.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true }); }, [open]);
-
-  const renderControl = ({ key, label, min, max, unit = '%' }: Control) => <label className="hero-setting" key={key} htmlFor={`${id}-${key}`}>
-    <span>{label}<output>{settings.values[key]}{unit}</output></span>
-    <input id={`${id}-${key}`} aria-label={label} type="range" min={min} max={max} step="1" value={settings.values[key]}
-      onChange={(event) => settings.change(key, Number(event.target.value))} />
-  </label>;
-
-  return <>
-    <button ref={trigger} className="hero-tune-trigger" type="button" aria-label="Hero settings"
-      aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>Tune hero</button>
-    {open && container && createPortal(<div ref={panel} id={id} className="hero-settings" role="dialog" aria-label="Hero settings"
-      onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close(); } }}>
-      <div className="hero-settings-heading">
-        <div><strong>{adeName(ade)} hero</strong><span>Temporary preview controls</span></div>
-        <button className="icon-btn" aria-label="Close hero settings" onClick={close}>×</button>
-      </div>
-      <p className="hero-settings-hint">Lower background opacity to soften the color and decorations.</p>
-      {controls.map(renderControl)}
-      {ade === 'orca' && <fieldset className="hero-pattern-settings">
-        <legend>Orca animation</legend>
-        <button className="btn hero-orca-pause" type="button" aria-pressed={settings.values.orcaPaused === 1}
-          aria-label="Pause Orca animation"
-          onClick={() => settings.change('orcaPaused', settings.values.orcaPaused ? 0 : 1)}>
-          {settings.values.orcaPaused ? 'Resume animation' : 'Pause animation'}
-        </button>
-        <p className="hero-settings-hint">100% is the original size and speed. Lower visibility for a subtler silhouette. Reduced motion keeps the scene still.</p>
-        {orcaControls.map(renderControl)}
-      </fieldset>}
-      {ade === 'paradev' && <fieldset className="hero-pattern-settings">
-        <legend>Top light</legend>
-        {lightControls.map(renderControl)}
-      </fieldset>}
-      {ade === 'paradev' && <fieldset className="hero-pattern-settings">
-        <legend>Pixelated pattern</legend>
-        <p className="hero-settings-hint">Position: 0% is the original placement. Negative moves left or up; positive moves right or down.</p>
-        {patternControls.map(renderControl)}
-      </fieldset>}
-      <div className="hero-settings-footer"><span>{settings.saved ? 'Saved locally for this ADE' : 'Changes last for this session'}</span>
-        <button className="btn" onClick={settings.reset}>Reset</button></div>
-    </div>, container)}
-  </>;
 }
