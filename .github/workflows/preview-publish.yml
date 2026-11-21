@@ -36,7 +36,7 @@ jobs:
       at: ${{ steps.check.outputs.at }}
     steps:
       # main, for the list of authors.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - id: check
@@ -95,10 +95,10 @@ jobs:
       actions: read
     steps:
       # main, for the signing script.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: preview-${{ matrix.target }}
           run-id: ${{ github.event.workflow_run.id }}
@@ -117,7 +117,7 @@ jobs:
         run: |
           .github/scripts/sign-preview.sh "$RUNNER_TEMP/build/preview.zip" "${{ matrix.arch }}" \
             "$RUNNER_TEMP/signed/Instabox-Preview-pr$PR-${SHA::7}-${{ matrix.arch }}.dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: signed-${{ matrix.target }}
           path: ${{ runner.temp }}/signed/*.dmg
@@ -133,12 +133,12 @@ jobs:
       pull-requests: write
       actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: signed-*
           merge-multiple: true
           path: files
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: preview-x86_64-pc-windows-msvc
           run-id: ${{ github.event.workflow_run.id }}
@@ -153,26 +153,34 @@ jobs:
         run: |
           short=${SHA::7}
           prefix="Instabox-Preview-pr$PR-"
-          # This build is cancelled once the pull request closes, or once a person takes the
-          # label off after this build took it. It is checked before and after the upload, so
-          # a cleanup that finishes during the upload still wins.
-          cancelled() {
-            state=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state --jq .state)
-            if [ "$state" != "OPEN" ]; then
-              return 0
+          # Prints why this build may no longer be published: the pull request closed, it has a
+          # newer commit, or a person took the label off after this build took it. Prints
+          # nothing when it may. Checked before and after the upload, so a cleanup or a push
+          # during the upload still wins.
+          stale() {
+            info=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,headRefOid)
+            if [ "$(jq -r .state <<<"$info")" != "OPEN" ]; then
+              echo closed
+              return
+            fi
+            if [ "$(jq -r .headRefOid <<<"$info")" != "$SHA" ]; then
+              echo newer
+              return
             fi
             removed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/events" \
               --jq ".[] | select(.event == \"unlabeled\" and .label.name == \"preview-build\" and .actor.login != \"github-actions[bot]\" and .created_at >= \"$AT\") | .id")
-            [ -n "$removed" ]
+            if [ -n "$removed" ]; then
+              echo unlabeled
+            fi
           }
-          if cancelled; then
-            echo "#$PR closed or lost its label while the preview was signed. Nothing to publish."
-            exit 0
-          fi
-          head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
-          if [ "$head" != "$SHA" ]; then
+          tell_newer() {
             gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
               --body "A newer commit arrived while the preview of $short was signed, so it was not published. Add the preview-build label again to build the newer commit."
+          }
+          why=$(stale)
+          if [ -n "$why" ]; then
+            echo "Not publishing #$PR at $short: $why."
+            if [ "$why" = newer ]; then tell_newer; fi
             exit 0
           fi
           mv windows/preview.exe "files/$prefix$short-x64-setup.exe"
@@ -190,11 +198,13 @@ jobs:
               gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
             done
           gh release upload "$TAG" files/* --repo "$GITHUB_REPOSITORY" --clobber
-          if cancelled; then
+          why=$(stale)
+          if [ -n "$why" ]; then
             for f in files/*; do
               gh release delete-asset "$TAG" "$(basename "$f")" --repo "$GITHUB_REPOSITORY" --yes || true
             done
-            echo "#$PR closed or lost its label during the upload. Its files are deleted."
+            echo "#$PR at $short went stale during the upload ($why). Its files are deleted."
+            if [ "$why" = newer ]; then tell_newer; fi
             exit 0
           fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"

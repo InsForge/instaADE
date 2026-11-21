@@ -29,15 +29,15 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
           key: preview-${{ matrix.target }}
@@ -59,7 +59,7 @@ jobs:
             exit 1
           fi
           cp "${files[0]}" "$RUNNER_TEMP/preview.exe"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: preview-${{ matrix.target }}
           path: ${{ runner.temp }}/${{ runner.os == 'Windows' && 'preview.exe' || 'preview.zip' }}
