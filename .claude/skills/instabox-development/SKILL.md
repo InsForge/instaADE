@@ -10,9 +10,9 @@ metadata:
 
 See the canonical development guide at [DEVELOPMENT.md](../../../DEVELOPMENT.md) in the repo root. It covers:
 
-1. **Layout**: the Rust core in `src-tauri/` holds all behavior, and the React UI in `src/` calls it only through Rust commands.
+1. **Layout**: every action on a sandbox, the account or this computer is a Rust command in `src-tauri/`, and the React UI in `src/` reaches the API only through those commands.
 2. **Running it**: `bun tauri dev` with hot reload, and the API environment variables.
-3. **Before a pull request**: the exact checks CI runs, tests with every fix, keeping `src/types.ts` in step with Rust.
+3. **Before a pull request**: the local checks, which cover CI's `check` job, tests with every fix, keeping `src/types.ts` in step with Rust.
 4. **ADEs and the sandbox mark**: the `instabox-ades` and `instabox-bridge` keys and the compatibility rules.
 5. **Preview builds**: the `preview-build` label, `.github/PREVIEW_AUTHORS`, and the two stage signing flow.
 6. **Releases**: the version bump, the `v*` tag, and where the signing secrets live.

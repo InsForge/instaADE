@@ -10,9 +10,9 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
   - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`).
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
-- `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state.
+- `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 
-The UI never calls the instabox API itself. Every action is a Rust command, so behavior lives in Rust and is tested there.
+The UI never calls the instabox API itself. Every action on a sandbox, the account or this computer is a Rust command, and is tested in Rust. The UI owns what it shows, such as the picked ADE, and is tested with Vitest.
 
 ## Run it
 
@@ -25,7 +25,7 @@ The UI never calls the instabox API itself. Every action is a Rust command, so b
 
 ## Before a pull request
 
-Run what CI runs:
+Run these locally. They cover the `check` job in CI, with clippy also over the tests. CI builds the Windows installer as well.
 
 ```bash
 bun install --frozen-lockfile
@@ -38,7 +38,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- Add a test with every fix, in Rust when the behavior is in Rust.
+- Add a test with every fix, in Rust for an action and in Vitest for the UI.
 - Keep `src/types.ts` in step with the Rust state. Rust serializes it in camelCase.
 - `main` takes changes only through pull requests. One approval and the `check` job are required.
 
