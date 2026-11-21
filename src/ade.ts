@@ -11,7 +11,6 @@ export const ADES: { id: Ade; name: string }[] = [
   { id: "t3", name: "T3 Code" },
   { id: "cmux", name: "cmux" },
   { id: "orca", name: "Orca" },
-  { id: "superset", name: "Superset" },
   { id: "paradev", name: "Paradev" },
 ];
 

@@ -33,6 +33,8 @@ toml_edit = "0.22"
 semver = "1"
 # Reads cmux's version from its app bundle. Tauri already depends on it.
 plist = "1"
+# Paradev's host id is an HMAC-SHA256. rustls already depends on it.
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"

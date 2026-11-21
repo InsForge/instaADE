@@ -56,13 +56,35 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 /// operation. Readers run on threads, so a background process that inherits a pipe
 /// cannot block us: on timeout the child is killed. After exit we wait at most one
 /// second for the pipes to close, then keep what arrived.
-pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Captured, RunError> {
+pub fn run_bounded(cmd: Command, timeout: Duration) -> Result<Captured, RunError> {
+    run(cmd, None, timeout)
+}
+
+/// `run_bounded` with `input` on the command's stdin.
+pub fn run_with_input(cmd: Command, input: &[u8], timeout: Duration) -> Result<Captured, RunError> {
+    run(cmd, Some(input), timeout)
+}
+
+fn run(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Captured, RunError> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(RunError::Spawn)?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // On a thread, so a command that never reads cannot block us; the deadline below
+        // still holds. Dropping stdin closes it, which ends the input.
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
     let (out, out_done) = spawn_reader(child.stdout.take());
     let (err, err_done) = spawn_reader(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -87,6 +109,30 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Captured, RunE
     let o = out.lock().unwrap().clone();
     let e = err.lock().unwrap().clone();
     Ok((status.code(), o, e))
+}
+
+/// A clipboard write that takes longer counts as failed.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Puts `text` on this computer's clipboard: `pbcopy` on macOS. No other platform needs it
+/// yet (only Paradev, a macOS app, asks for it).
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("Copying to the clipboard is only on macOS for now".to_string());
+    }
+    match run_with_input(
+        command("/usr/bin/pbcopy"),
+        text.as_bytes(),
+        CLIPBOARD_TIMEOUT,
+    ) {
+        Ok((Some(0), _, _)) => Ok(()),
+        Ok((code, _, err)) => Err(format!(
+            "Could not copy to the clipboard (pbcopy exited with {code:?}): {}",
+            String::from_utf8_lossy(&err).trim()
+        )),
+        Err(RunError::Spawn(e)) => Err(format!("Could not copy to the clipboard: {e}")),
+        Err(RunError::TimedOut) => Err("Copying to the clipboard took too long".to_string()),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -116,6 +162,26 @@ mod tests {
         assert!(matches!(
             run_bounded(Command::new("/nonexistent/x"), Duration::from_secs(1)),
             Err(RunError::Spawn(_))
+        ));
+    }
+
+    #[test]
+    fn the_input_reaches_stdin_and_ends() {
+        // cat exits only once its stdin closes.
+        let (code, out, _) = run_with_input(
+            Command::new("/bin/cat"),
+            b"ssh://ibssh_x@h:2222",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(out, b"ssh://ibssh_x@h:2222");
+        // A command that never reads its input still ends at the deadline.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exec sleep 10"]);
+        assert!(matches!(
+            run_with_input(cmd, &[b'x'; 1 << 20], Duration::from_millis(200)),
+            Err(RunError::TimedOut)
         ));
     }
 }

@@ -60,7 +60,7 @@ fn open_target(s: &SandboxView) -> (Ade, bool) {
     let ready = s.ades.contains(&ade)
         && match ade.open() {
             Open::Pair(_) => s.connected,
-            Open::Link(_) => true,
+            Open::Link(_) | Open::Host(_) => true,
         };
     (ade, ready)
 }
@@ -317,7 +317,7 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                         let _ = match verb.as_str() {
                             "pause" => core.pause(&sandbox).await,
                             "resume" => core.resume(&sandbox).await,
-                            "open" => core.open_in_ade(&sandbox, None).await,
+                            "open" => core.open_in_ade(&sandbox, None).await.map(drop),
                             _ => Ok(()),
                         };
                     });
@@ -430,6 +430,16 @@ mod tests {
         r.ades = vec![Ade::Cmux, Ade::T3];
         assert_eq!(open_target(&r), (Ade::Cmux, true));
         assert_eq!(open_label(Ade::Cmux, true), "Open in cmux");
+    }
+
+    #[test]
+    fn a_paradev_sandbox_opens_in_paradev_from_any_computer() {
+        // It is marked only once its host runs, and Paradev pairs nothing from here.
+        let mut r = row("a", ViewState::Paused);
+        r.connected = false;
+        r.ades = vec![Ade::Paradev];
+        assert_eq!(open_target(&r), (Ade::Paradev, true));
+        assert_eq!(open_label(Ade::Paradev, true), "Open in Paradev");
     }
 
     const SCREEN: Bounds = Bounds {

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { connectSandbox, createSandbox, getState, onState, openInAde, toErrorView } from "./api";
+import type { Opened } from "./api";
+import { finishSetupText } from "./ades";
 import type { Mode } from "./ades";
 import { agentKey } from "./common";
 import type { AgentCache, OnAgentStatus } from "./common";
@@ -115,18 +117,22 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setView(v);
   };
   const back = () => go({ name: "list" });
+  /** The one notice an open may add: an ADE whose own app finishes the setup (Paradev) says what to do there. */
+  const opened = (ade: AdeId | undefined) => (r: Opened) => {
+    if (ade && r === "finishSetupInAde") setNotice(finishSetupText(state, ade));
+  };
   /** Sets the ADE up on the sandbox, then opens it. The ADE asks to confirm in its own window. */
   const connect = (id: string, ade: AdeId) => {
-    void run(() => connectSandbox(id, ade));
+    void run(() => connectSandbox(id, ade).then(opened(ade)));
   };
   /** Opens the sandbox in the ADE. */
   const open = (id: string, ade: AdeId) => {
-    void run(() => openInAde(id, ade));
+    void run(() => openInAde(id, ade).then(opened(ade)));
   };
   const create = (args: CreateArgs, size: string) => {
     setPending({ name: args.name, size });
     go({ name: "list" });
-    void run(() => createSandbox(args));
+    void run(() => createSandbox(args).then(opened(args.ade)));
   };
   const toggleMenu = (id: string, anchor: HTMLElement) =>
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));

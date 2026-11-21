@@ -15,6 +15,11 @@ const invoke = <T,>(command: string, args?: Record<string, unknown>): Promise<T>
 /** Thin wrappers over the Tauri commands. Rejections are ErrorView objects. */
 export type Agent = "claude" | "codex";
 export type McpClient = "claudeCode" | "codex";
+/**
+ * How a create, connect or open ended. finishSetupInAde: the ADE's own host setup opened with
+ * the sandbox's SSH address on the clipboard (Paradev), so the user finishes there.
+ */
+export type Opened = "done" | "finishSetupInAde";
 
 export const getState = () => invoke<AppState>("get_state");
 export const onState = (cb: (s: AppState) => void) =>
@@ -31,14 +36,14 @@ export const createSandbox = (a: {
   autoSuspendAfterSeconds?: number;
   /** The ADE to set up; none: a plain sandbox. */
   ade?: AdeId;
-}) => invoke<void>("create_sandbox", a);
+}) => invoke<Opened>("create_sandbox", a);
 /** Sets the ADE up on the sandbox, then opens it. */
-export const connectSandbox = (id: string, ade: AdeId) => invoke<void>("connect_sandbox", { id, ade });
+export const connectSandbox = (id: string, ade: AdeId) => invoke<Opened>("connect_sandbox", { id, ade });
 export const dismissProgress = () => invoke<void>("dismiss_progress");
 /** Looks for every ADE's desktop app on this computer again. */
 export const refreshAdes = () => invoke<void>("refresh_t3");
 /** Opens the sandbox in the ADE; a sandbox without it gets it first. */
-export const openInAde = (id: string, ade: AdeId) => invoke<void>("open_in_t3", { id, ade });
+export const openInAde = (id: string, ade: AdeId) => invoke<Opened>("open_in_t3", { id, ade });
 export const pairAgain = (id: string) => invoke<void>("pair_again", { id, ade: "t3" });
 export const pause = (id: string) => invoke<void>("pause", { id });
 export const resume = (id: string) => invoke<void>("resume", { id });

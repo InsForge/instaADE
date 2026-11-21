@@ -88,6 +88,13 @@ const cmuxAde: AdeView = {
 };
 /** A Mac with T3 Code and cmux. */
 const mac: Partial<AppState> = { ades: [t3Ade, cmuxAde] };
+const paradevAde: AdeView = {
+  id: "paradev",
+  name: "Paradev",
+  shortName: "Paradev",
+  version: "2.0.11",
+  downloadUrl: "https://example.test/paradev/releases/latest",
+};
 /** No T3 Code on this computer. */
 const noT3: Partial<AppState> = { t3: null, ades: [{ ...t3Ade, version: null }] };
 /** The mode alex picked earlier on this computer. */
@@ -823,7 +830,7 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
 test("settings: update, account, the ADEs on this Mac and start at login", async () => {
   show(
     {
-      ades: [t3Ade, { ...cmuxAde, version: null }],
+      ades: [t3Ade, { ...cmuxAde, version: null }, paradevAde],
       orgs: [...sample.orgs, { id: "org-team", name: "team", tier: "pro", personal: false }],
       update: { version: "0.2.0", url: "https://example.com/v0.2.0" },
     },
@@ -835,9 +842,8 @@ test("settings: update, account, the ADEs on this Mac and start at login", async
   expect(ades.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
     "T3 Code0.1.10",
     "cmuxNot found",
+    "Paradev2.0.11",
     "OrcaComing soon",
-    "SSupersetComing soon",
-    "ParadevComing soon",
   ]);
   expect(screen.getByText("A new version of InstaBox is ready.")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Download" }));
@@ -945,10 +951,8 @@ test("the switcher lists Instabox, the ADEs on this Mac and the ones coming soon
     "T3 Code" + "0.1.10 on this Mac · on 2 sandboxes",
     "cmux" + "0.64.25 on this Mac · on 1 sandbox",
     "OrcaNot supported yetComing soon",
-    "SSupersetNot supported yetComing soon",
-    "ParadevNot supported yetComing soon",
   ]);
-  expect(items.map((b) => b.getAttribute("aria-checked"))).toEqual(["false", "true", "false", "false", "false", "false"]);
+  expect(items.map((b) => b.getAttribute("aria-checked"))).toEqual(["false", "true", "false", "false"]);
   for (const b of items.slice(3)) expect((b as HTMLButtonElement).disabled).toBe(true);
   // The checked mode has the focus, so the keyboard can walk the menu.
   expect(document.activeElement).toBe(items[1]);
@@ -1093,6 +1097,120 @@ test("a new sandbox in cmux mode sets cmux up", async () => {
   expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "cmux" }));
   await act(async () => {});
   expect(screen.queryByText(/Confirm the/)).toBeNull();
+});
+
+// ---- Paradev ----
+
+const PARADEV_NOTICE = "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";
+
+test("Paradev on a Mac: one entry in the switcher, with no Superset and not coming soon", async () => {
+  show({ ades: [t3Ade, cmuxAde, paradevAde] }, [{}, { id: "b", name: "web", ades: ["paradev"], connected: false }]);
+  await screen.findByText("dev-1");
+  await userEvent.click(switcher());
+  const items = within(screen.getByRole("menu", { name: "Open sandboxes in" })).getAllByRole("menuitemradio");
+  expect(items.map((b) => b.textContent)).toEqual([
+    "InstaBox" + "Sandboxes only, no ADE",
+    "T3 Code" + "0.1.10 on this Mac · on 1 sandbox",
+    "cmux" + "0.64.25 on this Mac",
+    "Paradev" + "2.0.11 on this Mac · on 1 sandbox",
+    "OrcaNot supported yetComing soon",
+  ]);
+  expect(document.body.textContent).not.toMatch(/Superset/);
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /Paradev/ }));
+  expect(localStorage.getItem(modeKey("alex"))).toBe("paradev");
+  expect(popover().dataset.mode).toBe("paradev");
+  expect(theme()).toBe("paradev");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: Paradev. Switch ADE");
+});
+
+test("Paradev rows: Install says what to do in Paradev, Open opens it with no notice", async () => {
+  picked("paradev");
+  show(
+    { ades: [t3Ade, cmuxAde, paradevAde] },
+    [
+      { id: "a", name: "dev-1", ades: ["t3"] },
+      // Marked once its host ran. Paradev pairs nothing from here, so it is not "connected".
+      { id: "b", name: "web", ades: ["paradev"], connected: false, state: "paused" },
+    ],
+    { connect_sandbox: () => "finishSetupInAde", open_in_t3: () => "done" },
+  );
+  const dev = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
+  const install = dev.getByRole("button", { name: "Connect" });
+  expect(install.title).toBe("Connect to Paradev");
+  await userEvent.click(install);
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "paradev" });
+  // The one notice: the user finishes the setup in Paradev.
+  expect((await screen.findByRole("status")).textContent).toBe(PARADEV_NOTICE);
+
+  const web = within(rowOf("web"));
+  expect(web.getByRole("img", { name: "Paradev" })).toBeTruthy();
+  expect(web.getByText("connected")).toBeTruthy();
+  expect(web.queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(screen.getByText("web"));
+  // A new screen drops the notice.
+  expect(screen.queryByText(PARADEV_NOTICE)).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Open in Paradev" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "paradev" });
+  await act(async () => {});
+  expect(screen.queryByText(PARADEV_NOTICE)).toBeNull();
+  // No T3 pairing or reinstall; Reconnect checks the host again.
+  expect(screen.queryByRole("button", { name: /Reinstall|Pair again/ })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "b", ade: "paradev" });
+  expect((await screen.findByRole("status")).textContent).toBe(PARADEV_NOTICE);
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+
+  await openMenu("web");
+  expect(menuItems()).toEqual([
+    "Open in Paradev",
+    "Resume",
+    "Resize4 vCPU / 8 GB",
+    "Auto sleepAfter 30 min",
+    "Copy SSH command",
+    "Open in Terminal",
+    "Delete sandbox",
+  ]);
+  await userEvent.keyboard("{Escape}");
+  await openMenu("dev-1");
+  expect(menuItems()[0]).toBe("Install Paradev");
+});
+
+test("a new sandbox in Paradev mode says Paradev finishes the setup", async () => {
+  picked("paradev");
+  show({ ades: [t3Ade, paradevAde], tier: "pro" }, [{}], { create_sandbox: () => "finishSetupInAde" });
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText("Copies the SSH address of the new sandbox and opens Paradev, where you set it up as a host.")).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "paradev" }));
+  expect((await screen.findByRole("status")).textContent).toBe(PARADEV_NOTICE);
+});
+
+test("Windows has no Paradev: not in the switcher, a Paradev pick falls back, details say so", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    // The back end lists only the ADEs that run here.
+    show({ ades: [t3Ade] }, [{ ades: ["t3", "paradev"] }]);
+    await userEvent.click(await screen.findByRole("button", { name: /Switch ADE/ }));
+    const names = within(screen.getByRole("menu")).getAllByRole("menuitemradio").map((b) => b.textContent);
+    expect(names.some((n) => n?.includes("Paradev"))).toBe(false);
+    await userEvent.keyboard("{Escape}");
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(within(screen.getByRole("list", { name: "ADEs on this PC" })).queryByText("Paradev")).toBeNull();
+    cleanup();
+
+    // A Paradev pick saved on a Mac falls back to plain Instabox here.
+    picked("paradev");
+    show({ ades: [t3Ade] }, [{ ades: ["t3", "paradev"] }]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: InstaBox. Switch ADE");
+    await userEvent.click(screen.getByText("dev-1"));
+    const section = screen.getByRole("region", { name: "Connected ADE" });
+    const paradev = within(within(section).getByText("Paradev").closest(".connected-ade-row") as HTMLElement);
+    expect(paradev.queryByRole("button", { name: "Open in Paradev" })).toBeNull();
+    expect(paradev.getByText("Not available on this PC")).toBeTruthy();
+  } finally {
+    ua.mockRestore();
+  }
 });
 
 // ---- first run and the default mode ----

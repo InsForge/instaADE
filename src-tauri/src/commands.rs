@@ -1,9 +1,12 @@
 //! The commands the UI calls. Each one parses its arguments and hands off to `Core`.
 //! Errors are `ErrorView` values the UI can branch on.
 //!
-//! An optional `ade` argument picks the ADE (`"t3"`, `"cmux"`). Without it a command uses the
-//! sandbox's own ADE (the first in its mark), else the default (T3); `create_sandbox` without
-//! it creates a plain sandbox, with no ADE.
+//! An optional `ade` argument picks the ADE (`"t3"`, `"cmux"`, `"paradev"`). Without it a
+//! command uses the sandbox's own ADE (the first in its mark), else the default (T3);
+//! `create_sandbox` without it creates a plain sandbox, with no ADE.
+//!
+//! `create_sandbox`, `connect_sandbox` and `open_in_t3` answer how the open ended (`Opened`),
+//! so the UI can say when the user must finish the setup in the ADE.
 
 use std::sync::Arc;
 
@@ -12,7 +15,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::ade::Ade;
 use crate::agents::Agent;
-use crate::app::{AppState, Core, CreateArgs, parse_mcp_client, parse_provider};
+use crate::app::{AppState, Core, CreateArgs, Opened, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
 
 type Shared<'a> = State<'a, Arc<Core>>;
@@ -51,7 +54,7 @@ pub async fn create_sandbox(
     memMiB: u32,
     auto_suspend_after_seconds: Option<i64>,
     ade: Option<Ade>,
-) -> Res<()> {
+) -> Res<Opened> {
     core.inner()
         .clone()
         .create_sandbox(CreateArgs {
@@ -66,7 +69,7 @@ pub async fn create_sandbox(
 }
 
 #[tauri::command]
-pub async fn connect_sandbox(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+pub async fn connect_sandbox(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Opened> {
     core.inner().clone().connect_sandbox(&id, ade).await
 }
 
@@ -76,16 +79,17 @@ pub fn dismiss_progress(core: Shared<'_>) {
     core.dismiss_progress();
 }
 
-/// Looks for the ADEs' desktop apps (T3 Code, cmux) on this computer again, now.
+/// Looks for the ADEs' desktop apps (T3 Code, cmux, Paradev) on this computer again, now.
 #[tauri::command]
 pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
     core.inner().clone().refresh_ades().await
 }
 
-/// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken and synced) or
-/// cmux (its link, with an SSH token). A sandbox without the ADE gets it first.
+/// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken and synced),
+/// cmux (its link, with an SSH token) or Paradev (the sandbox is woken, then its host opens).
+/// A sandbox without the ADE gets it first.
 #[tauri::command]
-pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Opened> {
     core.inner().clone().open_in_ade(&id, ade).await
 }
 

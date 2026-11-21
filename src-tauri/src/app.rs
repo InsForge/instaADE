@@ -48,6 +48,8 @@ pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send +
 pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
 /// Checks that the app at a path is the ADE's own (`Ade::verify`).
 pub type Verifier = Arc<dyn Fn(Ade, &Path) -> bool + Send + Sync>;
+/// Puts text on this computer's clipboard (`process::copy_to_clipboard`).
+pub type Copier = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -113,6 +115,18 @@ impl AdeView {
             download_url: ade.download_url(),
         }
     }
+}
+
+/// How a create, connect or open ended on this computer. The UI says what to do next when the
+/// user must act in the ADE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Opened {
+    /// The ADE opened the sandbox, or a plain create had nothing to open.
+    Done,
+    /// A host ADE (Paradev) opened its own host setup, with the sandbox's SSH address on the
+    /// clipboard. The user finishes the setup there.
+    FinishSetupInAde,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,7 +501,8 @@ pub fn newer_release(current: &str, body: &str) -> Option<UpdateInfo> {
 
 /// URLs the UI may ask the app to open in the default handler: https, and the links of every
 /// pairing ADE's app. A link ADE's link (cmux) holds an SSH token, so only `open_link` opens
-/// one, and only in the app it found.
+/// one, and only in the app it found. A host ADE's links (Paradev) open only in its checked
+/// app too (`open_host`).
 pub fn allowed_url(url: &str) -> bool {
     Url::parse(url).is_ok_and(|u| {
         u.scheme() == "https"
@@ -700,6 +715,8 @@ pub struct Core {
     /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
     locate: Locator,
     verify: Verifier,
+    /// The clipboard; a test puts its own in place.
+    copy: Copier,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -809,6 +826,7 @@ impl Core {
             open,
             locate: Arc::new(Ade::locate),
             verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
+            copy: Arc::new(crate::process::copy_to_clipboard),
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -830,6 +848,13 @@ impl Core {
     fn with_apps(mut self, locate: Locator, verify: Verifier) -> Core {
         self.locate = locate;
         self.verify = verify;
+        self
+    }
+
+    /// Test only: puts text on `copy` instead of this computer's clipboard.
+    #[cfg(test)]
+    fn with_clipboard(mut self, copy: Copier) -> Core {
+        self.copy = copy;
         self
     }
 
@@ -1419,7 +1444,7 @@ impl Core {
             .ok_or_else(unknown_ade)
     }
 
-    pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<()> {
+    pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<Opened> {
         let (client, account, org_id) = match self.signed_in_with(|i| i.state.org_id.clone()) {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
@@ -1454,8 +1479,10 @@ impl Core {
 
     /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
     /// installed (never an older version) and paired, then its app opens with the pairing
-    /// link; a link ADE (cmux) gets its prep command, then its link opens.
-    pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
+    /// link; a link ADE (cmux) gets its prep command, then its link opens. A host ADE
+    /// (Paradev) is checked: once its host runs, the sandbox is marked and opens in it; else
+    /// the user sets the host up in the app (`open_host`).
+    pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<Opened> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
@@ -1483,8 +1510,9 @@ impl Core {
     /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
     /// with it: wake it, sync the ADE, open the app (no setup, no new pairing). A link ADE
     /// (cmux) on a sandbox marked with it: open its link with an SSH token (the link wakes the
-    /// sandbox). Anything else goes through the connect flow.
-    pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
+    /// sandbox). A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not),
+    /// then open its link. Anything else goes through the connect flow.
+    pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<Opened> {
         let snapshot = self.signed_in_with(|i| {
             // None: the sandbox is marked only with ADEs this build does not know.
             let ade = asked.or_else(|| i.data.ade_of(id));
@@ -1493,7 +1521,7 @@ impl Core {
                 i.data.ades_of(id).contains(&a)
                     && match a.open() {
                         Open::Pair(_) => connected,
-                        Open::Link(_) => true,
+                        Open::Link(_) | Open::Host(_) => true,
                     }
             });
             (ready, ade, ade.and_then(|a| i.sync_version(a)))
@@ -1503,8 +1531,23 @@ impl Core {
             _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
+            if let Open::Host(_) = ade.open() {
+                // The app is looked for before the sandbox wakes, and checked again right
+                // before it gets the link.
+                self.desktop_version(ade).await?;
+                sandbox::ensure_running(&client, id)
+                    .await
+                    .map_err(ErrorView::from)?;
+                let link = connect::host_link(&client, ade, id)
+                    .await
+                    .map_err(ErrorView::from)?;
+                return self.open_host(ade, id, Some(&link), account).await;
+            }
             let Open::Pair(p) = ade.open() else {
-                return self.open_link(ade, id, account).await;
+                return self
+                    .open_link(ade, id, account)
+                    .await
+                    .map(|()| Opened::Done);
             };
             sandbox::ensure_running(&client, id)
                 .await
@@ -1513,9 +1556,35 @@ impl Core {
                 let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            self.open_for(account, p.app_url)
+            self.open_for(account, p.app_url).map(|()| Opened::Done)
         };
         self.act(account, r).await
+    }
+
+    /// The ADE's own app on this computer, found and checked again (identifier and signature)
+    /// right before it gets anything. An error when there is none or it fails the check.
+    async fn checked_app(&self, ade: Ade) -> Res<PathBuf> {
+        let (locate, verify) = (self.locate.clone(), self.verify.clone());
+        let checked = tokio::task::spawn_blocking(move || {
+            locate(ade).map(|app| {
+                let ok = verify(ade, &app);
+                (app, ok)
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        match checked {
+            Some((app, true)) => Ok(app),
+            Some((_, false)) => Err(ErrorView::other(format!(
+                "Could not verify the {} app. Install it again from its official download.",
+                ade.name()
+            ))),
+            None => Err(ErrorView::other(format!(
+                "{} is not installed. Install it first.",
+                ade.name()
+            ))),
+        }
     }
 
     /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
@@ -1528,31 +1597,7 @@ impl Core {
         let Open::Link(l) = ade.open() else {
             return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
         };
-        let (locate, verify) = (self.locate.clone(), self.verify.clone());
-        let checked = tokio::task::spawn_blocking(move || {
-            locate(ade).map(|app| {
-                let ok = verify(ade, &app);
-                (app, ok)
-            })
-        })
-        .await
-        .ok()
-        .flatten();
-        let app = match checked {
-            Some((app, true)) => app,
-            Some((_, false)) => {
-                return Err(ErrorView::other(format!(
-                    "Could not verify the {} app. Install it again from its official download.",
-                    ade.name()
-                )));
-            }
-            None => {
-                return Err(ErrorView::other(format!(
-                    "{} is not installed. Install it first.",
-                    ade.name()
-                )));
-            }
-        };
+        let app = self.checked_app(ade).await?;
         let (client, title) = self
             .read_in(account, |i| {
                 let title = i
@@ -1575,6 +1620,50 @@ impl Core {
             title: &title,
         });
         self.open_with(account, &link, Some(&app))
+    }
+
+    /// Opens a host ADE (Paradev) for running sandbox `id`, only in the ADE's own app, checked
+    /// again right before. With the sandbox's `link` (its host runs), it opens the sandbox in
+    /// the app. Without one, the user sets the host up in the app: the SSH address, with an
+    /// SSH token from `ssh::token`, goes on the clipboard and the app opens its host setup.
+    /// With no app, or one that fails the check, no token is made, nothing is copied and
+    /// nothing opens.
+    async fn open_host(
+        self: &Arc<Self>,
+        ade: Ade,
+        id: &str,
+        link: Option<&str>,
+        account: u64,
+    ) -> Res<Opened> {
+        let Open::Host(h) = ade.open() else {
+            return Err(ErrorView::other(format!(
+                "{} does not run sandboxes as hosts",
+                ade.name()
+            )));
+        };
+        let app = self.checked_app(ade).await?;
+        if let Some(link) = link {
+            self.open_with(account, link, Some(&app))?;
+            return Ok(Opened::Done);
+        }
+        let client = self
+            .read_in(account, |i| i.client.clone())
+            .flatten()
+            .ok_or_else(account_changed)?;
+        let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+            .await
+            .map_err(ErrorView::from)?;
+        let address = (h.ssh_address)(&SshLogin {
+            host: &t.host,
+            port: t.port,
+            user: &t.token,
+            title: "",
+        });
+        guarded(&self.gate(account), || (self.copy)(&address))
+            .ok_or_else(account_changed)?
+            .map_err(ErrorView::other)?;
+        self.open_with(account, h.setup_link, Some(&app))?;
+        Ok(Opened::FinishSetupInAde)
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -1684,11 +1773,11 @@ impl Core {
         self: &Arc<Self>,
         r: Result<String, SandboxError>,
         account: u64,
-    ) -> Res<()> {
+    ) -> Res<Opened> {
         if self.account() != account {
-            return Ok(());
+            return Ok(Opened::Done);
         }
-        let r = r.map(drop).map_err(ErrorView::from);
+        let r = r.map(|_| Opened::Done).map_err(ErrorView::from);
         self.update_in(account, Inner::clear_progress);
         let out = self.settle_in(account, r);
         if self.account() == account {
@@ -1698,18 +1787,18 @@ impl Core {
     }
 
     /// Shows the result of a create or connect that began under `account`, and opens the
-    /// ADE: the pairing link, or a link ADE's link. Every write checks the account as part of
-    /// the write, so a change at any point drops the rest.
+    /// ADE: the pairing link, a link ADE's link, or a host ADE's link or host setup. Every
+    /// write checks the account as part of the write, so a change at any point drops the rest.
     async fn finish_connect(
         self: &Arc<Self>,
         ade: Ade,
         r: Result<Connected, SandboxError>,
         version: &str,
         account: u64,
-    ) -> Res<()> {
+    ) -> Res<Opened> {
         if self.account() != account {
             // Signed out or switched account while this ran: drop the result.
-            return Ok(());
+            return Ok(Opened::Done);
         }
         self.step("finish");
         let out = match r {
@@ -1730,8 +1819,15 @@ impl Core {
                     i.rebuild();
                 });
                 let opened = match &c.link {
-                    Some(link) => self.open_for(account, link),
-                    None => self.open_link(ade, &c.machine_id, account).await,
+                    _ if matches!(ade.open(), Open::Host(_)) => {
+                        self.open_host(ade, &c.machine_id, c.link.as_deref(), account)
+                            .await
+                    }
+                    Some(link) => self.open_for(account, link).map(|()| Opened::Done),
+                    None => self
+                        .open_link(ade, &c.machine_id, account)
+                        .await
+                        .map(|()| Opened::Done),
                 };
                 let out = self.settle_in(account, opened);
                 // The connected set says a pairing ADE (T3) was paired from here. A link ADE
@@ -2687,11 +2783,16 @@ mod tests {
     fn ades_hold_the_desktop_versions_and_t3_mirrors_its_own() {
         let core = core_with(Arc::new(MemoryConnectedStore::default()));
         let s = core.state();
-        // Listed from the start; nothing is found before the first look. cmux is macOS only.
+        // Listed from the start; nothing is found before the first look. cmux and Paradev are
+        // macOS only.
         if cfg!(target_os = "macos") {
             assert_eq!(
                 s.ades,
-                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Cmux, None)]
+                vec![
+                    AdeView::new(Ade::T3, None),
+                    AdeView::new(Ade::Cmux, None),
+                    AdeView::new(Ade::Paradev, None)
+                ]
             );
         }
         if cfg!(windows) {
@@ -2846,6 +2947,11 @@ mod tests {
                     };
                     // It holds an SSH token: only `open_link` opens it, in the app it found.
                     assert!(!allowed_url(&(l.link)(&login)), "{a:?}");
+                }
+                Open::Host(h) => {
+                    // Only `open_host` opens them, in the app it checked.
+                    assert!(!allowed_url(h.setup_link), "{a:?}");
+                    assert!(!allowed_url(&(h.link)("0123456789abcdef0123456789abcdef")));
                 }
             }
         }
@@ -4030,6 +4136,262 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
         assert!(execs.iter().any(|e| e.contains("v=0.1.11")), "T3 setup ran");
+    }
+
+    // ---- Paradev ----
+
+    #[test]
+    fn the_ui_reads_how_an_open_ended() {
+        // src/api.ts: type Opened = "done" | "finishSetupInAde".
+        assert_eq!(
+            serde_json::to_value([Opened::Done, Opened::FinishSetupInAde]).unwrap(),
+            serde_json::json!(["done", "finishSetupInAde"])
+        );
+    }
+
+    /// The link to the host of the sandbox whose machine id `paradev_server` reports.
+    const PARADEV_LINK: &str = "superset://new-workspace?host=977b9d5310b351a8e85d4a4b333d5481";
+
+    /// `cmux_server`, whose exec answers Paradev's host check with the host service `state`.
+    async fn paradev_server(
+        metadata: serde_json::Value,
+        state: &str,
+    ) -> (wiremock::MockServer, Url) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) = cmux_server(metadata).await;
+        let stdout = format!("service={state}\nmachineid=0123456789abcdef0123456789abcdef\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("superset-host"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"stdout": stdout, "stderr": "", "exitCode": 0}),
+                ),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        (server, base)
+    }
+
+    /// A signed-in core with a recording opener, a recording clipboard and a Superset.app as
+    /// `here` says (as for cmux), found at the last look unless it is missing.
+    struct ParadevCore {
+        core: Arc<Core>,
+        opened: Arc<Mutex<Vec<String>>>,
+        copied: Arc<Mutex<Vec<String>>>,
+        app: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn paradev_core(base: &Url, here: CmuxHere) -> ParadevCore {
+        let dir = tempfile::tempdir().unwrap();
+        let id = if here == CmuxHere::OtherId {
+            "com.superset.desktop.canary"
+        } else {
+            ade::paradev::BUNDLE_ID
+        };
+        let app = ade::paradev::test_bundle(dir.path(), id, "2.0.11", false);
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        let copied = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = copied.clone();
+        let found = app.clone();
+        let core = Arc::new(
+            core.with_apps(
+                Arc::new(move |ade| {
+                    (here != CmuxHere::Missing && ade == Ade::Paradev).then(|| found.clone())
+                }),
+                Arc::new(move |ade, path| {
+                    ade == Ade::Paradev
+                        && ade::paradev::verify_with(path, |_| here != CmuxHere::BadSignature)
+                }),
+            )
+            .with_clipboard(Arc::new(move |text: &str| {
+                sink.lock().unwrap().push(text.to_string());
+                Ok(())
+            })),
+        );
+        sign_in_as(&core, base, 7);
+        if here != CmuxHere::Missing {
+            core.update(|i| i.state.set_desktop(Ade::Paradev, Some("2.0.11".into())));
+        }
+        ParadevCore {
+            core,
+            opened,
+            copied,
+            app,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn installing_paradev_copies_the_ssh_address_and_opens_its_host_setup_in_the_app() {
+        let (server, base) = paradev_server(serde_json::json!({}), "inactive").await;
+        let ParadevCore {
+            core,
+            opened,
+            copied,
+            app,
+            _dir,
+        } = paradev_core(&base, CmuxHere::Real);
+        core.refresh(false).await;
+        let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(Opened::FinishSetupInAde));
+        // The token is the SSH user, at the gateway's host and port.
+        assert_eq!(
+            *copied.lock().unwrap(),
+            ["ssh://ibssh_new@ssh.example.test:2222"]
+        );
+        // Only in the Paradev app it checked, never the default handler of superset:// links.
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!("superset://settings/hosts in {}", app.display())]
+        );
+        let r = requests(&server).await;
+        assert_eq!(
+            r.iter().filter(|x| x.ends_with("/exec")).count(),
+            1,
+            "the check: {r:?}"
+        );
+        assert_eq!(
+            r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(),
+            1,
+            "{r:?}"
+        );
+        assert!(
+            !r.iter().any(|x| x.starts_with("PATCH")),
+            "not marked: {r:?}"
+        );
+        let s = core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        assert_eq!(s.sandboxes[0].ades, vec![]);
+        // Paradev pairs nothing from here.
+        assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn installing_paradev_once_its_host_runs_marks_the_sandbox_and_opens_it() {
+        let (server, base) =
+            paradev_server(serde_json::json!({"instabox-bridge": "t3"}), "active").await;
+        let ParadevCore {
+            core,
+            opened,
+            copied,
+            app,
+            _dir,
+        } = paradev_core(&base, CmuxHere::Real);
+        core.refresh(false).await;
+        let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(Opened::Done));
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!("{PARADEV_LINK} in {}", app.display())]
+        );
+        assert!(copied.lock().unwrap().is_empty(), "nothing to paste");
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ssh-tokens")));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,paradev");
+        assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn open_in_paradev_wakes_the_sandbox_then_opens_its_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let md = serde_json::json!({"instabox-bridge": "paradev", "instabox-ades": "paradev"});
+        let (server, base) = paradev_server(md.clone(), "active").await;
+        // Asleep: Paradev would not wake it.
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m1", "name": "dev 1", "state": "suspended",
+                "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+                "metadata": md, "orgId": "org-me"
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/resume"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "id": "op1", "machineId": "m1", "type": "resume", "state": "queued", "machine": null
+            })))
+            .mount(&server)
+            .await;
+        let ParadevCore {
+            core,
+            opened,
+            copied,
+            app,
+            _dir,
+        } = paradev_core(&base, CmuxHere::Real);
+        core.refresh(false).await;
+        let r = core.open_in_ade("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(Opened::Done));
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!("{PARADEV_LINK} in {}", app.display())]
+        );
+        assert!(copied.lock().unwrap().is_empty());
+        let r = requests(&server).await;
+        let at = |p: &str| {
+            r.iter()
+                .position(|x| x == p)
+                .unwrap_or_else(|| panic!("{p}: {r:?}"))
+        };
+        assert!(at("POST /v1/machines/m1/resume") < at("POST /v1/machines/m1/exec"));
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        assert!(!r.iter().any(|x| x.ends_with("/ssh-tokens")), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn paradev_gets_nothing_without_its_real_app() {
+        for here in [CmuxHere::Missing, CmuxHere::OtherId, CmuxHere::BadSignature] {
+            for (md, open) in [
+                (serde_json::json!({}), false),
+                (serde_json::json!({"instabox-bridge": "paradev"}), true),
+            ] {
+                let (server, base) = paradev_server(md, "inactive").await;
+                let ParadevCore {
+                    core,
+                    opened,
+                    copied,
+                    app: _,
+                    _dir,
+                } = paradev_core(&base, here);
+                core.refresh(false).await;
+                let e = if open {
+                    core.open_in_ade("m1", Some(Ade::Paradev)).await
+                } else {
+                    core.connect_sandbox("m1", Some(Ade::Paradev)).await
+                }
+                .unwrap_err();
+                let want = if here == CmuxHere::Missing {
+                    "Paradev is not installed. Install it first."
+                } else {
+                    "Could not verify the Paradev app. Install it again from its official download."
+                };
+                assert_eq!(e.message, want, "{open}");
+                assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+                assert!(copied.lock().unwrap().is_empty(), "nothing copied");
+                let r = requests(&server).await;
+                assert!(
+                    !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+                    "no token: {r:?}"
+                );
+                assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+            }
+        }
     }
 
     #[tokio::test]
