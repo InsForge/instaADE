@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { HeroCube } from "./hero/HeroCube";
 import symbol from "./assets/main-view/instabox-symbol.svg";
-import wordmark from "./assets/main-view/instabox-wordmark.svg";
 import { adeLogoUrl } from "./hero/ade-logo";
 import unfold from "./assets/main-view/unfold.svg";
 import { ADES } from "./ade";
@@ -14,13 +13,14 @@ function AdeLogo({ ade }: { ade: Ade }) {
   return <span className="ade-logo" data-ade={ade} aria-hidden="true"><img src={adeLogoUrl(ade)} alt="" /></span>;
 }
 
-export default function MainHeader({ ade, onAdeChange }: { ade: Ade; onAdeChange: (ade: Ade) => void }) {
+export default function MainHeader({ ade, onAdeChange, showHero = false }: { ade: Ade; onAdeChange: (ade: Ade) => void; showHero?: boolean }) {
   const selected = ADES.find((item) => item.id === ade)!;
   const settings = useHeroSettings(ade);
   const toolbar = useRef<HTMLElement>(null);
   const [stuck, setStuck] = useState(false);
 
   useEffect(() => {
+    if (!showHero) return;
     const nav = toolbar.current;
     const scroll = nav?.closest(".scroll");
     const heading = scroll?.querySelector(".list-head");
@@ -34,14 +34,13 @@ export default function MainHeader({ ade, onAdeChange }: { ade: Ade; onAdeChange
       scroll.removeEventListener("scroll", update);
       window.removeEventListener("resize", update);
     };
-  }, []);
+  }, [showHero]);
 
   return (
     <>
-      <header ref={toolbar} className="main-hero-toolbar" data-stuck={stuck}>
+      <header ref={toolbar} className={`main-hero-toolbar${showHero ? "" : " main-nav-compact"}`} data-stuck={stuck}>
         <div className="main-wordmark" role="img" aria-label="Instabox">
           <img className="main-wordmark-symbol" src={symbol} alt="" />
-          <img className="main-wordmark-text" src={wordmark} alt="" />
         </div>
         <SelectMenu className="ade-picker" label="Development environment" value={ade}
           onChange={(value) => onAdeChange(value as Ade)}
@@ -51,10 +50,10 @@ export default function MainHeader({ ade, onAdeChange }: { ade: Ade; onAdeChange
           <img src={unfold} alt="" />
         </SelectMenu>
       </header>
-      <div className="main-hero" style={settings.style}>
+      {showHero && <div className="main-hero" style={settings.style}>
         <HeroAtmosphere ade={ade} patternSettings={settings.values} />
         <HeroCube ade={ade} />
-      </div>
+      </div>}
     </>
   );
 }

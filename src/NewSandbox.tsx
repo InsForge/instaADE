@@ -5,6 +5,7 @@ import { thisComputer } from "./common";
 import type { Run } from "./common";
 import Progress from "./Progress";
 import type { AppState, SleepChoice } from "./types";
+import { adeName, type Ade } from "./ade";
 
 export type CreateArgs = Parameters<typeof createSandbox>[0];
 
@@ -18,6 +19,7 @@ const FREE_SIZE = "4 vCPU / 8 GB";
 
 interface Props {
   state: AppState;
+  ade?: Ade;
   run: Run;
   onConnect: (id: string) => void;
   /** Starts the create; the app returns to the list. */
@@ -27,7 +29,7 @@ interface Props {
 
 const cols = (n: number) => ({ gridTemplateColumns: `repeat(${n <= 3 ? Math.max(n, 1) : 2}, minmax(0, 1fr))` });
 
-export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: Props) {
+export default function NewSandbox({ state, ade = "t3", run, onConnect, onCreate, onBack }: Props) {
   const free = state.tier === "free";
   const fromId = useId();
   const sizeId = useId();
@@ -148,7 +150,9 @@ export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: 
           </div>
 
           <p className="info">
-            Installs T3{state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on {thisComputer()}. Then the sandbox opens in T3 Code.
+            {ade === "t3"
+              ? <>Installs T3{state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on {thisComputer()}. Then the sandbox opens in T3 Code.</>
+              : <>Preview a new sandbox for {adeName(ade)}. Creation is not available for this placeholder environment.</>}
           </p>
 
           {state.progress && (

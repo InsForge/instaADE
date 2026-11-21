@@ -159,16 +159,20 @@ test("the ADE placeholder makes no API calls and the footer switches workspaces"
   expect(screen.getByRole("heading", { name: "No sandboxes" })).toBeTruthy();
   expect(screen.queryByText("dev-1")).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
+  expect(screen.getByRole("button", { name: "Create sandbox" })).toBeTruthy();
+  expect(screen.getByText(/Preview a new sandbox for Orca/)).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "orca-preview");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(screen.getByText(/This environment is a placeholder/)).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Create sandbox" })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
-  await userEvent.click(ade);
+  await userEvent.click(screen.getByRole("combobox", { name: "Development environment" }));
   await userEvent.click(screen.getByRole("option", { name: "cmux" }));
   expect(screen.getByText("cmux is not installed on this Mac")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Install" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
 
-  await userEvent.click(ade);
+  await userEvent.click(screen.getByRole("combobox", { name: "Development environment" }));
   await userEvent.click(screen.getByRole("option", { name: "Paradev" }));
   expect(screen.getByRole("heading", { name: "Sandboxes 4" })).toBeTruthy();
   expect(screen.queryByText("dev-1")).toBeNull();
@@ -195,6 +199,30 @@ test("the ADE placeholder makes no API calls and the footer switches workspaces"
   expect(screen.queryByText("dev-workspace")).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Pause dev-1" }));
   expect(invoke).toHaveBeenCalledWith("pause", { id: "a" });
+});
+
+test.each(["cmux", "Paradev"])("%s placeholder detail and create pages open without native machine calls", async (adeName) => {
+  show({}, [{}]);
+  await userEvent.click(await screen.findByRole("combobox", { name: "Development environment" }));
+  const before = invoke.mock.calls.length;
+  await userEvent.click(screen.getByRole("option", { name: adeName }));
+  await userEvent.click(screen.getByText("dev-workspace"));
+  expect(screen.getByRole("heading", { name: "Power" })).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Agents" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: `Connect to ${adeName}` })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Connect to T3 Code" })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Pause" }));
+  expect(screen.getByText(/This environment is a placeholder/)).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  expect(screen.getByRole("combobox", { name: "Development environment" }).getAttribute("title")).toBe(adeName);
+  await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText(new RegExp(`Preview a new sandbox for ${adeName}`))).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "sample-machine");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(screen.getByText(/This environment is a placeholder/)).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("heading", { name: /Sandboxes/ })).toBeTruthy();
+  expect(invoke.mock.calls.length).toBe(before);
 });
 
 test("clicking a row opens its details and Back returns to the list", async () => {

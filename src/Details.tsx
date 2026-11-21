@@ -23,11 +23,13 @@ import Progress from "./Progress";
 import type { AppState, SandboxView } from "./types";
 import claudeLogo from "./assets/agents/claude-code.svg";
 import codexLogo from "./assets/agents/codex.svg";
+import { adeName, type Ade } from "./ade";
 
 const agentLogos: Record<Agent, string> = { claude: claudeLogo, codex: codexLogo };
 
 interface Props {
   state: AppState;
+  ade?: Ade;
   sandbox: SandboxView;
   run: Run;
   agents: AgentCache;
@@ -84,7 +86,7 @@ function AgentRow({ id, running, agent, label, signedIn, run, onStatus }: AgentR
 /** The SSH box: nothing asked yet, the login command, or why it could not be made. */
 type Ssh = { command: string } | { error: string } | null;
 
-export default function Details({ state, sandbox: s, run, agents, onAgentStatus, onConnect }: Props) {
+export default function Details({ state, ade = "t3", sandbox: s, run, agents, onAgentStatus, onConnect }: Props) {
   const free = isFree(s, state.tier);
   const running = s.state === "running";
   const sizeId = useId();
@@ -131,7 +133,7 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
     setSleepPick(v);
     void run(() => setAutoSleep(s.id, v)).then(() => setSleepPick(null));
   };
-  const relation = t3Relation(s, state.t3);
+  const relation = ade === "t3" ? t3Relation(s, state.t3) : null;
 
   return (
     <>
@@ -145,8 +147,8 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
             </div>
             <div className="grid2">
               <div className="fact">
-                <span className="small muted">T3</span>
-                <span className="strong">{s.t3Version ?? (s.connected ? "Unknown" : "Not installed")}</span>
+                <span className="small muted">{ade === "t3" ? "T3" : adeName(ade)}</span>
+                <span className="strong">{ade === "t3" ? s.t3Version ?? (s.connected ? "Unknown" : "Not installed") : "Preview"}</span>
                 {relation && <span className="small muted">{relation}</span>}
               </div>
               <div className="fact">
@@ -174,11 +176,11 @@ export default function Details({ state, sandbox: s, run, agents, onAgentStatus,
 
           {s.connected ? (
             <button className="btn primary lg" onClick={() => run(() => openInT3(s.id))}>
-              Open in T3 Code
+              Open in {adeName(ade)}
             </button>
           ) : (
             <button className="btn primary lg" onClick={() => onConnect(s.id)}>
-              Connect to T3 Code
+              Connect to {adeName(ade)}
             </button>
           )}
 

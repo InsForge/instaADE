@@ -10,7 +10,7 @@ createRoot(document.getElementById("root")!).render(
     {isBrowserPreview ? (
       <div className="browser-preview">
         <p className="preview-note">Browser preview · Sample data<br />UI changes reload automatically. Refresh to reset.</p>
-        <App />
+        <App showHero={new URLSearchParams(window.location.search).get("layout") === "hero"} />
       </div>
     ) : <App />}
   </StrictMode>,

@@ -176,6 +176,7 @@ function PendingRow({ state, run, pending, onConnect }: { state: AppState; run: 
 
 interface Props {
   header: ReactNode;
+  showHero?: boolean;
   ade: Ade;
   adeMissing: boolean;
   adeConnections: Record<string, AdeConnection> | null;
@@ -193,27 +194,28 @@ interface Props {
   onAgentStatus: OnAgentStatus;
 }
 
-export default function SandboxList({ header, state, run, agents, pending, menuFor, onNew, onSettings, onConnect, onDetails, onMenu, onAgentStatus, onAdeConnect, ade, adeMissing, adeConnections }: Props) {
+export default function SandboxList({ header, showHero = false, state, run, agents, pending, menuFor, onNew, onSettings, onConnect, onDetails, onMenu, onAgentStatus, onAdeConnect, ade, adeMissing, adeConnections }: Props) {
   const p = state.progress;
   const showPending = p !== null && !state.sandboxes.some((s) => s.id === p.machineId);
   const empty = state.sandboxes.length === 0 && !showPending;
   const organization = state.orgs.find((o) => o.id === state.orgId);
   const workspaceName = organization?.name ?? state.login ?? "Workspace";
+  const heading = !empty && <div className="list-head">
+    <div className="list-heading">
+      <h1 className="list-title">
+        Sandboxes <span className="muted">{state.sandboxes.length}</span>
+      </h1>
+    </div>
+    <button className="btn primary" onClick={onNew}>
+      <Plus />
+      New sandbox
+    </button>
+  </div>;
   return (
     <>
-      <div className="scroll main-scroll">
-        {header}
-        {!empty && <div className="list-head">
-          <div className="list-heading">
-            <h1 className="list-title">
-              Sandboxes <span className="muted">{state.sandboxes.length}</span>
-            </h1>
-          </div>
-          <button className="btn primary" onClick={onNew}>
-            <Plus />
-            New sandbox
-          </button>
-        </div>}
+      {!showHero && <div className="main-list-header">{header}{heading}</div>}
+      <div className={`scroll main-scroll${showHero ? "" : " main-scroll-compact"}`} data-empty={empty}>
+        {showHero && <>{header}{heading}</>}
         {ade === "t3" && state.t3 === null && (
           <div className="list-card">
             <T3Missing run={run} />
