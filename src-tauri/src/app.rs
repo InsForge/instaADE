@@ -1659,7 +1659,11 @@ impl Core {
             user: &t.token,
             title: "",
         });
-        guarded(&self.gate(account), || (self.copy)(&address))
+        // pbcopy blocks for a moment, so off the async runtime.
+        let core = self.clone();
+        tokio::task::spawn_blocking(move || guarded(&core.gate(account), || (core.copy)(&address)))
+            .await
+            .map_err(|e| ErrorView::other(e.to_string()))?
             .ok_or_else(account_changed)?
             .map_err(ErrorView::other)?;
         self.open_with(account, h.setup_link, Some(&app))?;
