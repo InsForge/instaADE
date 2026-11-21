@@ -1477,27 +1477,6 @@ pre.banner-text {
   align-items: center;
   gap: 8px;
 }
-.hint {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 4px 8px 10px;
-  background: var(--raised);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  font-size: 12px;
-  line-height: 16px;
-  color: var(--soft);
-}
-.hint > svg {
-  flex-shrink: 0;
-  margin-top: 1px;
-  color: var(--accent-text);
-}
-.icon-btn.sm {
-  width: 20px;
-  height: 20px;
-}
 /* The free plan's limits under a sandbox's details. */
 .free-line {
   display: flex;

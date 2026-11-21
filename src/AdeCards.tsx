@@ -3,7 +3,7 @@ import { refreshAdes } from "./api";
 import { AdeBadge, adeName, localAde } from "./ades";
 import { openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
-import { Alert, Close, Info } from "./icons";
+import { Alert } from "./icons";
 import type { AdeId, AppState } from "./types";
 
 /** Looks for the ADEs on this computer again, and shows that it did. */
@@ -83,21 +83,5 @@ export function ConnectAdeCard({ state, onConnect, onNotNow }: { state: AppState
         </button>
       </div>
     </section>
-  );
-}
-
-/** After a switch to an ADE: how a sandbox without it gets it. */
-export function SwitchedHint({ state, ade, onDismiss }: { state: AppState; ade: AdeId; onDismiss: () => void }) {
-  const name = adeName(state, ade);
-  return (
-    <div className="hint" role="status">
-      <Info />
-      <span className="grow">
-        Switched to {name}. A sandbox without {name} shows Install {name}: it sets {name} up, then opens it.
-      </span>
-      <button className="icon-btn sm" aria-label="Dismiss" onClick={onDismiss}>
-        <Close />
-      </button>
-    </div>
   );
 }

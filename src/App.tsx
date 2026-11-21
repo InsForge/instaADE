@@ -41,8 +41,6 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
   const [agents, setAgents] = useState<AgentCache>({});
   const [pending, setPending] = useState<PendingCreate | null>(null);
   const [switcher, setSwitcher] = useState(false);
-  // The ADE just switched to, while its hint shows.
-  const [hint, setHint] = useState<AdeId | null>(null);
   const root = useRef<HTMLElement>(null);
   const { mode, picked, choose } = useMode(state);
 
@@ -139,7 +137,6 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));
   const pickMode = (m: Mode) => {
     choose(m);
-    setHint(m === "instabox" ? null : m);
     setMenu(null);
     setFailure(null);
     setNotice(null);
@@ -222,7 +219,6 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
         pending={pending}
         menuFor={menu?.id ?? null}
         firstRun={!picked}
-        hint={hint}
         onNew={() => go({ name: "new" })}
         onSettings={() => go({ name: "settings" })}
         onOpen={open}
@@ -232,7 +228,6 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
         onAgentStatus={onAgentStatus}
         onPickAde={() => setSwitcher(true)}
         onNotNow={() => choose("instabox")}
-        onDismissHint={() => setHint(null)}
       />
     );
   }

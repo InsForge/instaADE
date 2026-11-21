@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { agentSignIn, isBrowserPreview, pause, reinstallT3, resume, switchOrg, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
-import { AdeMissing, ConnectAdeCard, SwitchedHint } from "./AdeCards";
+import { AdeMissing, ConnectAdeCard } from "./AdeCards";
 import { adeName, hasAde, localAde, readyText } from "./ades";
 import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, cap, isAsleep, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
@@ -207,18 +207,15 @@ interface Props extends ListActions {
   menuFor: string | null;
   /** Plain Instabox before any pick: offer an ADE. */
   firstRun: boolean;
-  /** The ADE just switched to, while its hint shows. */
-  hint: AdeId | null;
   onNew: () => void;
   onSettings: () => void;
   onPickAde: () => void;
   onNotNow: () => void;
-  onDismissHint: () => void;
 }
 
 export default function SandboxList(props: Props) {
-  const { header, showHero = false, state, run, mode, agents, pending, menuFor, firstRun, hint } = props;
-  const { onNew, onSettings, onPickAde, onNotNow, onDismissHint, onConnect } = props;
+  const { header, showHero = false, state, run, mode, agents, pending, menuFor, firstRun } = props;
+  const { onNew, onSettings, onPickAde, onNotNow, onConnect } = props;
   const p = state.progress;
   const showPending = p !== null && !state.sandboxes.some((s) => s.id === p.machineId);
   const empty = state.sandboxes.length === 0 && !showPending;
@@ -252,11 +249,6 @@ export default function SandboxList(props: Props) {
             {header}
             {heading}
           </>
-        )}
-        {mode !== "instabox" && hint === mode && (
-          <div className="list-card">
-            <SwitchedHint state={state} ade={mode} onDismiss={onDismissHint} />
-          </div>
         )}
         {empty ? (
           <div className="empty">

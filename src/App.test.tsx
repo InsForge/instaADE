@@ -982,9 +982,8 @@ test("picking an ADE switches the background and the row actions, and is remembe
   expect(popover().dataset.mode).toBe("cmux");
   expect(theme()).toBe("cmux");
   expect(switcher().getAttribute("aria-label")).toBe("ADE: cmux. Switch ADE");
-  expect(screen.getByRole("status").textContent).toBe("Switched to cmux. A sandbox without cmux shows Install cmux: it sets cmux up, then opens it.");
-  await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-  expect(screen.queryByText(/Switched to cmux/)).toBeNull();
+  // A switch shows no notice: each row's Install or Open says enough.
+  expect(screen.queryByText(/Switched to/)).toBeNull();
   // T3's lines are gone; each row offers cmux.
   expect(within(rowOf("dev-1")).getByText("No cmux here yet")).toBeTruthy();
   expect(within(rowOf("web")).getByText("Ready for cmux")).toBeTruthy();
