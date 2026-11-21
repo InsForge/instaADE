@@ -16,6 +16,23 @@ concurrency:
   cancel-in-progress: ${{ github.event.label.name == 'preview-build' }}
 
 jobs:
+  # Preview publish reads which pull request this run built, instead of guessing it from the
+  # commit, which several pull requests may share.
+  pull-request:
+    if: github.event.label.name == 'preview-build'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the pull request
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: printf '%s' "$PR" > "$RUNNER_TEMP/pr.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: preview-pr
+          path: ${{ runner.temp }}/pr.txt
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     if: github.event.label.name == 'preview-build'
     strategy:

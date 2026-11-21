@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
       issues: write
       pull-requests: write
     outputs:
@@ -39,20 +40,31 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # The pull request the build ran for. It comes from pull request code, so it is only a
+      # number to check, never trusted as is.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: preview-pr
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/pr
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
-            --jq "[.[] | select(.state == \"open\" and .head.sha == \"$SHA\")][0].number // empty")
-          if [ -z "$pr" ]; then
-            echo "No open pull request has $SHA as its head. Nothing to publish."
+          pr=$(head -c 20 "$RUNNER_TEMP/pr/pr.txt")
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "The build did not record a pull request number. Nothing to publish."
             exit 0
           fi
-          info=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json author,labels,headRefOid)
+          info=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state,author,labels,headRefOid)
+          if [ "$(jq -r .state <<<"$info")" != "OPEN" ]; then
+            echo "#$pr is not open. Nothing to publish."
+            exit 0
+          fi
           if [ "$(jq -r .headRefOid <<<"$info")" != "$SHA" ]; then
-            echo "#$pr has a newer commit than the build. Nothing to publish."
+            echo "#$pr's head is not the built commit $SHA. Nothing to publish."
             exit 0
           fi
           if ! jq -e '.labels | any(.name == "preview-build")' <<<"$info" >/dev/null; then
