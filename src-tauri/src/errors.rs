@@ -85,9 +85,9 @@ impl From<SandboxError> for ErrorView {
             SandboxError::AdeBusy(_) => ErrorView::new(ErrorKind::AdeBusy, message),
             SandboxError::Setup { .. } => ErrorView::new(ErrorKind::Setup, message),
             SandboxError::Timeout => ErrorView::new(ErrorKind::Timeout, message),
-            SandboxError::FixedOnFree | SandboxError::NewerThanDesktop(_) => {
-                ErrorView::other(message)
-            }
+            SandboxError::FixedOnFree
+            | SandboxError::NewerThanDesktop(_)
+            | SandboxError::NoReinstall(_) => ErrorView::other(message),
             SandboxError::Api(a) => ErrorView::from(a),
         }
     }

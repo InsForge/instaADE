@@ -1,5 +1,6 @@
 import { setStartAtLogin, signOut, switchOrg } from "./api";
-import { CheckT3Button } from "./Setup";
+import { CheckAdesButton } from "./AdeCards";
+import { AdeBadge, COMING_SOON } from "./ades";
 import { cap, openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
 import type { AppState } from "./types";
@@ -43,14 +44,31 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
         </section>
 
         <section className="section">
-          <h2 className="section-label">{cap(thisComputer())}</h2>
+          <div className="section-head">
+            <h2 className="section-label">ADEs on {thisComputer()}</h2>
+            <CheckAdesButton run={run} text />
+          </div>
+          <ul className="group" aria-label={`ADEs on ${thisComputer()}`}>
+            {state.ades.map((a) => (
+              <li key={a.id} className="group-row plain ade-row">
+                <AdeBadge id={a.id} />
+                <span className="grow">{a.name}</span>
+                <span className="small muted">{a.version ?? "Not found"}</span>
+              </li>
+            ))}
+            {COMING_SOON.map((a) => (
+              <li key={a.id} className="group-row plain ade-row">
+                <AdeBadge id={a.id} />
+                <span className="grow muted">{a.name}</span>
+                <span className="small muted">Coming soon</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section className="section">
+          <h2 className="section-label">General</h2>
           <div className="group">
-            <div className="group-row">
-              <span>
-                T3 Code <span className="muted">{state.t3 ?? "Not found"}</span>
-              </span>
-              <CheckT3Button run={run} />
-            </div>
             <div className="group-row plain">
               <label htmlFor="login-switch">Start at login</label>
               <button

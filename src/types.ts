@@ -11,7 +11,7 @@ export type ViewState =
   | "deleting";
 
 /** An ADE's id. */
-export type AdeId = "t3";
+export type AdeId = "t3" | "cmux";
 
 export type ErrorKind =
   | "freeLimit"
@@ -45,9 +45,10 @@ export interface SandboxView {
   name: string;
   state: ViewState;
   size: string;
+  /** T3 was paired with it from this computer. cmux never sets it. */
   connected: boolean;
-  /** The ADE the sandbox is marked as connected to. */
-  ade: AdeId | null;
+  /** The ADEs set up on the sandbox (its mark), in the order they were added. */
+  ades: AdeId[];
   t3Version: string | null;
   free: boolean;
   autoSleep: { seconds: number | null; label: string };
@@ -70,7 +71,7 @@ export interface SleepChoice {
   label: string;
 }
 
-/** An ADE whose desktop app runs on this computer. */
+/** An ADE whose desktop app runs on this computer (cmux is macOS only). */
 export interface AdeView {
   id: AdeId;
   name: string;
@@ -96,8 +97,10 @@ export interface ProgressView {
   /** create: a new sandbox. connect: one that exists. */
   kind: "create" | "connect";
   step: string;
-  /** Set once the sandbox exists; Retry calls connect_sandbox with it. */
+  /** Set once the sandbox exists; Retry calls connect_sandbox with it and ade. */
   machineId: string | null;
+  /** The ADE being set up; null for a create without one. */
+  ade: AdeId | null;
   error: ErrorView | null;
 }
 

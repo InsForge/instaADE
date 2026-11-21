@@ -1,8 +1,9 @@
 //! The commands the UI calls. Each one parses its arguments and hands off to `Core`.
 //! Errors are `ErrorView` values the UI can branch on.
 //!
-//! An optional `ade` argument picks the ADE (`"t3"`). Without it a command uses the
-//! sandbox's own ADE, or the default (T3) for a new one.
+//! An optional `ade` argument picks the ADE (`"t3"`, `"cmux"`). Without it a command uses the
+//! sandbox's own ADE (the first in its mark), else the default (T3); `create_sandbox` without
+//! it creates a plain sandbox, with no ADE.
 
 use std::sync::Arc;
 
@@ -75,14 +76,14 @@ pub fn dismiss_progress(core: Shared<'_>) {
     core.dismiss_progress();
 }
 
-/// Looks for the ADEs' desktop apps (T3 Code) on this computer again, now.
+/// Looks for the ADEs' desktop apps (T3 Code, cmux) on this computer again, now.
 #[tauri::command]
 pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
     core.inner().clone().refresh_ades().await
 }
 
-/// Opens the sandbox in the ADE's app (T3 Code). A connected sandbox is woken and synced;
-/// an unconnected one is connected first.
+/// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken and synced) or
+/// cmux (its link, with an SSH token). A sandbox without the ADE gets it first.
 #[tauri::command]
 pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
     core.inner().clone().open_in_ade(&id, ade).await
@@ -120,7 +121,7 @@ pub async fn set_auto_sleep(core: Shared<'_>, id: String, seconds: i64) -> Res<(
     core.inner().clone().set_auto_sleep(&id, seconds).await
 }
 
-/// Sets the ADE (T3) up again on the sandbox.
+/// Sets the ADE (T3) up again on the sandbox. cmux installs nothing there to set up again.
 #[tauri::command]
 pub async fn reinstall_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
     core.inner().clone().reinstall(&id, ade).await

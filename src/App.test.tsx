@@ -2,8 +2,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { T3_DOWNLOAD_URL } from "./api";
+import { SKINS } from "./ades";
 import fixture from "./fixtures/state.json";
-import type { AppState, SandboxView } from "./types";
+import { modeKey } from "./mode";
+import type { AdeView, AppState, SandboxView } from "./types";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
@@ -47,7 +49,7 @@ const box: SandboxView = {
   state: "running",
   size: "4 vCPU / 8 GB",
   connected: true,
-  ade: "t3",
+  ades: ["t3"],
   t3Version: "0.1.10",
   free: true,
   autoSleep: { seconds: 1800, label: "After 30 min" },
@@ -76,7 +78,27 @@ const rowOf = (name: string) => screen.getByText(name).closest("li") as HTMLElem
 const menuItems = () => within(screen.getByRole("menu")).getAllByRole("menuitem").map((b) => b.textContent);
 const openMenu = (name: string) => userEvent.click(screen.getByRole("button", { name: `More actions for ${name}` }));
 
-beforeEach(() => invoke.mockReset());
+const t3Ade: AdeView = sample.ades[0];
+const cmuxAde: AdeView = {
+  id: "cmux",
+  name: "cmux",
+  shortName: "cmux",
+  version: "0.64.25",
+  downloadUrl: "https://github.com/manaflow-ai/cmux/releases/latest",
+};
+/** A Mac with T3 Code and cmux. */
+const mac: Partial<AppState> = { ades: [t3Ade, cmuxAde] };
+/** No T3 Code on this computer. */
+const noT3: Partial<AppState> = { t3: null, ades: [{ ...t3Ade, version: null }] };
+/** The mode alex picked earlier on this computer. */
+const picked = (mode: string, login = "alex") => localStorage.setItem(modeKey(login), mode);
+const switcher = () => screen.getByRole("button", { name: /^ADE: .*\. Switch ADE$/ });
+const popover = () => document.querySelector("main.popover") as HTMLElement;
+
+beforeEach(() => {
+  invoke.mockReset();
+  localStorage.clear();
+});
 afterEach(cleanup);
 
 test("fixture and sample have the same nested keys", () => {
@@ -91,7 +113,7 @@ test("fixture and sample have the same nested keys", () => {
   const sampleWithRows: AppState = {
     ...sample,
     sandboxes: [box],
-    progress: { kind: "create", step: "x", machineId: null, error: null },
+    progress: { kind: "create", step: "x", machineId: null, ade: "t3", error: null },
     error: { kind: "other", message: "" },
     update: { version: "", url: "" },
   };
@@ -105,27 +127,35 @@ test("fixture and sample have the same nested keys", () => {
 
 // ---- list ----
 
-test("a row shows state, size and T3, and its only button is the … menu", async () => {
-  show({}, [{}, { id: "b", name: "web", state: "paused", t3Version: null }]);
+test("a row shows state, size and T3, Open in T3 Code and the … menu", async () => {
+  show({}, [{}, { id: "b", name: "web", state: "paused", t3Version: null }, { id: "c", name: "old", updatePending: true, t3Version: "0.1.2" }]);
   const row = await screen.findByText("dev-1").then(() => rowOf("dev-1"));
   expect(within(row).getByText("Running")).toBeTruthy();
-  expect(within(row).getByText("4 vCPU / 8 GB · T3 0.1.10")).toBeTruthy();
-  expect(within(rowOf("web")).getByText("4 vCPU / 8 GB")).toBeTruthy();
-  expect(within(row).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? "open")).toEqual(["open", "More actions for dev-1"]);
-  for (const name of ["Open in T3 Code", "Pause", "Resume"]) expect(screen.queryByRole("button", { name })).toBeNull();
+  // The T3 version shows once: on the Open line, else next to the size.
+  expect(within(row).getByText("4 vCPU / 8 GB")).toBeTruthy();
+  expect(within(row).getByText("T3 Code 0.1.10")).toBeTruthy();
+  expect(within(rowOf("web")).getByText("T3 Code")).toBeTruthy();
+  expect(within(rowOf("old")).getByText("4 vCPU / 8 GB · T3 0.1.2")).toBeTruthy();
+  const labels = within(row)
+    .getAllByRole("button")
+    .slice(1)
+    .map((b) => b.getAttribute("aria-label") ?? b.textContent);
+  expect(labels).toEqual(["More actions for dev-1", "Open in T3 Code"]);
+  // Play and pause buttons on rows are not part of this screen.
+  for (const name of ["Pause", "Resume"]) expect(screen.queryByRole("button", { name })).toBeNull();
   expect(screen.getByText("alex · Free")).toBeTruthy();
-  expect(screen.getByText("1 running · 1 paused")).toBeTruthy();
+  expect(screen.getByText("2 running · 1 paused")).toBeTruthy();
 });
 
 test("clicking a row opens its details and Back returns to the list", async () => {
-  show({}, [{}, { id: "b", name: "web", connected: false }]);
+  show({}, [{}, { id: "b", name: "web", connected: false, ades: [] }]);
   await userEvent.click(await screen.findByText("dev-1"));
   expect(screen.getByRole("button", { name: "Back to sandboxes" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
   // The line under a row is part of the row too, except for its button.
-  await userEvent.click(screen.getByText("Not in T3 Code yet"));
-  expect(screen.getByRole("button", { name: "Connect to T3 Code" })).toBeTruthy();
+  await userEvent.click(screen.getByText("No T3 Code here yet"));
+  expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
   expect(screen.queryByText("dev-1")).toBeNull();
 });
 
@@ -168,12 +198,12 @@ test("the menu of a running, connected sandbox", async () => {
   expect(document.activeElement?.textContent).toBe("Pair again");
 });
 
-test("the menu of a paused sandbox that is not in T3 Code", async () => {
-  show({}, [{ state: "paused", connected: false, t3Version: null }]);
+test("the menu of a paused sandbox without T3", async () => {
+  show({}, [{ state: "paused", connected: false, ades: [], t3Version: null }]);
   await screen.findByText("dev-1");
   await openMenu("dev-1");
   expect(menuItems()).toEqual([
-    "Connect to T3 Code",
+    "Install T3 Code",
     "Resume",
     "Resize4 vCPU / 8 GB",
     "Auto sleepAfter 30 min",
@@ -272,24 +302,25 @@ test("the details header has the same menu", async () => {
 // ---- the line under a row ----
 
 test("each row shows at most one line, by priority", async () => {
-  show({ progress: { kind: "connect", step: "installing", machineId: "a", error: null } }, [
+  show({ progress: { kind: "connect", step: "installing", machineId: "a", ade: "t3", error: null } }, [
     { id: "a", name: "p-progress", updatePending: true },
     { id: "b", name: "p-update", updatePending: true, t3Version: "0.1.2" },
     { id: "c", name: "p-behind", desktopBehind: true, updatePending: true },
-    { id: "d", name: "p-connect", connected: false },
-    { id: "e", name: "p-behind-unconnected", connected: false, desktopBehind: true },
-    { id: "f", name: "p-none" },
+    { id: "d", name: "p-install", connected: false, ades: [] },
+    { id: "e", name: "p-behind-unconnected", connected: false, ades: [], desktopBehind: true },
+    { id: "f", name: "p-open" },
   ]);
-  await screen.findByText("p-none");
+  await screen.findByText("p-open");
   const progress = within(rowOf("p-progress"));
   expect(progress.getByText("Installing T3 0.1.10")).toBeTruthy();
   expect(progress.getByRole("progressbar")).toBeTruthy();
   expect(progress.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(progress.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
 
   const update = within(rowOf("p-update"));
   expect(update.getByText("T3 is older than this Mac's 0.1.10")).toBeTruthy();
   await userEvent.click(update.getByRole("button", { name: "Update" }));
-  expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "b" });
+  expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "b", ade: "t3" });
 
   // A sandbox ahead of this Mac never offers Update.
   const behind = within(rowOf("p-behind"));
@@ -298,17 +329,21 @@ test("each row shows at most one line, by priority", async () => {
   await userEvent.click(behind.getByRole("button", { name: "Download" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
 
-  const connect = within(rowOf("p-connect"));
-  expect(connect.getByText("Not in T3 Code yet")).toBeTruthy();
-  await userEvent.click(connect.getByRole("button", { name: "Connect" }));
-  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "d" });
+  const install = within(rowOf("p-install"));
+  expect(install.getByText("No T3 Code here yet")).toBeTruthy();
+  await userEvent.click(install.getByRole("button", { name: "Install T3 Code" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "d", ade: "t3" });
 
-  expect(within(rowOf("p-behind-unconnected")).queryByText("Not in T3 Code yet")).toBeNull();
-  expect(within(rowOf("p-none")).getAllByRole("button").length).toBe(2);
-  expect(screen.getByRole("button", { name: "More actions for p-none" })).toBeTruthy();
+  expect(within(rowOf("p-behind-unconnected")).queryByText("No T3 Code here yet")).toBeNull();
+  const open = within(rowOf("p-open"));
+  expect(open.getByText("T3 Code 0.1.10")).toBeTruthy();
+  await userEvent.click(open.getByRole("button", { name: "Open in T3 Code" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "f", ade: "t3" });
 });
 
 test("the list never asks for agent status; it shows what details found", async () => {
+  // Plain Instabox: a row has no ADE line, so the agent line shows.
+  picked("instabox");
   show({}, [{}], { agent_status: (a) => a.agent === "claude" });
   await screen.findByText("dev-1");
   await openMenu("dev-1");
@@ -330,7 +365,7 @@ test("the list never asks for agent status; it shows what details found", async 
 });
 
 test("a create before its sandbox exists is a row at the top with its progress", async () => {
-  show({ progress: { kind: "create", step: "creating", machineId: null, error: null } }, [{}]);
+  show({ progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: null } }, [{}]);
   await screen.findByText("dev-1");
   const first = screen.getAllByRole("listitem")[0];
   expect(within(first).getByText("New sandbox")).toBeTruthy();
@@ -340,7 +375,7 @@ test("a create before its sandbox exists is a row at the top with its progress",
 });
 
 test("connecting an existing sandbox starts at Waking, not Creating", async () => {
-  show({ progress: { kind: "connect", step: "connecting", machineId: "a", error: null } }, [{}]);
+  show({ progress: { kind: "connect", step: "connecting", machineId: "a", ade: "t3", error: null } }, [{}]);
   expect(await screen.findByText("Waking sandbox")).toBeTruthy();
   expect(screen.queryByText("Creating sandbox")).toBeNull();
 });
@@ -380,6 +415,7 @@ test("paid plan with always on: auto sleep defaults to 30 min, size to the first
     vcpus: 2,
     memMiB: 4096,
     autoSuspendAfterSeconds: 1800,
+    ade: "t3",
   });
 });
 
@@ -430,7 +466,7 @@ test("a create returns to the list at once and shows the new row while it runs",
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(screen.queryByLabelText("Name")).toBeNull();
   act(() =>
-    emit({ ...sample, tier: "pro", sandboxes: [box], progress: { kind: "create", step: "creating", machineId: null, error: null } }),
+    emit({ ...sample, tier: "pro", sandboxes: [box], progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: null } }),
   );
   const first = within(screen.getAllByRole("listitem")[0]);
   expect(first.getByText("dev-2")).toBeTruthy();
@@ -463,7 +499,7 @@ test("a failed create shows its message in the list, without the confirm line", 
 const tarBad = { kind: "setup" as const, message: "tar: bad" };
 
 test("a failed create with a sandbox offers only Retry, not Create", async () => {
-  show({ tier: "pro", progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ tier: "pro", progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "dev-2");
   expect((screen.getByRole("button", { name: "Create sandbox" }) as HTMLButtonElement).disabled).toBe(true);
@@ -484,25 +520,33 @@ test("cooldown shows the cooling down line", async () => {
   expect(await screen.findByText("Cooling down, ready in about 12 min")).toBeTruthy();
 });
 
-test("free limit offers Connect on the unconnected sandbox, not create", async () => {
-  show({ error: { kind: "freeLimit", message: "x" } }, [{ connected: false }]);
+test("free limit offers Connect on the sandbox without the ADE, not create", async () => {
+  show({ error: { kind: "freeLimit", message: "x" } }, [{ connected: false, ades: [] }]);
   expect(await screen.findByText("The free plan has one sandbox")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Connect to T3 Code" }));
-  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a" });
-  expect(within(rowOf("dev-1")).getByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "t3" });
+  expect(within(rowOf("dev-1")).getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
 });
 
-test("retry after a failed create connects the existing sandbox", async () => {
-  show({ progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+test("free limit in plain Instabox offers no Connect", async () => {
+  picked("instabox");
+  show({ error: { kind: "freeLimit", message: "x" } }, [{ connected: false, ades: [] }]);
+  expect(await screen.findByText("The free plan has one sandbox")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /Connect/ })).toBeNull();
+});
+
+test("retry after a failed create connects the existing sandbox with the same ADE", async () => {
+  show({ ...mac, progress: { kind: "create", step: "installing", machineId: "m9", ade: "cmux", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   expect(await screen.findByText("tar: bad")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "m9" });
+  // In T3 mode, the retry still sets up the ADE the failed create set up.
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "m9", ade: "cmux" });
   expect(invoke).not.toHaveBeenCalledWith("create_sandbox", expect.anything());
 });
 
 test("a failed connect shows one notice and one Retry, in list and new views", async () => {
-  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   expect((await screen.findAllByText("tar: bad")).length).toBe(1);
   expect(screen.getAllByRole("button", { name: "Retry" }).length).toBe(1);
   await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
@@ -511,18 +555,18 @@ test("a failed connect shows one notice and one Retry, in list and new views", a
 });
 
 test("settings shows a progress error as a banner with its Retry", async () => {
-  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ error: tarBad, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
   expect(screen.getAllByText("tar: bad").length).toBe(1);
   await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "m9" });
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "m9", ade: "t3" });
 });
 
 test("a different state.error still shows next to a progress error", async () => {
   show(
     {
       error: { kind: "cooldown", message: "x", minutes: 12 },
-      progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad },
+      progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad },
     },
     [{}],
   );
@@ -532,24 +576,24 @@ test("a different state.error still shows next to a progress error", async () =>
 });
 
 test("Dismiss closes a failed progress", async () => {
-  show({ progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [{}]);
+  show({ progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
   expect(invoke).toHaveBeenCalledWith("dismiss_progress");
 });
 
 test("a rejected connect that is the progress error shows once", async () => {
-  show({ error: tarBad, progress: { kind: "connect", step: "installing", machineId: "a", error: tarBad } }, [{ connected: false }], {
+  show({ error: tarBad, progress: { kind: "connect", step: "installing", machineId: "a", ade: "t3", error: tarBad } }, [{ connected: false }], {
     connect_sandbox: () => Promise.reject(tarBad),
   });
   const row = await screen.findByText("dev-1").then(() => within(rowOf("dev-1")));
   await userEvent.click(row.getByRole("button", { name: "Retry" }));
-  await waitFor(() => expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "t3" }));
   expect(screen.getAllByText("tar: bad").length).toBe(1);
   expect(screen.getAllByRole("button", { name: "Retry" }).length).toBe(1);
 });
 
 test("another setup error (a reinstall) gets no Retry of the progress sandbox", async () => {
-  show({ error: { kind: "setup", message: "reinstall: boom" }, progress: { kind: "create", step: "installing", machineId: "m9", error: tarBad } }, [
+  show({ error: { kind: "setup", message: "reinstall: boom" }, progress: { kind: "create", step: "installing", machineId: "m9", ade: "t3", error: tarBad } }, [
     {},
   ]);
   expect(await screen.findByText("reinstall: boom")).toBeTruthy();
@@ -560,13 +604,23 @@ test("another setup error (a reinstall) gets no Retry of the progress sandbox", 
 
 // ---- details ----
 
-test("details of an unconnected sandbox offer Connect to T3 Code", async () => {
-  show({}, [{ connected: false }]);
+test("details of a sandbox without T3 offer Install T3 Code", async () => {
+  show({}, [{ connected: false, ades: [] }]);
   await userEvent.click(await screen.findByText("dev-1"));
   expect(screen.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Pair again" })).toBeNull();
-  await userEvent.click(screen.getByRole("button", { name: "Connect to T3 Code" }));
-  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a" });
+  await userEvent.click(screen.getByRole("button", { name: "Install T3 Code" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "t3" });
+  expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
+});
+
+test("details of a sandbox T3 is on but not paired from here: Open pairs it, then asks to confirm", async () => {
+  show({}, [{ connected: false }]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  // Pair again and Reinstall need a pairing from this computer.
+  expect(screen.queryByRole("button", { name: "Pair again" })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Open in T3 Code" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "t3" });
   expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
 });
 
@@ -641,7 +695,7 @@ test("details: a failed resize goes back to the current size", async () => {
 });
 
 test("progress buttons never submit the New sandbox form", async () => {
-  show({ progress: { kind: "create", step: "creating", machineId: null, error: { kind: "api", message: "boom" } } });
+  show({ progress: { kind: "create", step: "creating", machineId: null, ade: "t3", error: { kind: "api", message: "boom" } } });
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "typed");
   for (const b of screen.getAllByRole("button", { name: "Dismiss" })) await userEvent.click(b);
@@ -675,7 +729,7 @@ test("updatePending offers Update that reinstalls", async () => {
   await userEvent.click(await screen.findByText("dev-1"));
   expect(screen.getByText("Older than this Mac")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Update" }));
-  expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "a" });
+  expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "a", ade: "t3" });
 });
 
 test("details check agent status once for a running sandbox, never for a paused one", async () => {
@@ -695,7 +749,7 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Pause" }));
   expect(invoke).toHaveBeenCalledWith("pause", { id: "a" });
   await userEvent.click(screen.getByRole("button", { name: "Pair again" }));
-  expect(invoke).toHaveBeenCalledWith("pair_again", { id: "a" });
+  expect(invoke).toHaveBeenCalledWith("pair_again", { id: "a", ade: "t3" });
   await userEvent.click(screen.getByRole("button", { name: "Delete sandbox…" }));
   expect(calls("delete").length).toBe(0);
   await userEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
@@ -704,16 +758,25 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
 
 // ---- settings ----
 
-test("settings: update, account and this Mac", async () => {
+test("settings: update, account, the ADEs on this Mac and start at login", async () => {
   show(
     {
+      ades: [t3Ade, { ...cmuxAde, version: null }],
       orgs: [...sample.orgs, { id: "org-team", name: "team", tier: "pro", personal: false }],
       update: { version: "0.2.0", url: "https://example.com/v0.2.0" },
     },
     [{}],
   );
   await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
-  expect(screen.getByRole("heading", { name: "This Mac" })).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "ADEs on this Mac" })).toBeTruthy();
+  const ades = within(screen.getByRole("list", { name: "ADEs on this Mac" }));
+  expect(ades.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+    "T3T3 Code0.1.10",
+    "CcmuxNot found",
+    "OOrcaComing soon",
+    "SSupersetComing soon",
+  ]);
+  expect(screen.getByRole("heading", { name: "General" })).toBeTruthy();
   expect(screen.getByText("A new version of Instabox is ready.")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Download" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.com/v0.2.0" });
@@ -748,13 +811,14 @@ test("settings: no section for agents on this Mac, whatever their MCP state", as
 
 // ---- first run ----
 
-test("first run with T3 Code: sign-in buttons and the found line", async () => {
-  show({ signedIn: false, login: null });
+test("sign-in asks for no ADE", async () => {
+  show({ ...noT3, signedIn: false, login: null });
   await userEvent.click(await screen.findByRole("button", { name: "Sign in with GitHub" }));
   expect(invoke).toHaveBeenCalledWith("sign_in", { provider: "github" });
-  expect(screen.getByText("T3 Code 0.1.10 found on this Mac")).toBeTruthy();
-  expect(screen.queryByText("T3 Code is not on this Mac")).toBeNull();
+  expect(screen.getByText("Start, pause and open your sandboxes from the menu bar.")).toBeTruthy();
+  expect(screen.queryByText(/T3 Code/)).toBeNull();
   expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Switch ADE/ })).toBeNull();
 });
 
 test("sign-in screen shows the device code", async () => {
@@ -765,7 +829,7 @@ test("sign-in screen shows the device code", async () => {
 
 test("Check again shows that it is checking, then that it checked", async () => {
   let finish: () => void = () => {};
-  show({ t3: null }, [{}], { refresh_t3: () => new Promise<void>((r) => (finish = r)) });
+  show(noT3, [{}], { refresh_t3: () => new Promise<void>((r) => (finish = r)) });
   await userEvent.click(await screen.findByRole("button", { name: "Check again" }));
   expect((screen.getByRole("button", { name: "Checking…" }) as HTMLButtonElement).disabled).toBe(true);
   await act(async () => finish());
@@ -773,42 +837,306 @@ test("Check again shows that it is checking, then that it checked", async () => 
   expect(await screen.findByRole("button", { name: "Check again" }, { timeout: 2500 })).toBeTruthy();
 });
 
-test("first run without T3 Code: Check again and Download T3 Code", async () => {
-  show({ signedIn: false, t3: null });
-  expect(await screen.findByText("T3 Code is not on this Mac")).toBeTruthy();
-  await userEvent.click(screen.getByRole("button", { name: "Check again" }));
-  expect(invoke).toHaveBeenCalledWith("refresh_t3");
-  await userEvent.click(screen.getByRole("button", { name: "Download T3 Code" }));
-  expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
-  expect(screen.getByRole("button", { name: "Sign in with Google" })).toBeTruthy();
-  expect(screen.queryByText(/found on this Mac/)).toBeNull();
-});
-
-test("signed in without T3 Code and no sandboxes stays on setup", async () => {
-  show({ t3: null });
-  expect(await screen.findByText("Signed in as alex")).toBeTruthy();
-  expect(screen.getByText("T3 Code is not on this Mac")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Sign in with GitHub" })).toBeNull();
-});
+const windowsAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
 
 test("on Windows the copy says this PC, not this Mac", async () => {
-  const windows = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
-  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windows);
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
   try {
-    show({ t3: null }, [{}]);
+    show(noT3, [{}]);
     expect(await screen.findByText("T3 Code is not on this PC")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
-    expect(screen.getByRole("heading", { name: "This PC" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "ADEs on this PC" })).toBeTruthy();
     expect(screen.queryByText(/this Mac/i)).toBeNull();
   } finally {
     ua.mockRestore();
   }
 });
 
-test("signed in without T3 Code but with sandboxes shows the card above the list", async () => {
-  show({ t3: null }, [{}]);
+test("T3 mode without T3 Code on this Mac shows the card above the list", async () => {
+  // A sandbox with T3 puts a v0.1.x user in T3 mode even when T3 Code is not found.
+  show(noT3, [{}]);
   expect(await screen.findByText("T3 Code is not on this Mac")).toBeTruthy();
   expect(screen.getByText("dev-1")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Download T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
+  await userEvent.click(screen.getByRole("button", { name: "Check again" }));
+  expect(invoke).toHaveBeenCalledWith("refresh_t3");
+});
+
+// ---- the ADE switcher ----
+
+test("the switcher lists Instabox, the ADEs on this Mac and the ones coming soon", async () => {
+  show(mac, [{}, { id: "b", name: "web", ades: ["t3", "cmux"] }]);
+  await screen.findByText("dev-1");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: T3 Code. Switch ADE");
+  await userEvent.click(switcher());
+  const menu = within(screen.getByRole("menu", { name: "Open sandboxes in" }));
+  const items = menu.getAllByRole("menuitemradio");
+  expect(items.map((b) => b.textContent)).toEqual([
+    "Instabox" + "Sandboxes only, no ADE",
+    "T3T3 Code" + "0.1.10 on this Mac · on 2 sandboxes",
+    "Ccmux" + "0.64.25 on this Mac · on 1 sandbox",
+    "OOrcaNot supported yetComing soon",
+    "SSupersetNot supported yetComing soon",
+  ]);
+  expect(items.map((b) => b.getAttribute("aria-checked"))).toEqual(["false", "true", "false", "false", "false"]);
+  for (const b of items.slice(3)) expect((b as HTMLButtonElement).disabled).toBe(true);
+  // The checked mode has the focus, so the keyboard can walk the menu.
+  expect(document.activeElement).toBe(items[1]);
+  await userEvent.keyboard("{Escape}");
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(document.activeElement).toBe(switcher());
+});
+
+test("the switcher on Windows has no cmux", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    // The back end lists only the ADEs that run here.
+    show({ ades: [t3Ade] }, [{}]);
+    await userEvent.click(await screen.findByRole("button", { name: /Switch ADE/ }));
+    const names = within(screen.getByRole("menu")).getAllByRole("menuitemradio").map((b) => b.textContent);
+    expect(names.some((n) => n?.includes("cmux"))).toBe(false);
+    expect(names[1]).toBe("T3T3 Code" + "0.1.10 on this PC · on 1 sandbox");
+    // A cmux pick saved on another computer falls back to plain Instabox here.
+    cleanup();
+    picked("cmux");
+    show({ ades: [t3Ade] }, [{}]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: Instabox. Switch ADE");
+  } finally {
+    ua.mockRestore();
+  }
+});
+
+test("picking an ADE switches the skin and the row actions, and is remembered", async () => {
+  show(mac, [{}, { id: "b", name: "web", ades: ["t3", "cmux"] }]);
+  await screen.findByText("dev-1");
+  expect(popover().dataset.mode).toBe("t3");
+  expect(popover().style.getPropertyValue("--accent")).toBe(SKINS.t3.accent);
+  await userEvent.click(switcher());
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /cmux/ }));
+  expect(localStorage.getItem(modeKey("alex"))).toBe("cmux");
+  expect(popover().dataset.mode).toBe("cmux");
+  expect(popover().style.getPropertyValue("--accent")).toBe(SKINS.cmux.accent);
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: cmux. Switch ADE");
+  expect(screen.getByRole("status").textContent).toBe("Switched to cmux. A sandbox without cmux shows Install cmux: it sets cmux up, then opens it.");
+  await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+  expect(screen.queryByText(/Switched to cmux/)).toBeNull();
+  // T3's meta and lines are gone; each row offers cmux.
+  expect(within(rowOf("dev-1")).getByText("4 vCPU / 8 GB")).toBeTruthy();
+  expect(within(rowOf("dev-1")).getByText("No cmux here yet")).toBeTruthy();
+  expect(within(rowOf("web")).getByText("Ready for cmux")).toBeTruthy();
+
+  // Plain Instabox keeps the neutral look.
+  await userEvent.click(switcher());
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /Instabox/ }));
+  expect(popover().dataset.mode).toBe("instabox");
+  expect(popover().style.getPropertyValue("--accent")).toBe("");
+  expect(localStorage.getItem(modeKey("alex"))).toBe("instabox");
+});
+
+test("cmux rows: Open runs open_in_t3 with cmux, Install sets it up, both ask to confirm in cmux", async () => {
+  picked("cmux");
+  show(mac, [
+    { id: "a", name: "dev-1", ades: ["t3"] },
+    { id: "b", name: "web", ades: ["cmux"], state: "paused" },
+    { id: "c", name: "busy", ades: ["cmux"], state: "waking" },
+  ]);
+  const install = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
+  await userEvent.click(install.getByRole("button", { name: "Install cmux" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
+  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+
+  await userEvent.click(within(rowOf("web")).getByRole("button", { name: "Open in cmux" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "cmux" });
+  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+  expect((within(rowOf("busy")).getByRole("button", { name: "Open in cmux" }) as HTMLButtonElement).disabled).toBe(true);
+
+  // The menu offers the same, with no T3 pairing or reinstall.
+  await openMenu("web");
+  expect(menuItems()).toEqual([
+    "Open in cmux",
+    "Resume",
+    "Resize4 vCPU / 8 GB",
+    "Auto sleepAfter 30 min",
+    "Copy SSH command",
+    "Open in Terminal",
+    "Delete sandbox…",
+  ]);
+});
+
+test("installing cmux shows a progress line with no time left", async () => {
+  picked("cmux");
+  show({ ...mac, progress: { kind: "connect", step: "installing", machineId: "a", ade: "cmux", error: null } }, [{ ades: [] }]);
+  const row = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
+  expect(row.getByText("Installing cmux, then opening")).toBeTruthy();
+  expect(row.getByRole("progressbar")).toBeTruthy();
+  expect(row.queryByRole("button", { name: "Install cmux" })).toBeNull();
+  // No time estimates anywhere.
+  expect(document.body.textContent).not.toMatch(/~|\d+\s*s\b|left/);
+  act(() => emit({ ...sample, ...mac, sandboxes: [{ ...box, ades: [] }], progress: { kind: "connect", step: "done", machineId: "a", ade: "cmux", error: null } }));
+  expect(row.getByText("Opening cmux")).toBeTruthy();
+});
+
+test("plain Instabox: sandboxes only, with no Open, Install, Connect or Reinstall", async () => {
+  picked("instabox");
+  show({ ...mac, tier: "pro" }, [{ free: false }, { id: "b", name: "web", connected: false, ades: [] }]);
+  await screen.findByText("dev-1");
+  expect(popover().dataset.mode).toBe("instabox");
+  for (const name of [/^Open in (T3|cmux)/, /^Install/, /^Connect/, /^Update$/]) expect(screen.queryByRole("button", { name })).toBeNull();
+  expect(screen.queryByText(/here yet|T3 Code 0\.1\.10/)).toBeNull();
+  expect(within(rowOf("dev-1")).getByText("4 vCPU / 8 GB")).toBeTruthy();
+
+  await openMenu("dev-1");
+  expect(menuItems()).toEqual(["Pause", "Resize4 vCPU / 8 GB", "Auto sleepAfter 30 min", "Copy SSH command", "Open in Terminal", "Delete sandbox…"]);
+  await userEvent.keyboard("{Escape}");
+
+  await userEvent.click(screen.getByText("dev-1"));
+  for (const name of [/^Open in (T3|cmux)/, /^Install/, "Pair again", "Reinstall T3", "Reconnect"]) expect(screen.queryByRole("button", { name })).toBeNull();
+  expect(screen.queryByText("ADEs on this sandbox")).toBeNull();
+  expect(screen.queryByText("cmux mode")).toBeNull();
+
+  // A new sandbox gets no ADE.
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
+  expect(screen.queryByText(/Installs T3|Sets the sandbox up/)).toBeNull();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ name: "dev-2", ade: undefined }));
+  await waitFor(() => expect(screen.queryByLabelText("Name")).toBeNull());
+  expect(screen.queryByText(/Confirm/)).toBeNull();
+});
+
+test("a new sandbox in cmux mode sets cmux up", async () => {
+  picked("cmux");
+  show({ ...mac, tier: "pro" }, [{}]);
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText("Sets the sandbox up for cmux. Then it opens in cmux.")).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "cmux" }));
+  expect(await screen.findByText("Confirm the workspace in cmux")).toBeTruthy();
+});
+
+// ---- first run and the default mode ----
+
+test("first run after sign-in lands in plain Instabox with a Connect an ADE card", async () => {
+  show({ ...noT3, ades: [{ ...t3Ade, version: null }, cmuxAde] }, [{ ades: [] }]);
+  expect(await screen.findByText("Open sandboxes in your ADE")).toBeTruthy();
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: Instabox. Switch ADE");
+  expect(screen.getByText(/^cmux is on this Mac\. Pick one/)).toBeTruthy();
+  // Nothing is forced: the list works, with no ADE actions.
+  expect(screen.getByText("dev-1")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^Install/ })).toBeNull();
+
+  // Connect an ADE opens the switcher.
+  await userEvent.click(screen.getByRole("button", { name: "Connect an ADE" }));
+  expect(screen.getByRole("menu", { name: "Open sandboxes in" })).toBeTruthy();
+  await userEvent.keyboard("{Escape}");
+
+  // Not now keeps plain Instabox and does not ask again.
+  await userEvent.click(screen.getByRole("button", { name: "Not now" }));
+  expect(screen.queryByText("Open sandboxes in your ADE")).toBeNull();
+  expect(localStorage.getItem(modeKey("alex"))).toBe("instabox");
+  cleanup();
+  show({ ...noT3, ades: [{ ...t3Ade, version: null }, cmuxAde] }, [{ ades: [] }]);
+  await screen.findByText("dev-1");
+  expect(screen.queryByText("Open sandboxes in your ADE")).toBeNull();
+});
+
+test("a new user with no sandboxes and no ADE sees the empty list and the card", async () => {
+  show(noT3);
+  expect(await screen.findByText("No sandboxes yet. Create one to get started.")).toBeTruthy();
+  expect(screen.getByText("Open sandboxes in your ADE")).toBeTruthy();
+  expect(screen.queryByText("T3 Code is not on this Mac")).toBeNull();
+});
+
+test("the default mode keeps v0.1.x users in T3 Code until they pick", async () => {
+  const modeShown = async () => {
+    const b = await screen.findByRole("button", { name: /Switch ADE/ });
+    const m = popover().dataset.mode;
+    cleanup();
+    return [b.getAttribute("aria-label"), m];
+  };
+  // T3 Code on this Mac, no sandbox with T3.
+  show({}, [{ ades: [] }]);
+  expect(await modeShown()).toEqual(["ADE: T3 Code. Switch ADE", "t3"]);
+  // No T3 Code here, but a sandbox has T3.
+  show(noT3, [{}]);
+  expect(await modeShown()).toEqual(["ADE: T3 Code. Switch ADE", "t3"]);
+  // Neither: plain Instabox.
+  show(noT3, [{ ades: [] }, { id: "b", name: "web", ades: ["cmux"] }]);
+  expect(await modeShown()).toEqual(["ADE: Instabox. Switch ADE", "instabox"]);
+  // A pick wins over the default, and it is per user.
+  picked("instabox");
+  show({}, [{}]);
+  expect(await modeShown()).toEqual(["ADE: Instabox. Switch ADE", "instabox"]);
+  show({ login: "sam" }, [{}]);
+  expect(await modeShown()).toEqual(["ADE: T3 Code. Switch ADE", "t3"]);
+});
+
+test("T3 mode keeps the first-run card away and T3's own wording", async () => {
+  show({}, [{}]);
+  await screen.findByText("dev-1");
+  expect(screen.queryByText("Open sandboxes in your ADE")).toBeNull();
+  await userEvent.click(screen.getByText("dev-1"));
+  expect(screen.getByText("T3 Code mode")).toBeTruthy();
+  for (const name of ["Open in T3 Code", "Pair again", "Reinstall T3"]) expect(screen.getByRole("button", { name })).toBeTruthy();
+});
+
+test("in T3 mode a plain sandbox offers Install T3 Code, and a v0.1.x one Open", async () => {
+  // A sandbox created in plain Instabox has no mark, so no ADEs. One v0.1.x connected has t3.
+  show({}, [
+    { id: "p", name: "plain", connected: false, ades: [], t3Version: null },
+    { id: "o", name: "old", ades: ["t3"] },
+  ]);
+  const plain = within(await screen.findByText("plain").then(() => rowOf("plain")));
+  expect(plain.getByText("No T3 Code here yet")).toBeTruthy();
+  expect(plain.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(plain.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
+  expect(within(rowOf("old")).getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
+  await userEvent.click(screen.getByText("plain"));
+  expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(screen.queryByText("T3 CodeIn use")).toBeNull();
+  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
+  expect(chips.queryAllByRole("listitem").filter((li) => li.className.includes("chip"))).toEqual([]);
+});
+
+// ---- details: the ADEs on a sandbox ----
+
+test("details show a chip for each ADE on the sandbox and a dashed one to add another", async () => {
+  picked("cmux");
+  show(mac, [{ ades: ["t3", "cmux"] }, { id: "b", name: "web", ades: ["t3"] }]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
+  expect(chips.getAllByRole("listitem").map((c) => c.textContent)).toEqual(["T3T3 Code0.1.10", "CcmuxIn use"]);
+  expect(chips.queryByRole("button")).toBeNull();
+  expect(screen.getByText("cmux mode")).toBeTruthy();
+  // cmux has nothing to reinstall: Reconnect runs its prep again and opens it.
+  expect(screen.queryByRole("button", { name: /Reinstall|Pair again/ })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
+  await userEvent.click(screen.getByRole("button", { name: "Open in cmux" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "cmux" });
+
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await userEvent.click(screen.getByText("web"));
+  const add = screen.getByRole("button", { name: "Install cmux on web" });
+  expect(add.textContent).toBe("cmux");
+  expect(screen.getByRole("button", { name: "Install cmux" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+  await userEvent.click(add);
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "b", ade: "cmux" });
+});
+
+test("details in T3 mode offer adding cmux, never an ADE not found here", async () => {
+  show({ ades: [t3Ade, { ...cmuxAde, version: null }] }, [{}]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
+  expect(chips.getAllByRole("listitem").map((c) => c.textContent)).toEqual(["T3T3 CodeIn use"]);
+  expect(screen.queryByRole("button", { name: /Install cmux/ })).toBeNull();
+  cleanup();
+  show(mac, [{}]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  await userEvent.click(screen.getByRole("button", { name: "Install cmux on dev-1" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
 });

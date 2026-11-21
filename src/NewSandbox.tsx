@@ -1,10 +1,12 @@
 import { useId, useState } from "react";
 import type { FormEvent } from "react";
 import type { createSandbox } from "./api";
+import { adeName } from "./ades";
+import type { Mode } from "./ades";
 import { thisComputer } from "./common";
 import type { Run } from "./common";
 import Progress from "./Progress";
-import type { AppState, SleepChoice } from "./types";
+import type { AdeId, AppState, SleepChoice } from "./types";
 
 export type CreateArgs = Parameters<typeof createSandbox>[0];
 
@@ -16,10 +18,22 @@ export function defaultSleep(choices: SleepChoice[]): number {
 
 const FREE_SIZE = "4 vCPU / 8 GB";
 
+/** What the create sets up, by mode. */
+function setupText(state: AppState, mode: Mode): string | null {
+  if (mode === "instabox") return null;
+  if (mode === "t3") {
+    return `Installs T3${state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on ${thisComputer()}. Then the sandbox opens in T3 Code.`;
+  }
+  const name = adeName(state, mode);
+  return `Sets the sandbox up for ${name}. Then it opens in ${name}.`;
+}
+
 interface Props {
   state: AppState;
   run: Run;
-  onConnect: (id: string) => void;
+  /** The ADE the create sets up; plain Instabox sets none up. */
+  mode: Mode;
+  onConnect: (id: string, ade: AdeId) => void;
   /** Starts the create; the app returns to the list. */
   onCreate: (args: CreateArgs, sizeLabel: string) => void;
   onBack: () => void;
@@ -27,7 +41,8 @@ interface Props {
 
 const cols = (n: number) => ({ gridTemplateColumns: `repeat(${n <= 3 ? Math.max(n, 1) : 2}, minmax(0, 1fr))` });
 
-export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: Props) {
+export default function NewSandbox({ state, run, mode, onConnect, onCreate, onBack }: Props) {
+  const info = setupText(state, mode);
   const free = state.tier === "free";
   const fromId = useId();
   const sizeId = useId();
@@ -64,6 +79,7 @@ export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: 
         vcpus: free ? 4 : size.vcpus,
         memMiB: free ? 8192 : size.memMiB,
         autoSuspendAfterSeconds: free ? 1800 : sleep,
+        ade: mode === "instabox" ? undefined : mode,
       },
       free ? FREE_SIZE : size.label,
     );
@@ -149,14 +165,12 @@ export default function NewSandbox({ state, run, onConnect, onCreate, onBack }: 
             {free && <span className="small muted end">Free plan: fixed</span>}
           </div>
 
-          <p className="info">
-            Installs T3{state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on {thisComputer()}. Then the sandbox opens in T3 Code.
-          </p>
+          {info && <p className="info">{info}</p>}
 
           {state.progress && (
             <div className="field">
               <h2 className="section-label">Setting up a sandbox</h2>
-              <Progress state={state} run={run} onConnect={onConnect} />
+              <Progress state={state} run={run} mode={mode} onConnect={onConnect} />
             </div>
           )}
         </div>

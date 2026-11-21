@@ -6,7 +6,7 @@
 //! `lib.rs`, `commands.rs` and `tray.rs`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use url::Url;
 
-use crate::ade::{self, Ade, Open};
+use crate::ade::{self, Ade, Open, SshLogin};
 use crate::agents::{self, Agent};
 use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, Template};
 use crate::auth::{self, Provider, Session};
@@ -41,9 +41,13 @@ pub const FULL_REFRESH: Duration = Duration::from_secs(300);
 
 /// Called with the whole state after every change.
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
-/// Opens a URL in the default handler (browser, or an ADE's app for its links, such as
-/// T3 Code for `t3code://`).
-pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Opens a URL. With an app (the path of an app bundle), in that app only; without one, in the
+/// default handler (browser, or an ADE's app for its links, such as T3 Code for `t3code://`).
+pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send + Sync>;
+/// Finds an ADE's desktop app on this computer (`Ade::locate`).
+pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
+/// Checks that the app at a path is the ADE's own (`Ade::verify`).
+pub type Verifier = Arc<dyn Fn(Ade, &Path) -> bool + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -75,13 +79,15 @@ pub struct McpStatus {
 /// Where a create or connect is. `kind` is `create` (a new sandbox) or `connect` (one that
 /// exists). `step` is one of `connecting`, `creating`, `waking`, `installing`, `pairing`,
 /// `done`. `machine_id` is set once the sandbox exists, so the UI's Retry can call
-/// `connect_sandbox` with it.
+/// `connect_sandbox` with it and `ade`. `ade` is the ADE being set up; None for a create
+/// without one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressView {
     pub kind: String,
     pub step: String,
     pub machine_id: Option<String>,
+    pub ade: Option<Ade>,
     pub error: Option<ErrorView>,
 }
 
@@ -155,8 +161,8 @@ pub struct Data {
     pub update_pending: HashSet<String>,
     /// Sandboxes whose ADE is newer than the desktop's: the app on this computer is behind.
     pub desktop_behind: HashSet<String>,
-    /// Sandboxes the signed-in user connected from this computer. Only these get commands
-    /// without a user action.
+    /// Sandboxes the signed-in user paired a pairing ADE (T3) with from this computer. Only
+    /// these get commands without a user action. A link ADE (cmux) never adds one.
     pub connected: HashSet<String>,
     /// The user `connected` was loaded for. `None` until the account is known.
     pub connected_user: Option<i64>,
@@ -171,13 +177,37 @@ impl Data {
         self.desktop_behind.remove(id);
     }
 
-    /// The ADE of sandbox `id`: the one it is marked with, else the default. None when its
-    /// mark names an ADE this build does not know.
+    /// The ADEs sandbox `id` has: the ones its mark lists that this build knows. A sandbox
+    /// with no mark (a plain one) has none. This decides Open against Install.
+    pub fn ades_of(&self, id: &str) -> Vec<Ade> {
+        self.machines
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| view::marked_ades(&m.metadata))
+            .unwrap_or_default()
+    }
+
+    /// The ADE an action on sandbox `id` uses when none was asked for (see `action_ades`);
+    /// the default for a sandbox not listed. None when its mark names only ADEs this build
+    /// does not know.
     pub fn ade_of(&self, id: &str) -> Option<Ade> {
         self.machines
             .iter()
             .find(|m| m.id == id)
-            .map_or(Some(Ade::default()), machine_ade)
+            .map_or_else(|| vec![Ade::default()], action_ades)
+            .first()
+            .copied()
+    }
+
+    /// The ADE a resume of sandbox `id` keeps in step with this computer (T3), if any (see
+    /// `action_ades`).
+    pub fn pinned_ade_of(&self, id: &str) -> Option<Ade> {
+        self.machines
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| vec![Ade::default()], action_ades)
+            .into_iter()
+            .find(|a| a.pins_local_version())
     }
 
     /// The user whose connected set applies: the one it was loaded for, else the account's.
@@ -288,12 +318,16 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
     view::size_choices(own.unwrap_or(&me.allowed_specs))
 }
 
-/// The ADE a machine is marked with, else the default when it has no mark. None when the
-/// mark names an ADE this build does not know, such as one a newer app connected.
-fn machine_ade(m: &Machine) -> Option<Ade> {
-    match m.metadata.get(view::BRIDGE_KEY) {
-        None => Some(Ade::default()),
-        Some(id) => Ade::from_id(id),
+/// The ADEs an action may use on a machine when none was asked for: the ones its mark lists,
+/// in the order they were added, else the default when it has no mark at all. Empty when the
+/// mark names only ADEs this build does not know, such as one a newer app connected: such a
+/// sandbox never counts as the default. Only for picking an ADE to act with (connect, pair
+/// again, reinstall, resume, sync). What a sandbox has is its mark alone (`Data::ades_of`).
+fn action_ades(m: &Machine) -> Vec<Ade> {
+    if view::has_mark(&m.metadata) {
+        view::marked_ades(&m.metadata)
+    } else {
+        vec![Ade::default()]
     }
 }
 
@@ -361,15 +395,15 @@ pub fn version_changed(prev: Option<&str>, new: Option<&str>) -> bool {
 }
 
 /// The sandboxes to sync after a change of `ade`'s desktop version: running, connected from
-/// this computer and of that ADE, in any of the user's orgs. A sandbox someone else connected
-/// is left alone.
+/// this computer and of that ADE (among others or alone, see `action_ades`), in any of the
+/// user's orgs. A sandbox someone else connected is left alone.
 pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
     d.machines
         .iter()
         .filter(|m| view::view_state(&m.state) == ViewState::Running)
         .filter(|m| d.connected.contains(&m.id))
         .filter(|m| template_is_linux(&d.templates, &m.template.id))
-        .filter(|m| machine_ade(m) == Some(ade))
+        .filter(|m| action_ades(m).contains(&ade))
         .map(|m| m.id.clone())
         .collect()
 }
@@ -401,6 +435,7 @@ pub fn progress_after(prev: &ProgressView, step: &Step) -> ProgressView {
         kind: prev.kind.clone(),
         step: name.to_string(),
         machine_id,
+        ade: prev.ade,
         error: None,
     }
 }
@@ -450,10 +485,15 @@ pub fn newer_release(current: &str, body: &str) -> Option<UpdateInfo> {
     })
 }
 
-/// URLs the UI may ask the app to open: https, and the links of every ADE's app.
+/// URLs the UI may ask the app to open in the default handler: https, and the links of every
+/// pairing ADE's app. A link ADE's link (cmux) holds an SSH token, so only `open_link` opens
+/// one, and only in the app it found.
 pub fn allowed_url(url: &str) -> bool {
     Url::parse(url).is_ok_and(|u| {
-        u.scheme() == "https" || ade::ALL.iter().any(|a| a.url_scheme() == u.scheme())
+        u.scheme() == "https"
+            || ade::ALL
+                .iter()
+                .any(|a| matches!(a.open(), Open::Pair(_)) && a.url_scheme() == u.scheme())
     })
 }
 
@@ -627,7 +667,7 @@ pub struct CreateArgs {
     pub vcpus: u32,
     pub mem_mib: u32,
     pub auto_suspend_after_seconds: Option<i64>,
-    /// The ADE to set up; None: the default.
+    /// The ADE to set up; None: a plain sandbox, with no ADE.
     pub ade: Option<Ade>,
 }
 
@@ -657,6 +697,9 @@ pub struct Core {
     ssh: Arc<dyn SshTokenStore>,
     connected: Arc<dyn ConnectedStore>,
     open: Opener,
+    /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
+    locate: Locator,
+    verify: Verifier,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -698,9 +741,22 @@ async fn detect(ade: Ade) -> Option<String> {
 
 /// The desktop version of each ADE that runs on this computer; None: not found.
 async fn detect_local() -> Vec<(Ade, Option<String>)> {
-    let mut found = Vec::new();
-    for ade in ade::local() {
-        found.push((ade, detect(ade).await));
+    detect_each(ade::local(), Ade::detect).await
+}
+
+/// Runs `detect` for every ADE at once, off the async runtime: each may block for seconds,
+/// so the wait is the slowest one, not their sum. The results keep the order of `ades`.
+async fn detect_each(
+    ades: Vec<Ade>,
+    detect: fn(Ade) -> Option<String>,
+) -> Vec<(Ade, Option<String>)> {
+    let running: Vec<_> = ades
+        .into_iter()
+        .map(|ade| (ade, tokio::task::spawn_blocking(move || detect(ade))))
+        .collect();
+    let mut found = Vec::with_capacity(running.len());
+    for (ade, task) in running {
+        found.push((ade, task.await.ok().flatten()));
     }
     found
 }
@@ -751,6 +807,8 @@ impl Core {
             ssh,
             connected,
             open,
+            locate: Arc::new(Ade::locate),
+            verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -764,6 +822,15 @@ impl Core {
                 account: 0,
             }),
         }
+    }
+
+    /// Test only: finds the ADEs' apps with `locate` and checks them with `verify` instead of
+    /// on this computer.
+    #[cfg(test)]
+    fn with_apps(mut self, locate: Locator, verify: Verifier) -> Core {
+        self.locate = locate;
+        self.verify = verify;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -835,10 +902,16 @@ impl Core {
         }
     }
 
-    /// Opens `url` only while the flow's account is current.
+    /// Opens `url` in the default handler, only while the flow's account is current.
     fn open_for(self: &Arc<Self>, account: u64, url: &str) -> Res<()> {
+        self.open_with(account, url, None)
+    }
+
+    /// Opens `url` in the app at `app` (else the default handler), only while the flow's
+    /// account is current.
+    fn open_with(self: &Arc<Self>, account: u64, url: &str, app: Option<&Path>) -> Res<()> {
         guarded(&self.gate(account), || {
-            (self.open)(url).map_err(ErrorView::other)
+            (self.open)(url, app).map_err(ErrorView::other)
         })
         .unwrap_or_else(|| Err(account_changed()))
     }
@@ -1007,7 +1080,7 @@ impl Core {
 
     pub fn open_url(&self, url: &str) -> Res<()> {
         let r = if allowed_url(url) {
-            (self.open)(url).map_err(ErrorView::other)
+            (self.open)(url, None).map_err(ErrorView::other)
         } else {
             Err(ErrorView::other("This link cannot be opened"))
         };
@@ -1351,10 +1424,12 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
-        let ade = a.ade.unwrap_or_default();
-        let version = match self.desktop_version(ade).await {
-            Ok(v) => v,
-            Err(e) => return self.settle_in(account, Err(e)),
+        let version = match a.ade {
+            Some(ade) => match self.desktop_version(ade).await {
+                Ok(v) => Some(v),
+                Err(e) => return self.settle_in(account, Err(e)),
+            },
+            None => None,
         };
         let req = NewSandbox {
             name: a.name,
@@ -1366,15 +1441,20 @@ impl Core {
             auto_suspend_after_seconds: a.auto_suspend_after_seconds,
             org_id,
         };
-        self.begin_progress("create", "creating", None, account);
+        self.begin_progress("create", "creating", None, a.ade, account);
+        let (Some(ade), Some(version)) = (a.ade, version) else {
+            let r = connect::create(&client, &req, &self.progress_cb(account)).await;
+            return self.finish_create(r, account).await;
+        };
         let r =
             connect::create_and_connect(&client, ade, &req, &version, self.progress_cb(account))
                 .await;
-        self.finish_connect(r, &version, account).await
+        self.finish_connect(ade, r, &version, account).await
     }
 
-    /// Connects an existing sandbox: wakes it, installs the ADE (never an older version),
-    /// pairs, then opens the ADE's app with the pairing link.
+    /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
+    /// installed (never an older version) and paired, then its app opens with the pairing
+    /// link; a link ADE (cmux) gets its prep command, then its link opens.
     pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
@@ -1388,25 +1468,44 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
         };
-        self.begin_progress("connect", "connecting", Some(id.to_string()), account);
+        self.begin_progress(
+            "connect",
+            "connecting",
+            Some(id.to_string()),
+            Some(ade),
+            account,
+        );
         let r =
             connect::connect_existing(&client, ade, id, &version, self.progress_cb(account)).await;
-        self.finish_connect(r, &version, account).await
+        self.finish_connect(ade, r, &version, account).await
     }
 
-    /// Open in the ADE's app. A connected sandbox: wake it, sync its ADE, open the app (no
-    /// setup, no new pairing). An unconnected one goes through the connect flow.
+    /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
+    /// with it: wake it, sync the ADE, open the app (no setup, no new pairing). A link ADE
+    /// (cmux) on a sandbox marked with it: open its link with an SSH token (the link wakes the
+    /// sandbox). Anything else goes through the connect flow.
     pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
         let snapshot = self.signed_in_with(|i| {
-            let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
+            // None: the sandbox is marked only with ADEs this build does not know.
             let ade = asked.or_else(|| i.data.ade_of(id));
-            (connected, ade, ade.and_then(|a| i.sync_version(a)))
+            let connected = i.state.sandboxes.iter().any(|s| s.id == id && s.connected);
+            let ready = ade.is_some_and(|a| {
+                i.data.ades_of(id).contains(&a)
+                    && match a.open() {
+                        Open::Pair(_) => connected,
+                        Open::Link(_) => true,
+                    }
+            });
+            (ready, ade, ade.and_then(|a| i.sync_version(a)))
         });
         let (client, account, ade, version) = match snapshot {
             Ok((client, account, (true, Some(ade), version))) => (client, account, ade, version),
             _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
+            let Open::Pair(p) = ade.open() else {
+                return self.open_link(ade, id, account).await;
+            };
             sandbox::ensure_running(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
@@ -1414,10 +1513,68 @@ impl Core {
                 let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            let Open::Pair(p) = ade.open();
             self.open_for(account, p.app_url)
         };
         self.act(account, r).await
+    }
+
+    /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
+    /// in the ADE's own app found on this computer, never in whatever handles its scheme. The
+    /// app is checked again (identifier and signature) right before the token is made or
+    /// loaded: with no app, or one that fails the check, no token is made and nothing opens.
+    /// The token comes from `ssh::token`: the stored one while it has more than a day left,
+    /// else a new 30-day one.
+    async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<()> {
+        let Open::Link(l) = ade.open() else {
+            return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
+        };
+        let (locate, verify) = (self.locate.clone(), self.verify.clone());
+        let checked = tokio::task::spawn_blocking(move || {
+            locate(ade).map(|app| {
+                let ok = verify(ade, &app);
+                (app, ok)
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        let app = match checked {
+            Some((app, true)) => app,
+            Some((_, false)) => {
+                return Err(ErrorView::other(format!(
+                    "Could not verify the {} app. Install it again from its official download.",
+                    ade.name()
+                )));
+            }
+            None => {
+                return Err(ErrorView::other(format!(
+                    "{} is not installed. Install it first.",
+                    ade.name()
+                )));
+            }
+        };
+        let (client, title) = self
+            .read_in(account, |i| {
+                let title = i
+                    .data
+                    .machines
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map_or_else(|| id.to_string(), |m| m.name.clone());
+                i.client.clone().map(|c| (c, title))
+            })
+            .flatten()
+            .ok_or_else(account_changed)?;
+        let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+            .await
+            .map_err(ErrorView::from)?;
+        let link = (l.link)(&SshLogin {
+            host: &t.host,
+            port: t.port,
+            user: &t.token,
+            title: &title,
+        });
+        self.open_with(account, &link, Some(&app))
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -1485,13 +1642,21 @@ impl Core {
         });
     }
 
-    fn begin_progress(&self, kind: &str, step: &str, machine_id: Option<String>, account: u64) {
+    fn begin_progress(
+        &self,
+        kind: &str,
+        step: &str,
+        machine_id: Option<String>,
+        ade: Option<Ade>,
+        account: u64,
+    ) {
         self.update_in(account, |i| {
             i.state.error = None;
             i.state.progress = Some(ProgressView {
                 kind: kind.to_string(),
                 step: step.to_string(),
                 machine_id,
+                ade,
                 error: None,
             });
         });
@@ -1513,10 +1678,31 @@ impl Core {
         self.update(Inner::clear_progress);
     }
 
-    /// Shows the result of a create or connect that began under `account`. Every write
-    /// checks the account as part of the write, so a change at any point drops the rest.
+    /// Shows the result of a create with no ADE. A failure ends the progress: its Retry would
+    /// set an ADE up.
+    async fn finish_create(
+        self: &Arc<Self>,
+        r: Result<String, SandboxError>,
+        account: u64,
+    ) -> Res<()> {
+        if self.account() != account {
+            return Ok(());
+        }
+        let r = r.map(drop).map_err(ErrorView::from);
+        self.update_in(account, Inner::clear_progress);
+        let out = self.settle_in(account, r);
+        if self.account() == account {
+            self.refresh_and_sync(false).await;
+        }
+        out
+    }
+
+    /// Shows the result of a create or connect that began under `account`, and opens the
+    /// ADE: the pairing link, or a link ADE's link. Every write checks the account as part of
+    /// the write, so a change at any point drops the rest.
     async fn finish_connect(
         self: &Arc<Self>,
+        ade: Ade,
         r: Result<Connected, SandboxError>,
         version: &str,
         account: u64,
@@ -1533,18 +1719,28 @@ impl Core {
                 // offers the update.
                 self.update_in(account, |i| {
                     i.state.progress = None;
-                    i.data.set_version(&c.machine_id, &c.version);
-                    if c.update_pending {
-                        i.data.update_pending.insert(c.machine_id.clone());
-                    } else if c.version != version {
-                        i.data.desktop_behind.insert(c.machine_id.clone());
+                    if let Some(v) = &c.version {
+                        i.data.set_version(&c.machine_id, v);
+                        if c.update_pending {
+                            i.data.update_pending.insert(c.machine_id.clone());
+                        } else if v != version {
+                            i.data.desktop_behind.insert(c.machine_id.clone());
+                        }
                     }
                     i.rebuild();
                 });
-                let opened = self.open_for(account, &c.link);
+                let opened = match &c.link {
+                    Some(link) => self.open_for(account, link),
+                    None => self.open_link(ade, &c.machine_id, account).await,
+                };
                 let out = self.settle_in(account, opened);
-                // After `settle_in`, which clears the error: a failed save stays visible.
-                self.remember(&c.machine_id, account).await;
+                // The connected set says a pairing ADE (T3) was paired from here. A link ADE
+                // (cmux) pairs nothing, so it must not add the sandbox: T3 would then count
+                // as paired here when another computer set it up.
+                if matches!(ade.open(), Open::Pair(_)) {
+                    // After `settle_in`, which clears the error: a failed save stays visible.
+                    self.remember(&c.machine_id, account).await;
+                }
                 out
             }
             Err(e) => {
@@ -1583,14 +1779,15 @@ impl Core {
         .await
     }
 
-    /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop.
+    /// Wakes the sandbox. A connected one also gets its ADE brought in step with the desktop:
+    /// the one that keeps in step (T3), whatever other ADEs it has.
     pub async fn resume(self: &Arc<Self>, id: &str) -> Res<()> {
         // Only a sandbox connected from this computer, to an ADE this build knows, gets its
         // ADE synced after a resume.
         let (client, account, sync) = self.signed_in_with(|i| {
             let ade = i
                 .data
-                .ade_of(id)
+                .pinned_ade_of(id)
                 .filter(|_| i.data.connected.contains(id))?;
             i.sync_version(ade).map(|v| (ade, v))
         })?;
@@ -1685,7 +1882,7 @@ impl Core {
                 &*self.ssh,
                 id,
                 agent,
-                move |u| open(u).map_err(anyhow::Error::msg),
+                move |u| open(u, None).map_err(anyhow::Error::msg),
                 &gate,
             )
             .await
@@ -1903,11 +2100,16 @@ mod tests {
         d.machines[0].free = true;
         d.machines[0].run_started_at = Some(now() - chrono::Duration::minutes(20));
         d.machines[0].max_run_minutes = 120;
+        // e has T3 and cmux.
+        d.machines[4]
+            .metadata
+            .insert("instabox-ades".into(), "t3,cmux".into());
         let mut s = AppState::default();
         s.apply(&d, now());
         s.signed_in = true;
         s.sign_in_code = None;
         s.set_desktop(Ade::T3, Some("0.1.10".into()));
+        s.set_desktop(Ade::Cmux, Some("0.64.25".into()));
         s.mcp = McpStatus {
             claude_code: Some(true),
             codex: Some(false),
@@ -1916,6 +2118,7 @@ mod tests {
             kind: "create".into(),
             step: "installing".into(),
             machine_id: Some("a".into()),
+            ade: Some(Ade::T3),
             error: None,
         });
         s.error = Some(ErrorView::from(SandboxError::Cooldown { minutes: 12 }));
@@ -2167,7 +2370,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             store,
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ))
@@ -2176,8 +2379,8 @@ mod tests {
     fn connected_result(id: &str, version: &str) -> Connected {
         Connected {
             machine_id: id.into(),
-            link: "t3code://pair?pairingUrl=x".into(),
-            version: version.into(),
+            link: Some("t3code://pair?pairingUrl=x".into()),
+            version: Some(version.into()),
             update_pending: false,
         }
     }
@@ -2195,7 +2398,7 @@ mod tests {
             update_pending: true,
             ..connected_result("t", "0.1.9")
         };
-        core.finish_connect(Ok(c), "0.1.11", core.account())
+        core.finish_connect(Ade::T3, Ok(c), "0.1.11", core.account())
             .await
             .unwrap();
         let v = &core.state().sandboxes[0];
@@ -2216,6 +2419,7 @@ mod tests {
         });
         assert!(!core.state().sandboxes[0].connected);
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.11")),
             "0.1.11",
             core.account(),
@@ -2242,6 +2446,7 @@ mod tests {
             i.rebuild();
         });
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.12")),
             "0.1.11",
             core.account(),
@@ -2296,7 +2501,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(FileConnectedStore::new(path)),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2328,6 +2533,7 @@ mod tests {
             kind: "create".into(),
             step: "creating".into(),
             machine_id: None,
+            ade: Some(Ade::Cmux),
             error: None,
         };
         let p1 = progress_after(&start, &Step::Creating);
@@ -2337,6 +2543,7 @@ mod tests {
         assert_eq!(p3.step, "installing");
         assert_eq!(p3.kind, "create");
         assert_eq!(p3.machine_id.as_deref(), Some("m1"));
+        assert_eq!(p3.ade, Some(Ade::Cmux), "the ADE stays for Retry");
         let err = ErrorView::from(SandboxError::Setup {
             ade: Ade::T3,
             stderr_tail: "boom".into(),
@@ -2352,6 +2559,7 @@ mod tests {
             kind: "connect".into(),
             step: "installing".into(),
             machine_id: Some(id.into()),
+            ade: Some(Ade::T3),
             error: Some(ErrorView::from(SandboxError::Setup {
                 ade: Ade::T3,
                 stderr_tail: "tar: bad".into(),
@@ -2413,7 +2621,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2479,8 +2687,14 @@ mod tests {
     fn ades_hold_the_desktop_versions_and_t3_mirrors_its_own() {
         let core = core_with(Arc::new(MemoryConnectedStore::default()));
         let s = core.state();
-        if cfg!(any(target_os = "macos", windows)) {
-            // Listed from the start; nothing is found before the first look.
+        // Listed from the start; nothing is found before the first look. cmux is macOS only.
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                s.ades,
+                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Cmux, None)]
+            );
+        }
+        if cfg!(windows) {
             assert_eq!(s.ades, vec![AdeView::new(Ade::T3, None)]);
         }
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
@@ -2522,9 +2736,87 @@ mod tests {
             "an ADE this build does not know is not the default"
         );
         let views = sandbox_views(&data(), Some("org-me"), now());
-        let ades: Vec<Option<Ade>> = views.iter().map(|v| v.ade).collect();
+        let ades: Vec<Vec<Ade>> = views.iter().map(|v| v.ades.clone()).collect();
         assert_eq!(ids(&views), ["a", "e", "f", "g"]);
-        assert_eq!(ades, [Some(Ade::T3), Some(Ade::T3), None, None]);
+        assert_eq!(ades, [vec![Ade::T3], vec![Ade::T3], vec![], vec![]]);
+    }
+
+    #[test]
+    fn a_sandbox_with_several_ades_keeps_t3_in_step() {
+        let mut d = data();
+        // a: cmux first, then T3. b (running, connected, other org): cmux only.
+        for (i, ades) in [(0, vec![Ade::Cmux, Ade::T3]), (1, vec![Ade::Cmux])] {
+            let md = &mut d.machines[i].metadata;
+            md.clear();
+            for a in ades {
+                view::mark(md, a);
+            }
+        }
+        assert_eq!(d.machines[0].metadata["instabox-bridge"], "t3");
+        assert_eq!(d.ades_of("a"), [Ade::Cmux, Ade::T3]);
+        assert_eq!(d.ade_of("a"), Some(Ade::Cmux), "the first one");
+        assert_eq!(d.ade_of("b"), Some(Ade::Cmux), "a cmux mark routes to cmux");
+        assert_eq!(d.pinned_ade_of("a"), Some(Ade::T3));
+        assert_eq!(d.pinned_ade_of("b"), None);
+        assert_eq!(
+            sync_targets(&d, Ade::T3),
+            ["a"],
+            "b has no T3 to bring along"
+        );
+        assert_eq!(sync_targets(&d, Ade::Cmux), ["a", "b"]);
+        // No mark: the sandbox has no ADE, and an action with none asked uses the default.
+        assert_eq!(d.ades_of("f"), []);
+        assert_eq!(d.ade_of("f"), Some(Ade::T3));
+        assert_eq!(d.pinned_ade_of("f"), Some(Ade::T3));
+        // A mark keeps the ADEs this build knows and skips the rest.
+        let md = &mut d.machines[0].metadata;
+        md.insert("instabox-bridge".into(), "t3".into());
+        md.insert("instabox-ades".into(), "future-ade,t3".into());
+        assert_eq!(d.ade_of("a"), Some(Ade::T3));
+        assert_eq!(d.pinned_ade_of("a"), Some(Ade::T3));
+        let md = &mut d.machines[0].metadata;
+        md.insert("instabox-bridge".into(), "future-ade".into());
+        md.insert("instabox-ades".into(), "future-ade".into());
+        assert_eq!((d.ade_of("a"), d.pinned_ade_of("a")), (None, None));
+        // Only the list, with no instabox-bridge, is a mark too.
+        d.machines[0].metadata.remove("instabox-bridge");
+        assert_eq!(d.ade_of("a"), None);
+        assert!(!sync_targets(&d, Ade::T3).contains(&"a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_ades_on_this_computer_are_looked_for_at_once_in_their_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        // Each look waits until both have started. One after the other, the first would give
+        // up after 5 s and find nothing.
+        fn meet(ade: Ade) -> Option<String> {
+            STARTED.fetch_add(1, SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while STARTED.load(SeqCst) < 2 {
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Some(format!("{}-1.0", ade.id()))
+        }
+        let found = detect_each(vec![Ade::Cmux, Ade::T3], meet).await;
+        assert_eq!(
+            found,
+            vec![
+                (Ade::Cmux, Some("cmux-1.0".to_string())),
+                (Ade::T3, Some("t3-1.0".to_string()))
+            ]
+        );
+        // An ADE that is not found leaves the others alone.
+        fn only_t3(ade: Ade) -> Option<String> {
+            (ade == Ade::T3).then(|| "0.1.10".into())
+        }
+        assert_eq!(
+            detect_each(vec![Ade::T3, Ade::Cmux], only_t3).await,
+            vec![(Ade::T3, Some("0.1.10".into())), (Ade::Cmux, None)]
+        );
     }
 
     #[test]
@@ -2538,13 +2830,27 @@ mod tests {
     }
 
     #[test]
-    fn every_ade_link_may_be_opened() {
+    fn pairing_links_may_be_opened_by_the_ui_and_token_links_never() {
         for a in ade::ALL {
-            let Open::Pair(p) = a.open();
-            assert!(allowed_url(p.app_url), "{a:?}");
-            assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
+            match a.open() {
+                Open::Pair(p) => {
+                    assert!(allowed_url(p.app_url), "{a:?}");
+                    assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
+                }
+                Open::Link(l) => {
+                    let login = SshLogin {
+                        host: "ssh.example.test",
+                        port: 2222,
+                        user: "ibssh_x",
+                        title: "box",
+                    };
+                    // It holds an SSH token: only `open_link` opens it, in the app it found.
+                    assert!(!allowed_url(&(l.link)(&login)), "{a:?}");
+                }
+            }
         }
         assert!(!allowed_url("t3codex://x"));
+        assert!(!allowed_url("cmux-nightly://ssh?host=x"));
     }
 
     #[tokio::test]
@@ -2557,7 +2863,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             ssh,
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2684,7 +2990,7 @@ mod tests {
             keys.clone(),
             ssh.clone(),
             connected.clone(),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
             PathBuf::from("/nonexistent"),
         ));
@@ -2767,7 +3073,7 @@ mod tests {
             keys.clone(),
             ssh.clone(),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(move |s: &AppState| {
                 if !s.signed_in {
                     signal.notify_one();
@@ -2845,7 +3151,7 @@ mod tests {
             keys.clone(),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -2860,7 +3166,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -2882,7 +3188,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -2983,6 +3289,7 @@ mod tests {
             i.rebuild();
         });
         core.finish_connect(
+            Ade::T3,
             Ok(connected_result("t", "0.1.11")),
             "0.1.11",
             core.account(),
@@ -3083,9 +3390,14 @@ mod tests {
         let base = Url::parse("http://127.0.0.1:9").unwrap();
         sign_in_as(&core, &base, 7);
         let before = core.state();
-        core.finish_connect(Ok(connected_result("t", "0.1.11")), "0.1.11", started)
-            .await
-            .unwrap();
+        core.finish_connect(
+            Ade::T3,
+            Ok(connected_result("t", "0.1.11")),
+            "0.1.11",
+            started,
+        )
+        .await
+        .unwrap();
         assert!(store.load(7).is_empty(), "nothing remembered");
         assert!(core.lock().data.connected.is_empty());
         assert_eq!(core.state().error, before.error);
@@ -3223,14 +3535,52 @@ mod tests {
         core.sign_out().await.unwrap();
         sign_in_as(&core, &base, 8);
         // The old flow starts and moves its progress after the switch: nothing shows.
-        core.begin_progress("create", "creating", None, old);
+        core.begin_progress("create", "creating", None, Some(Ade::T3), old);
         stale(Step::Pairing);
         assert_eq!(core.state().progress, None);
         // The new account's own progress is not moved by the old flow's callback.
-        core.begin_progress("connect", "connecting", Some("m2".into()), core.account());
+        core.begin_progress(
+            "connect",
+            "connecting",
+            Some("m2".into()),
+            Some(Ade::T3),
+            core.account(),
+        );
         let before = core.state().progress;
         stale(Step::Pairing);
         assert_eq!(core.state().progress, before);
+    }
+
+    /// What a recording opener writes down: the URL, and the app it had to open it in.
+    fn opened_as(url: &str, app: Option<&Path>) -> String {
+        match app {
+            Some(a) => format!("{url} in {}", a.display()),
+            None => url.to_string(),
+        }
+    }
+
+    /// A core on `base` with a recording opener and the given stores and home, not yet shared.
+    fn recording_core(
+        base: Url,
+        keys: Arc<MemoryKeyStore>,
+        ssh: Arc<MemorySshStore>,
+        home: PathBuf,
+    ) -> (Core, Arc<Mutex<Vec<String>>>) {
+        let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        let core = Core::new(
+            base,
+            keys,
+            ssh,
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(move |u: &str, app: Option<&Path>| {
+                sink.lock().unwrap().push(opened_as(u, app));
+                Ok(())
+            }),
+            Arc::new(|_| {}),
+            home,
+        );
+        (core, opened)
     }
 
     /// A core on `base` with a recording opener and the given stores and home.
@@ -3240,21 +3590,8 @@ mod tests {
         ssh: Arc<MemorySshStore>,
         home: PathBuf,
     ) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
-        let opened = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = opened.clone();
-        let core = Arc::new(Core::new(
-            base,
-            keys,
-            ssh,
-            Arc::new(MemoryConnectedStore::default()),
-            Arc::new(move |u| {
-                sink.lock().unwrap().push(u.to_string());
-                Ok(())
-            }),
-            Arc::new(|_| {}),
-            home,
-        ));
-        (core, opened)
+        let (core, opened) = recording_core(base, keys, ssh, home);
+        (Arc::new(core), opened)
     }
 
     #[tokio::test]
@@ -3274,6 +3611,425 @@ mod tests {
         sign_in_as(&core, &base, 8);
         let _ = call.await.unwrap();
         assert!(opened.lock().unwrap().is_empty(), "no pairing link opened");
+    }
+
+    /// A mock API with one running sandbox `m1` named "dev 1" with `metadata`. It mints SSH
+    /// tokens, answers every exec with success, takes a metadata patch and creates sandboxes.
+    async fn cmux_server(metadata: serde_json::Value) -> (wiremock::MockServer, Url) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let m1 = serde_json::json!({
+            "id": "m1", "name": "dev 1", "state": "running",
+            "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+            "metadata": metadata, "orgId": "org-me"
+        });
+        let answers = [
+            (
+                "GET",
+                "/v1/machines",
+                serde_json::json!({"machines": [m1], "nextCursor": null}),
+            ),
+            ("GET", "/v1/machines/m1", m1.clone()),
+            ("PATCH", "/v1/machines/m1", m1.clone()),
+            (
+                "POST",
+                "/v1/machines/m1/ssh-tokens",
+                serde_json::json!({
+                    "id": "k1", "name": "Instabox", "host": "ssh.example.test", "port": 2222,
+                    "token": "ibssh_new", "command": "ssh -p 2222 ibssh_new@ssh.example.test",
+                    "expiresAt": Utc::now() + chrono::Duration::days(30)
+                }),
+            ),
+            (
+                "POST",
+                "/v1/machines/m1/exec",
+                serde_json::json!({"stdout": "", "stderr": "", "exitCode": 0}),
+            ),
+            (
+                "GET",
+                "/v1/me",
+                serde_json::json!({"userId": 7, "login": "alex",
+                    "org": {"id": "org-me", "tier": "pro", "kind": "personal"}}),
+            ),
+            (
+                "POST",
+                "/v1/machines",
+                serde_json::json!({"id": "op1", "machineId": "m1", "type": "create",
+                    "state": "queued", "machine": null}),
+            ),
+            (
+                "GET",
+                "/v1/operations/op1",
+                serde_json::json!({"id": "op1", "machineId": "m1", "type": "create",
+                    "state": "succeeded", "machine": m1}),
+            ),
+        ];
+        for (verb, p, body) in answers {
+            Mock::given(method(verb))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let base = Url::parse(&server.uri()).unwrap();
+        (server, base)
+    }
+
+    async fn requests(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect()
+    }
+
+    const CMUX_LINK: &str = "cmux://ssh?host=ssh.example.test&user=ibssh_new&port=2222&title=dev%201&host-key-policy=accept-new";
+
+    /// The cmux.app the test computer has.
+    #[derive(Clone, Copy, PartialEq)]
+    enum CmuxHere {
+        /// cmux's identifier and a signature that passes.
+        Real,
+        /// A bundle named cmux.app with another identifier.
+        OtherId,
+        /// cmux's identifier, but the signature check fails.
+        BadSignature,
+        Missing,
+    }
+
+    /// A signed-in core with a recording opener and a cmux.app as `here` says. The app is a
+    /// real bundle on disk, checked by the production identifier check; only codesign is
+    /// replaced by `here`.
+    struct CmuxCore {
+        core: Arc<Core>,
+        opened: Arc<Mutex<Vec<String>>>,
+        app: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn cmux_core(base: &Url, ssh: Arc<MemorySshStore>, here: CmuxHere) -> CmuxCore {
+        let dir = tempfile::tempdir().unwrap();
+        let id = if here == CmuxHere::OtherId {
+            "com.example.cmux"
+        } else {
+            ade::cmux::BUNDLE_ID
+        };
+        let app = ade::cmux::test_bundle(dir.path(), id, "0.64.25", false);
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            ssh,
+            PathBuf::from("/nonexistent"),
+        );
+        let found = app.clone();
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| {
+                (here != CmuxHere::Missing && ade == Ade::Cmux).then(|| found.clone())
+            }),
+            Arc::new(move |ade, path| {
+                ade == Ade::Cmux && ade::cmux::verify_with(path, |_| here != CmuxHere::BadSignature)
+            }),
+        ));
+        sign_in_as(&core, base, 7);
+        CmuxCore {
+            core,
+            opened,
+            app,
+            _dir: dir,
+        }
+    }
+
+    /// The cmux link as the opener got it: always with the cmux app named.
+    fn cmux_opened(app: &Path) -> String {
+        format!("{CMUX_LINK} in {}", app.display())
+    }
+
+    #[tokio::test]
+    async fn open_in_cmux_opens_its_link_in_the_cmux_app_only() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3,cmux"}))
+                .await;
+        let ssh = Arc::new(MemorySshStore::default());
+        let CmuxCore {
+            core,
+            opened,
+            app,
+            _dir,
+        } = cmux_core(&base, ssh.clone(), CmuxHere::Real);
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        // Never the default handler of cmux:// links: the link holds the SSH token.
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)]);
+        let r = requests(&server).await;
+        assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        assert_eq!(
+            r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(),
+            1,
+            "{r:?}"
+        );
+        // The token is kept, so the next open reuses it.
+        assert_eq!(ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [cmux_opened(&app), cmux_opened(&app)]
+        );
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cmux_link_never_opens_without_the_cmux_app() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}))
+                .await;
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(
+            &base,
+            Arc::new(MemorySshStore::default()),
+            CmuxHere::Missing,
+        );
+        core.refresh(false).await;
+        let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
+        assert_eq!(e.message, "cmux is not installed. Install it first.");
+        assert_eq!(core.state().error, Some(e));
+        assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+        let r = requests(&server).await;
+        assert!(
+            !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+            "no token: {r:?}"
+        );
+        // And the UI cannot open one in the default handler either.
+        assert!(core.open_url(CMUX_LINK).is_err());
+        assert!(opened.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cmux_link_never_goes_to_a_lookalike_or_an_unverified_app() {
+        for here in [CmuxHere::OtherId, CmuxHere::BadSignature] {
+            let (server, base) = cmux_server(
+                serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}),
+            )
+            .await;
+            let ssh = Arc::new(MemorySshStore::default());
+            // Even a stored token is not loaded for an app that fails the check.
+            ssh.save("m1", &ssh_token()).unwrap();
+            let CmuxCore {
+                core,
+                opened,
+                app: _,
+                _dir,
+            } = cmux_core(&base, ssh, here);
+            core.refresh(false).await;
+            let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
+            assert_eq!(
+                e.message,
+                "Could not verify the cmux app. Install it again from its official download."
+            );
+            assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+            let r = requests(&server).await;
+            assert!(
+                !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+                "no token: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_in_cmux_of_a_sandbox_without_it_runs_the_prep_marks_then_opens() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let CmuxCore {
+            core,
+            opened,
+            app,
+            _dir,
+        } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
+        core.update(|i| i.state.set_desktop(Ade::Cmux, Some("0.64.25".into())));
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)]);
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(execs.len(), 1, "only the prep");
+        assert!(execs[0].contains("chmod go-w ~/.local ~/.local/state"));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,cmux");
+        let s = core.state();
+        assert_eq!(s.progress, None);
+        assert_eq!(s.error, None);
+        // cmux pairs nothing, so the sandbox does not join the set of T3 pairings from here.
+        assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn adding_cmux_here_to_a_t3_sandbox_from_elsewhere_still_needs_t3_pairing() {
+        // Another computer set T3 up and marked the sandbox. This one adds cmux.
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
+        core.update(|i| {
+            i.state.set_desktop(Ade::Cmux, Some("0.64.25".into()));
+            i.state.set_desktop(Ade::T3, Some("0.1.11".into()));
+        });
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert!(!core.lock().data.connected.contains("m1"));
+        assert!(!core.state().sandboxes[0].connected);
+
+        // Open in T3 Code must pair first, not open T3 Code as if this computer had paired.
+        let _ = core.open_in_ade("m1", Some(Ade::T3)).await;
+        assert!(
+            !opened
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.starts_with("t3code://")),
+            "{:?}",
+            opened.lock().unwrap()
+        );
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().any(|r| r.url.path().ends_with("/exec")
+                && String::from_utf8_lossy(&r.body).contains("t3 pair")),
+            "the pairing ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn connecting_cmux_needs_the_app_on_this_computer() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        // Found as missing (Windows never looks): connecting asks for the app first.
+        core.update(|i| i.state.set_desktop(Ade::Cmux, None));
+        let detect_finds_nothing = !cfg!(target_os = "macos") || Ade::Cmux.locate().is_none();
+        if detect_finds_nothing {
+            let e = core
+                .connect_sandbox("m1", Some(Ade::Cmux))
+                .await
+                .unwrap_err();
+            assert_eq!(e.message, "cmux is not installed. Install it first.");
+            assert!(opened.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_create_sets_no_ade_up_and_opens_nothing() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.create_sandbox(CreateArgs {
+            name: "dev 1".into(),
+            snapshot_id: None,
+            vcpus: 2,
+            mem_mib: 4096,
+            auto_suspend_after_seconds: Some(1800),
+            ade: None,
+        })
+        .await
+        .unwrap();
+        let r = requests(&server).await;
+        assert!(r.contains(&"POST /v1/machines".to_string()), "{r:?}");
+        assert!(
+            !r.iter().any(|x| x.ends_with("/exec")
+                || x.starts_with("PATCH")
+                || x.ends_with("/ssh-tokens")),
+            "{r:?}"
+        );
+        assert!(opened.lock().unwrap().is_empty());
+        let s = core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        assert!(core.lock().data.connected.is_empty(), "not connected");
+        // After the refresh the create ran, it is a sandbox with no ADE, not a T3 one.
+        let v = &core.state().sandboxes[0];
+        assert_eq!((v.id.as_str(), v.ades.clone()), ("m1", vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_plain_sandbox_has_no_ade_and_a_v0_1_one_has_t3_after_a_refresh() {
+        // The API sends an empty object for a sandbox with no metadata.
+        for (metadata, has) in [
+            (serde_json::json!({}), vec![]),
+            (serde_json::json!({"instabox-bridge": "t3"}), vec![Ade::T3]),
+        ] {
+            let (_server, base) = cmux_server(metadata.clone()).await;
+            let (core, _) = core_full(
+                base.clone(),
+                Arc::new(MemoryKeyStore::default()),
+                Arc::new(MemorySshStore::default()),
+                PathBuf::from("/nonexistent"),
+            );
+            sign_in_as(&core, &base, 7);
+            core.refresh(false).await;
+            let j = serde_json::to_value(&core.state().sandboxes[0]).unwrap();
+            assert_eq!(j["ades"], serde_json::json!(has), "{metadata}");
+            assert_eq!(core.lock().data.ades_of("m1"), has);
+            // An action with no ADE asked still picks T3 for either.
+            assert_eq!(core.lock().data.ade_of("m1"), Some(Ade::T3));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_in_t3_of_a_sandbox_with_no_mark_sets_t3_up_first() {
+        // Even when it is in the connected set, a sandbox without the T3 mark has no T3.
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some("0.1.11".into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        let _ = core.open_in_ade("m1", Some(Ade::T3)).await;
+        assert!(
+            !opened
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.starts_with("t3code://")),
+            "{:?}",
+            opened.lock().unwrap()
+        );
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(execs.iter().any(|e| e.contains("v=0.1.11")), "T3 setup ran");
     }
 
     #[tokio::test]
@@ -3442,8 +4198,8 @@ mod tests {
                 Arc::new(MemoryKeyStore::default()),
                 Arc::new(MemorySshStore::default()),
                 store.clone(),
-                Arc::new(move |u| {
-                    sink.lock().unwrap().push(u.to_string());
+                Arc::new(move |u: &str, app: Option<&Path>| {
+                    sink.lock().unwrap().push(opened_as(u, app));
                     Ok(())
                 }),
                 Arc::new(|_| {}),
@@ -3451,11 +4207,12 @@ mod tests {
             ));
             sign_in_as(&core, &base, 7);
             let old = core.account();
-            core.begin_progress("connect", "pairing", Some("t".into()), old);
+            core.begin_progress("connect", "pairing", Some("t".into()), Some(Ade::T3), old);
             let new_progress = ProgressView {
                 kind: "create".into(),
                 step: "creating".into(),
                 machine_id: None,
+                ade: Some(Ade::T3),
                 error: None,
             };
             let b = base.clone();
@@ -3476,7 +4233,7 @@ mod tests {
             } else {
                 Err(SandboxError::Timeout)
             };
-            let _ = core.finish_connect(r, "0.1.11", old).await;
+            let _ = core.finish_connect(Ade::T3, r, "0.1.11", old).await;
             c.check(core.account() != old, format!("ok={ok}: no switch"));
             let s = core.state();
             c.check(
@@ -3652,7 +4409,7 @@ mod tests {
                 keys.clone(),
                 ssh.clone(),
                 Arc::new(MemoryConnectedStore::default()),
-                Arc::new(|_| Ok(())),
+                Arc::new(|_, _| Ok(())),
                 Arc::new(|_| {}),
                 PathBuf::from("/nonexistent"),
             ));

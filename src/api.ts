@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AppState, ErrorView } from "./types";
+import type { AdeId, AppState, ErrorView } from "./types";
 
 /** Thin wrappers over the Tauri commands. Rejections are ErrorView objects. */
 export type Agent = "claude" | "codex";
@@ -18,18 +18,24 @@ export const createSandbox = (a: {
   vcpus: number;
   memMiB: number;
   autoSuspendAfterSeconds?: number;
+  /** The ADE to set up; none: a plain sandbox. */
+  ade?: AdeId;
 }) => invoke<void>("create_sandbox", a);
-export const connectSandbox = (id: string) => invoke<void>("connect_sandbox", { id });
+/** Sets the ADE up on the sandbox, then opens it. */
+export const connectSandbox = (id: string, ade: AdeId) => invoke<void>("connect_sandbox", { id, ade });
 export const dismissProgress = () => invoke<void>("dismiss_progress");
-export const refreshT3 = () => invoke<void>("refresh_t3");
-export const openInT3 = (id: string) => invoke<void>("open_in_t3", { id });
-export const pairAgain = (id: string) => invoke<void>("pair_again", { id });
+/** Looks for every ADE's desktop app on this computer again. */
+export const refreshAdes = () => invoke<void>("refresh_t3");
+/** Opens the sandbox in the ADE; a sandbox without it gets it first. */
+export const openInAde = (id: string, ade: AdeId) => invoke<void>("open_in_t3", { id, ade });
+export const pairAgain = (id: string) => invoke<void>("pair_again", { id, ade: "t3" });
 export const pause = (id: string) => invoke<void>("pause", { id });
 export const resume = (id: string) => invoke<void>("resume", { id });
 export const deleteSandbox = (id: string) => invoke<void>("delete", { id });
 export const resize = (id: string, vcpus: number, memMiB: number) => invoke<void>("resize", { id, vcpus, memMiB });
 export const setAutoSleep = (id: string, seconds: number) => invoke<void>("set_auto_sleep", { id, seconds });
-export const reinstallT3 = (id: string) => invoke<void>("reinstall_t3", { id });
+/** Sets T3 up again at this computer's version: Reinstall and Update. */
+export const reinstallT3 = (id: string) => invoke<void>("reinstall_t3", { id, ade: "t3" });
 export const agentSignIn = (id: string, agent: Agent) => invoke<void>("agent_sign_in", { id, agent });
 export const agentStatus = (id: string, agent: Agent) => invoke<boolean>("agent_status", { id, agent });
 export const sshCommand = (id: string) => invoke<string>("ssh_command", { id });

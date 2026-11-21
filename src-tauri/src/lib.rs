@@ -46,11 +46,13 @@ pub fn run() {
             // A menu-bar app: no Dock icon.
             #[cfg(target_os = "macos")]
             let _ = handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // With an app, the opener runs `open -a <app> -- <url>` on macOS: only that app
+            // gets the URL, whatever else handles its scheme.
             let opener: Opener = {
                 let h = handle.clone();
-                Arc::new(move |url| {
+                Arc::new(move |url: &str, app: Option<&std::path::Path>| {
                     h.opener()
-                        .open_url(url, None::<&str>)
+                        .open_url(url, app.map(|p| p.to_string_lossy().into_owned()))
                         .map_err(|e| e.to_string())
                 })
             };

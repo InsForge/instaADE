@@ -1,9 +1,12 @@
-import type { ErrorView, SandboxView } from "./types";
+import { adeName, hasAde } from "./ades";
+import type { Mode } from "./ades";
+import type { AdeId, AppState, ErrorView, SandboxView } from "./types";
 
 interface Props {
   error: ErrorView;
-  sandboxes: SandboxView[];
-  onConnect: (id: string) => void;
+  state: AppState;
+  mode: Mode;
+  onConnect: (id: string, ade: AdeId) => void;
   /** Present when a retry makes sense for this error. */
   onRetry?: () => void;
 }
@@ -28,20 +31,20 @@ export function errorTone(error: ErrorView): "info" | "warn" | "danger" {
   return "danger";
 }
 
-/** The free-limit error offers Connect on the sandbox that is not in T3 Code yet. */
-export const unconnectedFor = (error: ErrorView, sandboxes: SandboxView[]) =>
-  error.kind === "freeLimit" ? sandboxes.find((s) => !s.connected) : undefined;
+/** In an ADE mode, the free-limit error offers Connect on the sandbox that does not have the ADE yet. */
+export const unconnectedFor = (error: ErrorView, sandboxes: SandboxView[], mode: Mode) =>
+  error.kind === "freeLimit" && mode !== "instabox" ? sandboxes.find((s) => !hasAde(s, mode)) : undefined;
 
 /** The compact banner under the header. */
-export default function ErrorNotice({ error, sandboxes, onConnect, onRetry }: Props) {
+export default function ErrorNotice({ error, state, mode, onConnect, onRetry }: Props) {
   const tone = errorTone(error);
-  const unconnected = unconnectedFor(error, sandboxes);
+  const unconnected = unconnectedFor(error, state.sandboxes, mode);
   return (
     <div className={`banner ${tone}`} role={tone === "info" ? "status" : "alert"}>
       {error.kind === "setup" ? <pre className="banner-text">{error.message}</pre> : <span className="banner-text">{errorCopy(error)}</span>}
-      {unconnected && (
-        <button className="btn sm" onClick={() => onConnect(unconnected.id)}>
-          Connect to T3 Code
+      {unconnected && mode !== "instabox" && (
+        <button className="btn sm" onClick={() => onConnect(unconnected.id, mode)}>
+          Connect to {adeName(state, mode)}
         </button>
       )}
       {error.kind === "setup" && onRetry && (

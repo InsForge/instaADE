@@ -10,18 +10,60 @@ use crate::api::types::{Machine, MachineSpec, Me, Template};
 
 /// The server's idle time when a machine sets none, and the free plan's fixed one.
 const DEFAULT_SLEEP_SECONDS: i64 = 1800;
-/// The metadata key that marks a sandbox as connected. Its value is the ADE's id.
+/// The metadata key v0.1.x reads: one ADE id. It holds `t3` while T3 is among the sandbox's
+/// ADEs, so v0.1.x still sees a T3 sandbox as connected (and syncs and reconnects it as
+/// before); else the first id of `ADES_KEY`.
 pub(crate) const BRIDGE_KEY: &str = "instabox-bridge";
+/// Every ADE id set up on the sandbox, comma separated, in the order they were added:
+/// `t3,cmux`.
+pub(crate) const ADES_KEY: &str = "instabox-ades";
 
-/// The ADE a sandbox is marked as connected to. Sandboxes connected by v0.1.x hold `t3`.
-/// None when there is no mark or its value is not a known ADE id.
-pub fn marked_ade(metadata: &BTreeMap<String, String>) -> Option<Ade> {
-    metadata.get(BRIDGE_KEY).and_then(|v| Ade::from_id(v))
+/// Every id in the mark, ones this build does not know too, each once: the ids of
+/// `ADES_KEY`, then the `BRIDGE_KEY` id when the list lacks it (v0.1.x writes only that key).
+fn mark_ids(metadata: &BTreeMap<String, String>) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let listed = metadata
+        .get(ADES_KEY)
+        .into_iter()
+        .flat_map(|v| v.split(','));
+    for id in listed.chain(metadata.get(BRIDGE_KEY).map(String::as_str)) {
+        let id = id.trim();
+        if !id.is_empty() && !ids.iter().any(|x| x == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
-/// Marks a sandbox's metadata as connected to `ade`. Other keys stay.
+/// True when the sandbox carries a mark at all, even one of ADEs this build does not know.
+pub fn has_mark(metadata: &BTreeMap<String, String>) -> bool {
+    metadata.contains_key(BRIDGE_KEY) || metadata.contains_key(ADES_KEY)
+}
+
+/// The ADEs a sandbox is marked with, in the order they were added. Ids this build does not
+/// know (written by a newer one) are skipped. Empty without a mark.
+pub fn marked_ades(metadata: &BTreeMap<String, String>) -> Vec<Ade> {
+    mark_ids(metadata)
+        .iter()
+        .filter_map(|id| Ade::from_id(id))
+        .collect()
+}
+
+/// Adds `ade` to a sandbox's mark and writes both keys. Every id already there stays, ones
+/// this build does not know too, and so does every other key.
 pub fn mark(metadata: &mut BTreeMap<String, String>, ade: Ade) {
-    metadata.insert(BRIDGE_KEY.to_string(), ade.id().to_string());
+    let mut ids = mark_ids(metadata);
+    if !ids.iter().any(|id| id == ade.id()) {
+        ids.push(ade.id().to_string());
+    }
+    let t3 = Ade::T3.id();
+    let bridge = if ids.iter().any(|id| id == t3) {
+        t3
+    } else {
+        &ids[0]
+    };
+    metadata.insert(BRIDGE_KEY.to_string(), bridge.to_string());
+    metadata.insert(ADES_KEY.to_string(), ids.join(","));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -69,8 +111,8 @@ pub struct SandboxView {
     pub state: ViewState,
     pub size: String,
     pub connected: bool,
-    /// The ADE the sandbox is marked as connected to.
-    pub ade: Option<Ade>,
+    /// The ADEs the sandbox is marked with, in the order they were added.
+    pub ades: Vec<Ade>,
     pub t3_version: Option<String>,
     pub free: bool,
     pub auto_sleep: AutoSleep,
@@ -151,8 +193,8 @@ pub fn view(m: &Machine, now: DateTime<Utc>) -> SandboxView {
         name: m.name.clone(),
         state,
         size: size_label(&m.spec),
-        connected: marked_ade(&m.metadata).is_some(),
-        ade: marked_ade(&m.metadata),
+        connected: !marked_ades(&m.metadata).is_empty(),
+        ades: marked_ades(&m.metadata),
         t3_version: None,
         free: m.free,
         auto_sleep,
@@ -296,27 +338,109 @@ mod tests {
         let v = view(&m, now());
         assert!(v.connected);
         assert_eq!(v.t3_version, None);
-        assert_eq!(v.ade, Some(Ade::T3));
+        assert_eq!(v.ades, [Ade::T3]);
+        m.metadata.insert("instabox-ades".into(), "t3,cmux".into());
+        assert_eq!(view(&m, now()).ades, [Ade::T3, Ade::Cmux]);
+    }
+
+    /// Metadata with another key `a`, and the two mark keys when given.
+    fn marked(bridge: Option<&str>, ades: Option<&str>) -> BTreeMap<String, String> {
+        let mut md = BTreeMap::from([("a".to_string(), "1".to_string())]);
+        if let Some(b) = bridge {
+            md.insert("instabox-bridge".into(), b.into());
+        }
+        if let Some(a) = ades {
+            md.insert("instabox-ades".into(), a.into());
+        }
+        md
     }
 
     #[test]
     fn the_mark_holds_the_ade_id_and_keeps_other_keys() {
-        let mut md = BTreeMap::from([("a".to_string(), "1".to_string())]);
-        assert_eq!(marked_ade(&md), None);
+        let mut md = marked(None, None);
+        assert!(!has_mark(&md));
+        assert_eq!(marked_ades(&md), []);
         mark(&mut md, Ade::T3);
-        // The same mark v0.1.x wrote, so its sandboxes stay connected.
-        assert_eq!(
-            md,
-            BTreeMap::from([
-                ("a".to_string(), "1".to_string()),
-                ("instabox-bridge".to_string(), "t3".to_string()),
-            ])
-        );
-        assert_eq!(marked_ade(&md), Some(Ade::T3));
-        md.insert("instabox-bridge".into(), "other".into());
-        assert_eq!(marked_ade(&md), None);
+        // instabox-bridge is the same mark v0.1.x writes and reads.
+        assert_eq!(md, marked(Some("t3"), Some("t3")));
+        assert!(has_mark(&md));
+        assert_eq!(marked_ades(&md), [Ade::T3]);
+        let unknown = marked(Some("other"), None);
+        assert!(has_mark(&unknown));
+        assert_eq!(marked_ades(&unknown), []);
         let j = serde_json::to_value(view(&machine("running"), now())).unwrap();
-        assert_eq!(j["ade"], serde_json::Value::Null);
+        assert_eq!(j["ades"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_v0_1_mark_alone_reads_as_t3() {
+        // v0.1.x writes only instabox-bridge = t3.
+        let mut md = marked(Some("t3"), None);
+        assert_eq!(marked_ades(&md), [Ade::T3]);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md, marked(Some("t3"), Some("t3")), "the list joins it");
+    }
+
+    #[test]
+    fn a_sandbox_with_t3_and_cmux_keeps_instabox_bridge_exactly_t3() {
+        let mut md = marked(Some("t3"), None);
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked(Some("t3"), Some("t3,cmux")));
+        assert_eq!(marked_ades(&md), [Ade::T3, Ade::Cmux]);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md, marked(Some("t3"), Some("t3,cmux")), "each id once");
+
+        // cmux first, then T3: the list keeps the order, and v0.1.x still reads t3.
+        let mut md = BTreeMap::new();
+        mark(&mut md, Ade::Cmux);
+        mark(&mut md, Ade::T3);
+        assert_eq!(md["instabox-bridge"], "t3");
+        assert_eq!(md["instabox-ades"], "cmux,t3");
+        assert_eq!(marked_ades(&md), [Ade::Cmux, Ade::T3]);
+    }
+
+    #[test]
+    fn a_cmux_only_sandbox_has_instabox_bridge_cmux() {
+        let mut md = marked(None, None);
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked(Some("cmux"), Some("cmux")));
+        assert_eq!(marked_ades(&md), [Ade::Cmux]);
+    }
+
+    #[test]
+    fn instabox_bridge_joins_a_list_that_lacks_it() {
+        // v0.1.x connected T3 on a sandbox with cmux: it overwrote only instabox-bridge.
+        let md = marked(Some("t3"), Some("cmux"));
+        assert_eq!(marked_ades(&md), [Ade::Cmux, Ade::T3]);
+        let mut written = md.clone();
+        mark(&mut written, Ade::Cmux);
+        assert_eq!(written, marked(Some("t3"), Some("cmux,t3")));
+        assert_eq!(
+            marked_ades(&marked(Some("t3"), Some("t3,cmux"))),
+            [Ade::T3, Ade::Cmux]
+        );
+    }
+
+    #[test]
+    fn the_mark_reads_loosely_and_keeps_ids_it_does_not_know() {
+        assert_eq!(
+            marked_ades(&marked(None, Some(" t3 , cmux "))),
+            [Ade::T3, Ade::Cmux]
+        );
+        assert_eq!(marked_ades(&marked(None, Some("t3,,t3,"))), [Ade::T3]);
+        assert_eq!(marked_ades(&marked(Some(""), Some(""))), []);
+        // ADEs a newer build added stay in the list when this build adds its own, and an
+        // unknown instabox-bridge id stays as long as there is no T3.
+        let mut md = marked(Some("orca"), Some("orca,t3"));
+        assert_eq!(marked_ades(&md), [Ade::T3]);
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked(Some("t3"), Some("orca,t3,cmux")));
+        let mut md = marked(Some("orca"), Some("orca"));
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked(Some("orca"), Some("orca,cmux")));
+        let mut md = marked(Some("zed"), None);
+        mark(&mut md, Ade::Cmux);
+        assert_eq!(md, marked(Some("zed"), Some("zed,cmux")));
     }
 
     #[test]
