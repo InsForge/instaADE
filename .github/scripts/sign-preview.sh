@@ -34,7 +34,10 @@ trap cleanup EXIT
 # The build comes from pull request code, so check it is the app this signs and nothing else.
 mkdir "$work/in"
 ditto -x -k "$zip" "$work/in"
+# Hidden entries count too.
+shopt -s dotglob nullglob
 entries=("$work/in"/*)
+shopt -u dotglob nullglob
 [ ${#entries[@]} -eq 1 ] && [ "${entries[0]}" = "$work/in/$NAME.app" ] || fail "the zip must hold only $NAME.app"
 app="$work/in/$NAME.app"
 [ -z "$(find "$app" -type l)" ] || fail "the app must not hold symbolic links"

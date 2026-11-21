@@ -228,6 +228,43 @@ jobs:
 
           It installs next to Instabox. Add the preview-build label again to build a newer commit."
 
+  # A failed build leaves the label on, and only a new label starts a build. Take it off, so
+  # adding it again retries.
+  failed:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: preview-pr
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/pr
+      - name: Take the label off and link the failed build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN: ${{ github.event.workflow_run.html_url }}
+        run: |
+          pr=$(head -c 20 "$RUNNER_TEMP/pr/pr.txt")
+          if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+            echo "The build did not record a pull request number."
+            exit 0
+          fi
+          if ! gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/preview-build" >/dev/null; then
+            echo "#$pr no longer carries the label."
+            exit 0
+          fi
+          gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" \
+            --body "The preview build of ${SHA::7} failed: $RUN. Add the preview-build label again to retry."
+
   cleanup:
     if: >-
       github.event_name == 'pull_request_target' &&
