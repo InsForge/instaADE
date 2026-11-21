@@ -834,7 +834,7 @@ test("settings: update, account, the ADEs on this Mac and start at login", async
     "SSupersetComing soon",
     "ParadevComing soon",
   ]);
-  expect(screen.getByText("A new version of Instabox is ready.")).toBeTruthy();
+  expect(screen.getByText("A new version of InstaBox is ready.")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Download" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.com/v0.2.0" });
 
@@ -936,7 +936,7 @@ test("the switcher lists Instabox, the ADEs on this Mac and the ones coming soon
   const menu = within(screen.getByRole("menu", { name: "Open sandboxes in" }));
   const items = menu.getAllByRole("menuitemradio");
   expect(items.map((b) => b.textContent)).toEqual([
-    "Instabox" + "Sandboxes only, no ADE",
+    "InstaBox" + "Sandboxes only, no ADE",
     "T3 Code" + "0.1.10 on this Mac · on 2 sandboxes",
     "cmux" + "0.64.25 on this Mac · on 1 sandbox",
     "OrcaNot supported yetComing soon",
@@ -965,7 +965,7 @@ test("the switcher on Windows has no cmux", async () => {
     cleanup();
     picked("cmux");
     show({ ades: [t3Ade] }, [{}]);
-    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: Instabox. Switch ADE");
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: InstaBox. Switch ADE");
   } finally {
     ua.mockRestore();
   }
@@ -991,7 +991,7 @@ test("picking an ADE switches the background and the row actions, and is remembe
 
   // Plain Instabox has T3's plain black background.
   await userEvent.click(switcher());
-  await userEvent.click(screen.getByRole("menuitemradio", { name: /Instabox/ }));
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /InstaBox/ }));
   expect(popover().dataset.mode).toBe("instabox");
   expect(theme()).toBe("t3");
   expect(localStorage.getItem(modeKey("alex"))).toBe("instabox");
@@ -1085,7 +1085,7 @@ test("a new sandbox in cmux mode sets cmux up", async () => {
 test("first run after sign-in lands in plain Instabox with a Connect an ADE card", async () => {
   show({ ...noT3, ades: [{ ...t3Ade, version: null }, cmuxAde] }, [{ ades: [] }]);
   expect(await screen.findByText("Open sandboxes in your ADE")).toBeTruthy();
-  expect(switcher().getAttribute("aria-label")).toBe("ADE: Instabox. Switch ADE");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: InstaBox. Switch ADE");
   expect(screen.getByText(/^cmux is on this Mac\. Pick one/)).toBeTruthy();
   // Nothing is forced: the list works, with no ADE actions.
   expect(screen.getByText("dev-1")).toBeTruthy();
@@ -1129,11 +1129,11 @@ test("the default mode keeps v0.1.x users in T3 Code until they pick", async () 
   expect(await modeShown()).toEqual(["ADE: T3 Code. Switch ADE", "t3"]);
   // Neither: plain Instabox.
   show(noT3, [{ ades: [] }, { id: "b", name: "web", ades: ["cmux"] }]);
-  expect(await modeShown()).toEqual(["ADE: Instabox. Switch ADE", "instabox"]);
+  expect(await modeShown()).toEqual(["ADE: InstaBox. Switch ADE", "instabox"]);
   // A pick wins over the default, and it is per user.
   picked("instabox");
   show({}, [{}]);
-  expect(await modeShown()).toEqual(["ADE: Instabox. Switch ADE", "instabox"]);
+  expect(await modeShown()).toEqual(["ADE: InstaBox. Switch ADE", "instabox"]);
   show({ login: "sam" }, [{}]);
   expect(await modeShown()).toEqual(["ADE: T3 Code. Switch ADE", "t3"]);
 });

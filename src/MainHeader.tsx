@@ -44,7 +44,7 @@ export default function MainHeader({ state, mode, switcherOpen, onSwitcherOpenCh
   return (
     <>
       <header ref={toolbar} className={`main-hero-toolbar${showHero ? "" : " main-nav-compact"}`} data-stuck={stuck}>
-        <div className="main-wordmark" role="img" aria-label="Instabox">
+        <div className="main-wordmark" role="img" aria-label="InstaBox">
           <img className="main-wordmark-symbol" src={symbol} alt="" />
         </div>
         <AdeSwitcher state={state} mode={mode} open={switcherOpen} onOpenChange={onSwitcherOpenChange} onChoose={onChoose} />

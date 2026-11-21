@@ -62,7 +62,7 @@ export async function invokePreview(command: string, args: Record<string, unknow
     case "set_start_at_login": state = { ...state, startAtLogin: Boolean(args.on) }; break;
     case "dismiss_progress": state = { ...state, progress: null }; break;
     default:
-      throw { kind: "other", message: "This is a browser preview. Use the Instabox menu bar app for this action." };
+      throw { kind: "other", message: "This is a browser preview. Use the InstaBox menu bar app for this action." };
   }
   for (const cb of listeners) cb(structuredClone(state));
 }

@@ -39,7 +39,7 @@ export function AdeMissing({ state, ade, run }: { state: AppState; ade: AdeId; r
           <span className="strong">
             {name} is not on {thisComputer()}
           </span>
-          <span className="small soft">Instabox opens sandboxes in {name}. Install it first.</span>
+          <span className="small soft">InstaBox opens sandboxes in {name}. Install it first.</span>
         </div>
       </div>
       <div className="warn-buttons">
@@ -71,7 +71,7 @@ export function ConnectAdeCard({ state, onConnect, onNotNow }: { state: AppState
       <div className="ade-card-text">
         <span className="strong">Open sandboxes in your ADE</span>
         <span className="small muted">
-          {here}Pick one to get an Open button on every sandbox. Change it or go back to Instabox from the menu at the top.
+          {here}Pick one to get an Open button on every sandbox. Change it or go back to InstaBox from the menu at the top.
         </span>
       </div>
       <div className="ade-card-buttons">

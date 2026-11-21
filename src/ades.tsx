@@ -38,7 +38,7 @@ export const adeName = (state: AppState, id: AdeId) => state.ades.find((a) => a.
 export const localAde = (state: AppState, id: AdeId) => state.ades.find((a) => a.id === id);
 
 /** The name of a mode, for the switcher. */
-export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? "Instabox" : adeName(state, mode));
+export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? "InstaBox" : adeName(state, mode));
 
 /** True when the ADE is set up on the sandbox (its mark lists it). */
 export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);

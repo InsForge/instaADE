@@ -108,7 +108,7 @@ export default function AdeSwitcher({ state, mode, open, onOpenChange, onChoose 
       </button>
       {open && container && createPortal(
         <div ref={menu} role="menu" aria-label="Open sandboxes in" className="menu ade-menu" onKeyDown={onKeyDown}>
-          {item("instabox", "Instabox", "Sandboxes only, no ADE")}
+          {item("instabox", "InstaBox", "Sandboxes only, no ADE")}
           <div className="menu-sep" role="separator" />
           <span className="ade-menu-label">Open sandboxes in an ADE</span>
           {state.ades.map((a) => item(a.id, a.name, adeLine(a, state)))}
