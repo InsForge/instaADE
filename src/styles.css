@@ -179,25 +179,76 @@ pre {
 }
 
 .main-wordmark {
-  position: relative;
-  width: 83.871px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
   height: 20px;
 }
 
-.main-wordmark-symbol,
-.main-wordmark-text {
+.main-hero-toolbar.main-nav-compact {
+  flex-shrink: 0;
+  margin-bottom: 0;
+  isolation: isolate;
+}
+
+.ambient-view {
+  isolation: isolate;
+}
+
+/* Anchor the theme to the app, so its 200px fade stays put while content scrolls. */
+.app-background {
   position: absolute;
-  display: block;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.app-background .main-hero {
+  --hero-fade-start: 0%;
+  --hero-fade-end: 100%;
+  height: 200px;
+  border-top: 0;
+}
+
+.app-background .hero-atmosphere::before {
+  animation: none;
+}
+
+.main-list-header {
+  --main-nav-height: 44px;
+  --list-head-height: 44px;
+  position: relative;
+  z-index: 5;
+  flex-shrink: 0;
+}
+
+/* Clip scrolling cards below the headers, preserving the shared theme and sharp pixels. */
+.ambient-view .main-list-header .main-nav-compact,
+.ambient-view .main-list-header .list-head {
+  position: relative;
+  top: auto;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.main-scroll.main-scroll-compact {
+  scroll-padding-top: 0;
 }
 
 .main-wordmark-symbol {
-  left: 1.26%;
-  top: 0.48%;
+  display: block;
 }
 
-.main-wordmark-text {
-  left: 28.92%;
-  top: 28.22%;
+.main-scroll-compact[data-empty="true"] {
+  display: flex;
+  flex-direction: column;
+}
+
+.main-scroll-compact > .empty {
+  flex-shrink: 0;
+  margin-block: auto;
 }
 
 .ade-picker {
@@ -1068,6 +1119,9 @@ pre.banner-text {
   gap: 12px;
   min-height: 40px;
   padding: 0 6px 0 10px;
+}
+.settings-view .group {
+  background: var(--card);
 }
 .group-row.plain {
   padding: 0 10px;

@@ -16,7 +16,7 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
   const avatar = state.account?.avatarUrl;
 
   return (
-    <div className="scroll">
+    <div className="scroll settings-view">
       <div className="stack">
         {update && (
           <div className="update">

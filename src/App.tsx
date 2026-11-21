@@ -6,6 +6,7 @@ import Details from "./Details";
 import ErrorNotice from "./ErrorNotice";
 import { Back } from "./icons";
 import MainHeader from "./MainHeader";
+import AppBackground from "./hero/AppBackground";
 import { useAdeConnections } from "./ade";
 import type { Ade } from "./ade";
 import { placeholderMessage, placeholderSandboxes } from "./placeholders";
@@ -28,7 +29,7 @@ const sameError = (a: ErrorView | null | undefined, b: ErrorView | null | undefi
 export const CONFIRM_IN_T3 = "Confirm the new environment in T3 Code";
 export const SSH_COPIED = "SSH command copied";
 
-export default function App() {
+export default function App({ showHero = false }: { showHero?: boolean }) {
   const [ade, setAde] = useState<Ade>("t3");
   const [sourceState, setState] = useState<AppState | null>(null);
   // T3 uses the native state; other ADEs show independent examples on both platforms.
@@ -149,7 +150,7 @@ export default function App() {
   // First run has no header: setup draws its own brand block.
   let header = null;
   if (!needSetup && current.name === "list") {
-    header = <MainHeader ade={ade} onAdeChange={changeAde} />;
+    header = <MainHeader ade={ade} onAdeChange={changeAde} showHero={showHero} />;
   } else if (!needSetup) {
     const title = current.name === "new" ? "New sandbox" : current.name === "settings" ? "Settings" : (sandbox?.name ?? "");
     header = (
@@ -178,17 +179,18 @@ export default function App() {
   if (needSetup) {
     body = <Setup state={state} run={run} />;
   } else if (current.name === "new") {
-    body = <NewSandbox state={state} run={run} onConnect={connect} onCreate={create} onBack={back} />;
+    body = <NewSandbox state={state} ade={ade} run={run} onConnect={connect} onCreate={create} onBack={back} />;
   } else if (current.name === "settings") {
     body = <Settings state={state} run={run} />;
   } else if (sandbox) {
     body = (
-      <Details key={sandbox.id} state={state} sandbox={sandbox} run={run} agents={agents} onAgentStatus={onAgentStatus} onConnect={connect} />
+      <Details key={sandbox.id} state={state} ade={ade} sandbox={sandbox} run={run} agents={agents} onAgentStatus={onAgentStatus} onConnect={connect} />
     );
   } else {
     body = (
       <SandboxList
         header={<>{header}{banners}</>}
+        showHero={showHero}
         state={state}
         ade={ade}
         adeMissing={adeMissing}
@@ -198,10 +200,10 @@ export default function App() {
         agents={agents}
         pending={pending}
         menuFor={menu?.id ?? null}
-        onNew={() => ade === "t3" ? go({ name: "new" }) : setNotice(placeholderMessage)}
+        onNew={() => go({ name: "new" })}
         onSettings={() => go({ name: "settings" })}
         onConnect={connect}
-        onDetails={(id) => ade === "t3" ? go({ name: "details", id }) : setNotice(placeholderMessage)}
+        onDetails={(id) => go({ name: "details", id })}
         onMenu={(id, anchor) => ade === "t3" ? toggleMenu(id, anchor) : setNotice(placeholderMessage)}
         onAgentStatus={onAgentStatus}
       />
@@ -210,7 +212,8 @@ export default function App() {
 
   const menuSandbox = menu && !needSetup && (current.name === "list" || current.name === "details") ? state.sandboxes.find((s) => s.id === menu.id) : undefined;
   return (
-    <main className={`popover${needSetup ? " sign-in-view" : isList ? " main-view" : ""}`} ref={root}>
+    <main className={`popover${needSetup ? " sign-in-view" : isList ? " main-view" : ""}${!needSetup && !showHero ? " ambient-view" : ""}`} ref={root}>
+      {!needSetup && !showHero && <AppBackground ade={ade} />}
       {!isList && header}
       {!isList && banners}
       {body}
