@@ -124,8 +124,10 @@ jobs:
   publish:
     needs: [resolve, sign]
     runs-on: ubuntu-latest
+    # One pull request's publish and cleanup run one at a time, so a cleanup never finishes
+    # before an upload it should have deleted.
     concurrency:
-      group: preview-publish
+      group: preview-pr-${{ needs.resolve.outputs.pr }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -149,12 +151,25 @@ jobs:
           PR: ${{ needs.resolve.outputs.pr }}
           SHA: ${{ needs.resolve.outputs.sha }}
         run: |
+          # Signing takes minutes: check again that the pull request is open at the built commit.
+          info=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state,headRefOid)
+          if [ "$(jq -r .state <<<"$info")" != "OPEN" ]; then
+            echo "#$PR closed while the preview was signed. Nothing to publish."
+            exit 0
+          fi
+          if [ "$(jq -r .headRefOid <<<"$info")" != "$SHA" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" \
+              --body "A newer commit arrived while the preview of ${SHA::7} was signed, so it was not published. Add the preview-build label again to build the newer commit."
+            exit 0
+          fi
           prefix="Instabox-Preview-pr$PR-"
           mv windows/preview.exe "files/$prefix${SHA::7}-x64-setup.exe"
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Another pull request's publish may create it at the same time.
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main --prerelease --latest=false \
               --title "Instabox Preview" \
-              --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. Instabox Preview installs next to Instabox and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs."
+              --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. Instabox Preview installs next to Instabox and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs." ||
+              gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
             { grep "^$prefix" || true; } |
@@ -178,7 +193,7 @@ jobs:
       (github.event.action == 'closed' || github.event.label.name == 'preview-build')
     runs-on: ubuntu-latest
     concurrency:
-      group: preview-publish
+      group: preview-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: false
     permissions:
       contents: write

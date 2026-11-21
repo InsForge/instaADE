@@ -11,7 +11,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use url::Url;
 
-use crate::KEYCHAIN_SERVICE;
 use crate::api::Client;
 use crate::gate::{Gate, guarded};
 use crate::process::{RunError, command, run_bounded};
@@ -50,7 +49,7 @@ pub struct KeyringKeyStore;
 
 impl KeyringKeyStore {
     fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+        keyring::Entry::new(crate::keychain_service(), KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
     }
 }
 

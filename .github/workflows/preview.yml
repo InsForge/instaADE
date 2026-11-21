@@ -28,9 +28,6 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
-    env:
-      # Instabox Preview keeps its own sign-in, apart from Instabox.
-      INSTABOX_KEYCHAIN_SERVICE: sh.instabox.bridge.preview
     steps:
       - uses: actions/checkout@v4
         with:

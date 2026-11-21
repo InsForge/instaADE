@@ -11,7 +11,6 @@ use chrono::Utc;
 use tokio::sync::{Mutex, watch};
 use url::Url;
 
-use crate::KEYCHAIN_SERVICE;
 use crate::api::{self, ApiErrorBody, Credentials, DeviceStart, Tokens};
 
 const KEYCHAIN_ACCOUNT: &str = "tokens";
@@ -81,7 +80,7 @@ pub struct KeyringStore;
 
 impl KeyringStore {
     fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+        keyring::Entry::new(crate::keychain_service(), KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
     }
 }
 
