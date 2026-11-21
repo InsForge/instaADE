@@ -2,12 +2,15 @@
 //! `cmux://ssh` link opens a workspace, and `cmux ssh` uploads its own `cmuxd-remote` to the
 //! sandbox, pinned to the app's version. So nothing is installed on the sandbox and no
 //! versions must match; the sandbox only needs `PREP_SCRIPT` once, before the first link.
-//! On this computer: find the app and read its version from its bundle.
+//! On this computer: find the real cmux app (its identifier and its signature, not only its
+//! name) and read its version from its bundle.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::ade::{Link, Platform, SshLogin};
+use crate::process::{command, run_bounded};
 
 pub const ID: &str = "cmux";
 pub const NAME: &str = "cmux";
@@ -23,42 +26,104 @@ pub const URL_SCHEME: &str = "cmux";
 
 const BUNDLE: &str = "cmux.app";
 const VERSION_KEY: &str = "CFBundleShortVersionString";
+const ID_KEY: &str = "CFBundleIdentifier";
 
-/// The cmux app bundle in the first of `dirs` that has one.
-pub fn locate_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+/// The bundle identifier of the cmux app.
+pub const BUNDLE_ID: &str = "com.cmuxterm.app";
+/// The code requirement the cmux app must satisfy: cmux's identifier, signed with the
+/// Developer ID of Manaflow, Inc. (team 7WLXT3NR37). The cmux link holds an SSH token, so
+/// only an app that meets it may get one.
+pub const REQUIREMENT: &str = r#"identifier "com.cmuxterm.app" and anchor apple generic and certificate leaf[subject.OU] = "7WLXT3NR37""#;
+/// A signature check that takes longer counts as failed.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The cmux app bundle in the first of `dirs` that has one `verify` accepts.
+pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     dirs.iter()
         .map(|d| d.join(BUNDLE))
-        .find(|app| app.join("Contents").join("Info.plist").is_file())
+        .filter(|app| app.join("Contents").join("Info.plist").is_file())
+        .find(|app| verify(app))
 }
 
-/// The cmux app bundle in `/Applications` or `~/Applications`, if it is there.
+/// The cmux app in `/Applications` or `~/Applications`, if one there is the real cmux
+/// (`verify`). A bundle that only has the name counts as not installed.
 pub fn locate() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
     let mut dirs = vec![PathBuf::from("/Applications")];
     dirs.extend(dirs::home_dir().map(|h| h.join("Applications")));
-    locate_in(&dirs)
+    locate_in(&dirs, verify)
 }
 
-/// The version in the bundle's `Info.plist` (XML or binary), such as `0.64.25`.
-pub fn version(app: &Path) -> Result<String> {
+/// True when the bundle at `app` is the real cmux: its `Info.plist` names `BUNDLE_ID`, and
+/// codesign finds its signature valid and meeting `REQUIREMENT`. Blocks for a few seconds.
+pub fn verify(app: &Path) -> bool {
+    verify_with(app, codesign_meets_requirement)
+}
+
+/// `verify` with the signature check `signed`.
+pub fn verify_with(app: &Path, signed: impl Fn(&Path) -> bool) -> bool {
+    plist_string(app, ID_KEY).is_ok_and(|id| id == BUNDLE_ID) && signed(app)
+}
+
+/// `codesign --verify --strict` of `app` against `REQUIREMENT`, run with no shell and a
+/// deadline. Anything but exit 0 fails, and so does every platform but macOS.
+pub fn codesign_meets_requirement(app: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let mut cmd = command("/usr/bin/codesign");
+    cmd.arg("--verify")
+        .arg("--strict")
+        .arg(format!("-R={REQUIREMENT}"))
+        .arg(app);
+    matches!(run_bounded(cmd, VERIFY_TIMEOUT), Ok((Some(0), _, _)))
+}
+
+/// A string from the bundle's `Info.plist` (XML or binary).
+fn plist_string(app: &Path, key: &str) -> Result<String> {
     let plist = app.join("Contents").join("Info.plist");
     let value = plist::Value::from_file(&plist)
         .with_context(|| format!("could not read {}", plist.display()))?;
-    let v = value
+    Ok(value
         .as_dictionary()
-        .and_then(|d| d.get(VERSION_KEY))
+        .and_then(|d| d.get(key))
         .and_then(plist::Value::as_string)
-        .with_context(|| format!("no {VERSION_KEY} in {}", plist.display()))?
-        .trim();
+        .with_context(|| format!("no {key} in {}", plist.display()))?
+        .trim()
+        .to_string())
+}
+
+/// The version in the bundle's `Info.plist`, such as `0.64.25`.
+pub fn version(app: &Path) -> Result<String> {
+    let v = plist_string(app, VERSION_KEY)?;
     let ok = !v.is_empty()
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'));
     if !ok {
         bail!("unrecognized cmux version: {v}");
     }
-    Ok(v.to_string())
+    Ok(v)
+}
+
+/// Test only: a bundle named cmux.app in `dir` whose `Info.plist` has `id` and `version`,
+/// in XML or binary form. It has no code and no signature.
+#[cfg(test)]
+pub(crate) fn test_bundle(dir: &Path, id: &str, version: &str, binary: bool) -> PathBuf {
+    let mut d = plist::Dictionary::new();
+    d.insert(ID_KEY.into(), id.into());
+    d.insert(VERSION_KEY.into(), version.into());
+    let app = dir.join(BUNDLE);
+    std::fs::create_dir_all(app.join("Contents")).unwrap();
+    let path = app.join("Contents").join("Info.plist");
+    let value = plist::Value::Dictionary(d);
+    if binary {
+        value.to_file_binary(&path).unwrap();
+    } else {
+        value.to_file_xml(&path).unwrap();
+    }
+    app
 }
 
 // ---- the sandbox ----
@@ -222,47 +287,90 @@ mod tests {
         assert_eq!(q[0], ("host".to_string(), "ssh.instabox.sh".to_string()));
     }
 
-    fn bundle(dir: &Path, plist: &plist::Value, binary: bool) -> PathBuf {
-        let app = dir.join(BUNDLE);
-        std::fs::create_dir_all(app.join("Contents")).unwrap();
-        let path = app.join("Contents").join("Info.plist");
-        if binary {
-            plist.to_file_binary(&path).unwrap();
-        } else {
-            plist.to_file_xml(&path).unwrap();
-        }
-        app
-    }
-
-    fn info(version: &str) -> plist::Value {
-        let mut d = plist::Dictionary::new();
-        d.insert("CFBundleIdentifier".into(), "com.cmuxterm.app".into());
-        d.insert(VERSION_KEY.into(), version.into());
-        plist::Value::Dictionary(d)
+    /// A signature check that passes or fails without running codesign.
+    fn signed(ok: bool) -> impl Fn(&Path) -> bool {
+        move |_| ok
     }
 
     #[test]
-    fn finds_the_app_in_the_first_folder_that_has_it() {
+    fn finds_the_first_real_app_and_skips_lookalikes() {
         let system = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
-        assert_eq!(locate_in(&dirs), None, "not installed");
+        let real = |p: &Path| verify_with(p, signed(true));
+        assert_eq!(locate_in(&dirs, real), None, "not installed");
         // A folder named cmux.app without a bundle is not the app.
         std::fs::create_dir_all(user.path().join(BUNDLE)).unwrap();
-        assert_eq!(locate_in(&dirs), None);
-        let app = bundle(user.path(), &info("0.64.25"), false);
-        assert_eq!(locate_in(&dirs), Some(app), "~/Applications");
-        let app = bundle(system.path(), &info("0.64.25"), false);
-        assert_eq!(locate_in(&dirs), Some(app), "/Applications first");
+        assert_eq!(locate_in(&dirs, real), None);
+        let app = test_bundle(user.path(), BUNDLE_ID, "0.64.25", false);
+        assert_eq!(locate_in(&dirs, real), Some(app.clone()), "~/Applications");
+        // A bundle with another identifier in /Applications does not hide the real one.
+        test_bundle(system.path(), "com.example.cmux", "9.9.9", false);
+        assert_eq!(
+            locate_in(&dirs, real),
+            Some(app),
+            "the lookalike is skipped"
+        );
+        let app = test_bundle(system.path(), BUNDLE_ID, "0.64.25", false);
+        assert_eq!(locate_in(&dirs, real), Some(app), "/Applications first");
+        // The right identifier without the signature counts as not installed.
+        assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
+    }
+
+    #[test]
+    fn only_cmux_bundle_id_and_a_good_signature_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = test_bundle(dir.path(), BUNDLE_ID, "0.64.25", true);
+        assert!(verify_with(&good, signed(true)));
+        assert!(!verify_with(&good, signed(false)), "a bad signature");
+        let dir = tempfile::tempdir().unwrap();
+        let other = test_bundle(dir.path(), "com.cmuxterm.app.evil", "0.64.25", false);
+        let asked = std::cell::Cell::new(false);
+        let check = |_: &Path| {
+            asked.set(true);
+            true
+        };
+        assert!(!verify_with(&other, check), "another identifier");
+        assert!(!asked.get(), "no signature check for the wrong identifier");
+        assert!(!verify_with(&dir.path().join("none.app"), signed(true)));
+    }
+
+    #[test]
+    fn the_requirement_names_cmux_and_its_developer() {
+        assert_eq!(BUNDLE_ID, "com.cmuxterm.app");
+        assert!(REQUIREMENT.contains(r#"identifier "com.cmuxterm.app""#));
+        assert!(REQUIREMENT.contains("anchor apple generic"));
+        assert!(REQUIREMENT.contains(r#"certificate leaf[subject.OU] = "7WLXT3NR37""#));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codesign_turns_down_an_unsigned_lookalike() {
+        // The real check, run on a bundle with cmux's identifier and no code or signature.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = test_bundle(dir.path(), BUNDLE_ID, "0.64.25", false);
+        assert!(!codesign_meets_requirement(&fake));
+        assert!(!verify(&fake));
+    }
+
+    /// The real check against the installed cmux, when this Mac has it. It runs codesign
+    /// only; it does not open the app.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_installed_cmux_passes_the_real_check() {
+        let app = Path::new("/Applications/cmux.app");
+        if app.join("Contents").join("Info.plist").is_file() {
+            assert!(verify(app), "{} did not verify", app.display());
+        }
     }
 
     #[test]
     fn reads_the_version_from_an_xml_or_binary_info_plist() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bundle(dir.path(), &info("0.64.25"), false);
+        let app = test_bundle(dir.path(), BUNDLE_ID, "0.64.25", false);
         assert_eq!(version(&app).unwrap(), "0.64.25");
         let dir = tempfile::tempdir().unwrap();
-        let app = bundle(dir.path(), &info("0.65.2.2"), true);
+        let app = test_bundle(dir.path(), BUNDLE_ID, "0.65.2.2", true);
         assert_eq!(version(&app).unwrap(), "0.65.2.2");
     }
 
@@ -270,21 +378,22 @@ mod tests {
     fn a_missing_or_odd_version_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(version(&dir.path().join(BUNDLE)).is_err(), "no bundle");
-        let app = bundle(dir.path(), &info("1.0; rm -rf /"), false);
+        let app = test_bundle(dir.path(), BUNDLE_ID, "1.0; rm -rf /", false);
         assert!(version(&app).is_err());
         let dir = tempfile::tempdir().unwrap();
-        let app = bundle(
-            dir.path(),
-            &plist::Value::Dictionary(plist::Dictionary::new()),
-            false,
-        );
+        let app = dir.path().join(BUNDLE);
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        plist::Value::Dictionary(plist::Dictionary::new())
+            .to_file_xml(app.join("Contents").join("Info.plist"))
+            .unwrap();
         assert!(version(&app).is_err(), "no version key");
     }
 
     #[test]
-    fn locate_looks_on_macos_only() {
+    fn locate_and_the_signature_check_are_macos_only() {
         if !cfg!(target_os = "macos") {
             assert_eq!(locate(), None);
+            assert!(!codesign_meets_requirement(Path::new("cmux.app")));
         }
     }
 

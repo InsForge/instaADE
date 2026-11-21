@@ -181,6 +181,17 @@ impl Ade {
         }
     }
 
+    /// True when the app at `path` is the ADE's own, checked again right before the app hands
+    /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
+    /// link). T3: the app gets no token from a link, so the path `locate` found stands.
+    /// Blocks for a few seconds, so run it off the async runtime.
+    pub fn verify(self, path: &Path) -> bool {
+        match self {
+            Ade::T3 => true,
+            Ade::Cmux => cmux::verify(path),
+        }
+    }
+
     /// The version of the desktop app on this computer; None when it is not found or does not
     /// answer. It blocks, so run it off the async runtime.
     pub fn detect(self) -> Option<String> {

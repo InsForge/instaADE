@@ -46,6 +46,8 @@ pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
 pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send + Sync>;
 /// Finds an ADE's desktop app on this computer (`Ade::locate`).
 pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
+/// Checks that the app at a path is the ADE's own (`Ade::verify`).
+pub type Verifier = Arc<dyn Fn(Ade, &Path) -> bool + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -681,8 +683,9 @@ pub struct Core {
     ssh: Arc<dyn SshTokenStore>,
     connected: Arc<dyn ConnectedStore>,
     open: Opener,
-    /// `Ade::locate`; a test puts its own in place.
+    /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
     locate: Locator,
+    verify: Verifier,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -791,6 +794,7 @@ impl Core {
             connected,
             open,
             locate: Arc::new(Ade::locate),
+            verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -806,10 +810,12 @@ impl Core {
         }
     }
 
-    /// Test only: finds the ADEs' apps with `locate` instead of on this computer.
+    /// Test only: finds the ADEs' apps with `locate` and checks them with `verify` instead of
+    /// on this computer.
     #[cfg(test)]
-    fn with_locate(mut self, locate: Locator) -> Core {
+    fn with_apps(mut self, locate: Locator, verify: Verifier) -> Core {
         self.locate = locate;
+        self.verify = verify;
         self
     }
 
@@ -1499,23 +1505,39 @@ impl Core {
     }
 
     /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
-    /// in the ADE's app found on this computer, never in whatever handles its scheme; with no
-    /// app found, nothing opens and no token is made. The token comes from `ssh::token`: the
-    /// stored one while it has more than a day left, else a new 30-day one.
+    /// in the ADE's own app found on this computer, never in whatever handles its scheme. The
+    /// app is checked again (identifier and signature) right before the token is made or
+    /// loaded: with no app, or one that fails the check, no token is made and nothing opens.
+    /// The token comes from `ssh::token`: the stored one while it has more than a day left,
+    /// else a new 30-day one.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<()> {
         let Open::Link(l) = ade.open() else {
             return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
         };
-        let locate = self.locate.clone();
-        let Some(app) = tokio::task::spawn_blocking(move || locate(ade))
-            .await
-            .ok()
-            .flatten()
-        else {
-            return Err(ErrorView::other(format!(
-                "{} is not installed. Install it first.",
-                ade.name()
-            )));
+        let (locate, verify) = (self.locate.clone(), self.verify.clone());
+        let checked = tokio::task::spawn_blocking(move || {
+            locate(ade).map(|app| {
+                let ok = verify(ade, &app);
+                (app, ok)
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        let app = match checked {
+            Some((app, true)) => app,
+            Some((_, false)) => {
+                return Err(ErrorView::other(format!(
+                    "Could not verify the {} app. Install it again from its official download.",
+                    ade.name()
+                )));
+            }
+            None => {
+                return Err(ErrorView::other(format!(
+                    "{} is not installed. Install it first.",
+                    ade.name()
+                )));
+            }
         };
         let (client, title) = self
             .read_in(account, |i| {
@@ -3649,31 +3671,63 @@ mod tests {
 
     const CMUX_LINK: &str = "cmux://ssh?host=ssh.example.test&user=ibssh_new&port=2222&title=dev%201&host-key-policy=accept-new";
 
-    /// Where the test cores find the cmux app.
-    const CMUX_APP: &str = "/test/Applications/cmux.app";
+    /// The cmux.app the test computer has.
+    #[derive(Clone, Copy, PartialEq)]
+    enum CmuxHere {
+        /// cmux's identifier and a signature that passes.
+        Real,
+        /// A bundle named cmux.app with another identifier.
+        OtherId,
+        /// cmux's identifier, but the signature check fails.
+        BadSignature,
+        Missing,
+    }
 
-    /// A signed-in core with a recording opener that finds cmux at `CMUX_APP`, or nowhere.
-    fn cmux_core(
-        base: &Url,
-        ssh: Arc<MemorySshStore>,
-        cmux_found: bool,
-    ) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
+    /// A signed-in core with a recording opener and a cmux.app as `here` says. The app is a
+    /// real bundle on disk, checked by the production identifier check; only codesign is
+    /// replaced by `here`.
+    struct CmuxCore {
+        core: Arc<Core>,
+        opened: Arc<Mutex<Vec<String>>>,
+        app: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn cmux_core(base: &Url, ssh: Arc<MemorySshStore>, here: CmuxHere) -> CmuxCore {
+        let dir = tempfile::tempdir().unwrap();
+        let id = if here == CmuxHere::OtherId {
+            "com.example.cmux"
+        } else {
+            ade::cmux::BUNDLE_ID
+        };
+        let app = ade::cmux::test_bundle(dir.path(), id, "0.64.25", false);
         let (core, opened) = recording_core(
             base.clone(),
             Arc::new(MemoryKeyStore::default()),
             ssh,
             PathBuf::from("/nonexistent"),
         );
-        let core = Arc::new(core.with_locate(Arc::new(move |ade| {
-            (cmux_found && ade == Ade::Cmux).then(|| PathBuf::from(CMUX_APP))
-        })));
+        let found = app.clone();
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| {
+                (here != CmuxHere::Missing && ade == Ade::Cmux).then(|| found.clone())
+            }),
+            Arc::new(move |ade, path| {
+                ade == Ade::Cmux && ade::cmux::verify_with(path, |_| here != CmuxHere::BadSignature)
+            }),
+        ));
         sign_in_as(&core, base, 7);
-        (core, opened)
+        CmuxCore {
+            core,
+            opened,
+            app,
+            _dir: dir,
+        }
     }
 
     /// The cmux link as the opener got it: always with the cmux app named.
-    fn cmux_opened() -> String {
-        format!("{CMUX_LINK} in {CMUX_APP}")
+    fn cmux_opened(app: &Path) -> String {
+        format!("{CMUX_LINK} in {}", app.display())
     }
 
     #[tokio::test]
@@ -3682,11 +3736,16 @@ mod tests {
             cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3,cmux"}))
                 .await;
         let ssh = Arc::new(MemorySshStore::default());
-        let (core, opened) = cmux_core(&base, ssh.clone(), true);
+        let CmuxCore {
+            core,
+            opened,
+            app,
+            _dir,
+        } = cmux_core(&base, ssh.clone(), CmuxHere::Real);
         core.refresh(false).await;
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
         // Never the default handler of cmux:// links: the link holds the SSH token.
-        assert_eq!(*opened.lock().unwrap(), [cmux_opened()]);
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)]);
         let r = requests(&server).await;
         assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
         assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
@@ -3698,7 +3757,10 @@ mod tests {
         // The token is kept, so the next open reuses it.
         assert_eq!(ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
-        assert_eq!(*opened.lock().unwrap(), [cmux_opened(), cmux_opened()]);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [cmux_opened(&app), cmux_opened(&app)]
+        );
         let r = requests(&server).await;
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
     }
@@ -3708,7 +3770,16 @@ mod tests {
         let (server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}))
                 .await;
-        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), false);
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(
+            &base,
+            Arc::new(MemorySshStore::default()),
+            CmuxHere::Missing,
+        );
         core.refresh(false).await;
         let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
         assert_eq!(e.message, "cmux is not installed. Install it first.");
@@ -3725,13 +3796,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cmux_link_never_goes_to_a_lookalike_or_an_unverified_app() {
+        for here in [CmuxHere::OtherId, CmuxHere::BadSignature] {
+            let (server, base) = cmux_server(
+                serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}),
+            )
+            .await;
+            let ssh = Arc::new(MemorySshStore::default());
+            // Even a stored token is not loaded for an app that fails the check.
+            ssh.save("m1", &ssh_token()).unwrap();
+            let CmuxCore {
+                core,
+                opened,
+                app: _,
+                _dir,
+            } = cmux_core(&base, ssh, here);
+            core.refresh(false).await;
+            let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
+            assert_eq!(
+                e.message,
+                "Could not verify the cmux app. Install it again from its official download."
+            );
+            assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+            let r = requests(&server).await;
+            assert!(
+                !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+                "no token: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn open_in_cmux_of_a_sandbox_without_it_runs_the_prep_marks_then_opens() {
         let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
-        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), true);
+        let CmuxCore {
+            core,
+            opened,
+            app,
+            _dir,
+        } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
         core.update(|i| i.state.set_desktop(Ade::Cmux, Some("0.64.25".into())));
         core.refresh(false).await;
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
-        assert_eq!(*opened.lock().unwrap(), [cmux_opened()]);
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)]);
         let reqs = server.received_requests().await.unwrap();
         let execs: Vec<String> = reqs
             .iter()
@@ -3755,7 +3862,12 @@ mod tests {
     async fn adding_cmux_here_to_a_t3_sandbox_from_elsewhere_still_needs_t3_pairing() {
         // Another computer set T3 up and marked the sandbox. This one adds cmux.
         let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
-        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), true);
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
         core.update(|i| {
             i.state.set_desktop(Ade::Cmux, Some("0.64.25".into()));
             i.state.set_desktop(Ade::T3, Some("0.1.11".into()));

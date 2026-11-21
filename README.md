@@ -58,7 +58,7 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 
 ### cmux (macOS)
 
-cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so Instabox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so Instabox opens it only in the cmux app it found in Applications, never in another handler of `cmux://` links and never through cmux.com. Without that app, nothing opens. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so Instabox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so Instabox opens it only in the real cmux app in Applications: its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). Instabox checks this when it looks for cmux and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
 A sandbox can have several ADEs. Its metadata marks them with two keys:
 
