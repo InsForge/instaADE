@@ -109,7 +109,7 @@ export default function App() {
 
   const error = failure ?? state.error;
   const signedOut = !state.signedIn || error?.kind === "signedOut";
-  const needSetup = signedOut || (ade === "t3" && state.t3 === null && state.sandboxes.length === 0);
+  const needSetup = signedOut;
   const current: View = detailsGone ? { name: "list" } : view;
   const sandbox = current.name === "details" ? state.sandboxes.find((s) => s.id === current.id) : undefined;
 
@@ -176,7 +176,7 @@ export default function App() {
 
   let body;
   if (needSetup) {
-    body = <Setup state={{ ...state, signedIn: !signedOut }} run={run} />;
+    body = <Setup state={state} run={run} />;
   } else if (current.name === "new") {
     body = <NewSandbox state={state} run={run} onConnect={connect} onCreate={create} onBack={back} />;
   } else if (current.name === "settings") {
@@ -210,7 +210,7 @@ export default function App() {
 
   const menuSandbox = menu && !needSetup && (current.name === "list" || current.name === "details") ? state.sandboxes.find((s) => s.id === menu.id) : undefined;
   return (
-    <main className={`popover${isList ? " main-view" : ""}`} ref={root}>
+    <main className={`popover${needSetup ? " sign-in-view" : isList ? " main-view" : ""}`} ref={root}>
       {!isList && header}
       {!isList && banners}
       {body}

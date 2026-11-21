@@ -832,11 +832,12 @@ test("settings: no section for agents on this Mac, whatever their MCP state", as
 
 // ---- first run ----
 
-test("first run with T3 Code: sign-in buttons and the found line", async () => {
+test("sign-in with T3 installed shows provider buttons without installation status", async () => {
   show({ signedIn: false, login: null });
   await userEvent.click(await screen.findByRole("button", { name: "Sign in with GitHub" }));
   expect(invoke).toHaveBeenCalledWith("sign_in", { provider: "github" });
-  expect(screen.getByText("T3 Code 0.1.10 found on this Mac")).toBeTruthy();
+  expect(screen.queryByText(/found on this Mac/)).toBeNull();
+  expect(screen.getByText("Run any ADE on an InstaBox Sandbox.")).toBeTruthy();
   expect(screen.queryByText("T3 Code is not on this Mac")).toBeNull();
   expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
 });
@@ -857,20 +858,23 @@ test("Check again shows that it is checking, then that it checked", async () => 
   expect(await screen.findByRole("button", { name: "Check again" }, { timeout: 2500 })).toBeTruthy();
 });
 
-test("first run without T3 Code: Check again and Download T3 Code", async () => {
+test("sign-in without T3 offers both providers without checking installation", async () => {
   show({ signedIn: false, t3: null });
-  expect(await screen.findByText("T3 Code is not on this Mac")).toBeTruthy();
-  await userEvent.click(screen.getByRole("button", { name: "Check again" }));
-  expect(invoke).toHaveBeenCalledWith("refresh_t3");
-  await userEvent.click(screen.getByRole("button", { name: "Download T3 Code" }));
-  expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
-  expect(screen.getByRole("button", { name: "Sign in with Google" })).toBeTruthy();
-  expect(screen.queryByText(/found on this Mac/)).toBeNull();
+  expect(await screen.findByRole("button", { name: "Sign in with GitHub" })).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Sign in with Google" }));
+  expect(invoke).toHaveBeenCalledWith("sign_in", { provider: "google" });
+  expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Download T3 Code" })).toBeNull();
+  expect(screen.queryByText(/T3 Code is not on|found on this Mac/)).toBeNull();
+  expect(calls("refresh_t3")).toHaveLength(0);
 });
 
-test("signed in without T3 Code and no sandboxes stays on setup", async () => {
-  show({ t3: null });
-  expect(await screen.findByText("Signed in as alex")).toBeTruthy();
+test("sign-in completes without T3 and opens the empty sandbox list", async () => {
+  const { state } = show({ signedIn: false, t3: null });
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  act(() => emit({ ...state, signedIn: true }));
+  expect(await screen.findByRole("heading", { name: "No sandboxes" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "New sandbox" })).toBeTruthy();
   expect(screen.getByText("T3 Code is not on this Mac")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Sign in with GitHub" })).toBeNull();
 });
