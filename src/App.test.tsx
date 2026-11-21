@@ -526,29 +526,29 @@ test("a create returns to the list at once and shows the new row while it runs",
   const first = within(screen.getAllByRole("listitem")[0]);
   expect(first.getByText("dev-2")).toBeTruthy();
   expect(first.getByText("2 vCPU / 4 GB · Creating sandbox")).toBeTruthy();
-  act(() => finish());
-  expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
+  await act(async () => finish());
+  // T3 Code asks to confirm in its own window. The popover adds no notice.
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
-test("a successful create asks to confirm in T3 Code once", async () => {
+test("a successful create adds no notice", async () => {
   show({ tier: "pro" }, [{}]);
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "dev-2");
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
-  expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ name: "dev-2" }));
+  await act(async () => {});
   expect(screen.getByText("dev-1")).toBeTruthy();
-  await userEvent.click(screen.getByRole("button", { name: "Settings" }));
-  expect(screen.queryByText("Confirm the new environment in T3 Code")).toBeNull();
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
-test("a failed create shows its message in the list, without the confirm line", async () => {
+test("a failed create shows its message in the list", async () => {
   show({ tier: "pro" }, [{}], { create_sandbox: () => Promise.reject({ kind: "api", message: "no_capacity" }) });
   await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
   await userEvent.type(screen.getByLabelText("Name"), "dev-2");
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(await screen.findByText("no_capacity")).toBeTruthy();
   expect(screen.getByText("dev-1")).toBeTruthy();
-  expect(screen.queryByText("Confirm the new environment in T3 Code")).toBeNull();
 });
 
 const tarBad = { kind: "setup" as const, message: "tar: bad" };
@@ -666,17 +666,19 @@ test("details of a sandbox without T3 offer Install T3 Code", async () => {
   expect(screen.queryByRole("button", { name: "Pair again" })).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Install T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "t3" });
-  expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
-test("details of a sandbox T3 is on but not paired from here: Open pairs it, then asks to confirm", async () => {
+test("details of a sandbox T3 is on but not paired from here: Open pairs it", async () => {
   show({}, [{ connected: false }]);
   await userEvent.click(await screen.findByText("dev-1"));
   // Pair again and Reinstall need a pairing from this computer.
   expect(screen.queryByRole("button", { name: "Pair again" })).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Open in T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "t3" });
-  expect(await screen.findByText("Confirm the new environment in T3 Code")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
 test("details show the T3 version against this Mac and the free plan line", async () => {

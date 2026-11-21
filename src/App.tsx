@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { connectSandbox, createSandbox, getState, onState, openInAde, toErrorView } from "./api";
-import { confirmText, hasAde, pairs } from "./ades";
 import type { Mode } from "./ades";
 import { agentKey } from "./common";
 import type { AgentCache, OnAgentStatus } from "./common";
@@ -25,8 +24,6 @@ type Menu = { id: string; anchor: HTMLElement } | null;
 const sameError = (a: ErrorView | null | undefined, b: ErrorView | null | undefined) =>
   !!a && !!b && a.kind === b.kind && a.message === b.message;
 
-/** Shown once after a create or connect: the pairing dialog waits in T3 Code. */
-export const CONFIRM_IN_T3 = "Confirm the new environment in T3 Code";
 export const SSH_COPIED = "SSH command copied";
 
 /** `showHero`: the browser preview's original hero layout (`?layout=hero`). */
@@ -118,20 +115,18 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setView(v);
   };
   const back = () => go({ name: "list" });
-  /** Sets the ADE up on the sandbox, then opens it: confirm there. */
+  /** Sets the ADE up on the sandbox, then opens it. The ADE asks to confirm in its own window. */
   const connect = (id: string, ade: AdeId) => {
-    void run(() => connectSandbox(id, ade)).then((ok) => ok && setNotice(confirmText(ade)));
+    void run(() => connectSandbox(id, ade));
   };
-  /** Opens the sandbox in the ADE. A link ADE (cmux) asks to confirm every time; T3 only when it paired just now. */
+  /** Opens the sandbox in the ADE. */
   const open = (id: string, ade: AdeId) => {
-    const s = state.sandboxes.find((x) => x.id === id);
-    const ready = !!s && hasAde(s, ade) && (!pairs(ade) || s.connected);
-    void run(() => openInAde(id, ade)).then((ok) => ok && (!pairs(ade) || !ready) && setNotice(confirmText(ade)));
+    void run(() => openInAde(id, ade));
   };
   const create = (args: CreateArgs, size: string) => {
     setPending({ name: args.name, size });
     go({ name: "list" });
-    void run(() => createSandbox(args)).then((ok) => ok && args.ade && setNotice(confirmText(args.ade)));
+    void run(() => createSandbox(args));
   };
   const toggleMenu = (id: string, anchor: HTMLElement) =>
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));

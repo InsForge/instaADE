@@ -51,9 +51,3 @@ export function readyText(state: AppState, s: SandboxView, id: AdeId): string {
   if (id === "t3") return s.t3Version ? `T3 Code ${s.t3Version}` : "T3 Code";
   return `Ready for ${adeName(state, id)}`;
 }
-
-/** Shown once after a connect or create opens T3 Code: what to confirm there. Other ADEs
- * show nothing. */
-export function confirmText(id: AdeId): string | null {
-  return id === "t3" ? "Confirm the new environment in T3 Code" : null;
-}
