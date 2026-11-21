@@ -177,23 +177,35 @@ impl Data {
         self.desktop_behind.remove(id);
     }
 
-    /// The ADEs of sandbox `id` (see `machine_ades`); the default for a sandbox not listed.
+    /// The ADEs sandbox `id` has: the ones its mark lists that this build knows. A sandbox
+    /// with no mark (a plain one) has none. This decides Open against Install.
     pub fn ades_of(&self, id: &str) -> Vec<Ade> {
         self.machines
             .iter()
             .find(|m| m.id == id)
-            .map_or_else(|| vec![Ade::default()], machine_ades)
+            .map(|m| view::marked_ades(&m.metadata))
+            .unwrap_or_default()
     }
 
-    /// The ADE of sandbox `id`: the first it is marked with, else the default. None when its
-    /// mark names only ADEs this build does not know.
+    /// The ADE an action on sandbox `id` uses when none was asked for (see `action_ades`);
+    /// the default for a sandbox not listed. None when its mark names only ADEs this build
+    /// does not know.
     pub fn ade_of(&self, id: &str) -> Option<Ade> {
-        self.ades_of(id).first().copied()
+        self.machines
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| vec![Ade::default()], action_ades)
+            .first()
+            .copied()
     }
 
-    /// The ADE of sandbox `id` that keeps in step with this computer (T3), if it has one.
+    /// The ADE a resume of sandbox `id` keeps in step with this computer (T3), if any (see
+    /// `action_ades`).
     pub fn pinned_ade_of(&self, id: &str) -> Option<Ade> {
-        self.ades_of(id)
+        self.machines
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| vec![Ade::default()], action_ades)
             .into_iter()
             .find(|a| a.pins_local_version())
     }
@@ -306,10 +318,12 @@ pub fn sizes_for(orgs: &[Org], org_id: Option<&str>, me: &Me) -> Vec<SizeChoice>
     view::size_choices(own.unwrap_or(&me.allowed_specs))
 }
 
-/// The ADEs a machine is marked with, in the order they were added, else the default when it
-/// has no mark. Empty when the mark names only ADEs this build does not know, such as one a
-/// newer app connected: such a sandbox never counts as the default.
-fn machine_ades(m: &Machine) -> Vec<Ade> {
+/// The ADEs an action may use on a machine when none was asked for: the ones its mark lists,
+/// in the order they were added, else the default when it has no mark at all. Empty when the
+/// mark names only ADEs this build does not know, such as one a newer app connected: such a
+/// sandbox never counts as the default. Only for picking an ADE to act with (connect, pair
+/// again, reinstall, resume, sync). What a sandbox has is its mark alone (`Data::ades_of`).
+fn action_ades(m: &Machine) -> Vec<Ade> {
     if view::has_mark(&m.metadata) {
         view::marked_ades(&m.metadata)
     } else {
@@ -381,7 +395,7 @@ pub fn version_changed(prev: Option<&str>, new: Option<&str>) -> bool {
 }
 
 /// The sandboxes to sync after a change of `ade`'s desktop version: running, connected from
-/// this computer and of that ADE (among others or alone, see `machine_ades`), in any of the
+/// this computer and of that ADE (among others or alone, see `action_ades`), in any of the
 /// user's orgs. A sandbox someone else connected is left alone.
 pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
     d.machines
@@ -389,7 +403,7 @@ pub fn sync_targets(d: &Data, ade: Ade) -> Vec<String> {
         .filter(|m| view::view_state(&m.state) == ViewState::Running)
         .filter(|m| d.connected.contains(&m.id))
         .filter(|m| template_is_linux(&d.templates, &m.template.id))
-        .filter(|m| machine_ades(m).contains(&ade))
+        .filter(|m| action_ades(m).contains(&ade))
         .map(|m| m.id.clone())
         .collect()
 }
@@ -2750,8 +2764,11 @@ mod tests {
             "b has no T3 to bring along"
         );
         assert_eq!(sync_targets(&d, Ade::Cmux), ["a", "b"]);
-        // No mark is still the default; a mark keeps the ADEs this build knows and skips the rest.
-        assert_eq!(d.ades_of("f"), [Ade::T3]);
+        // No mark: the sandbox has no ADE, and an action with none asked uses the default.
+        assert_eq!(d.ades_of("f"), []);
+        assert_eq!(d.ade_of("f"), Some(Ade::T3));
+        assert_eq!(d.pinned_ade_of("f"), Some(Ade::T3));
+        // A mark keeps the ADEs this build knows and skips the rest.
         let md = &mut d.machines[0].metadata;
         md.insert("instabox-bridge".into(), "t3".into());
         md.insert("instabox-ades".into(), "future-ade,t3".into());
@@ -3951,6 +3968,68 @@ mod tests {
         let s = core.state();
         assert_eq!((s.progress, s.error), (None, None));
         assert!(core.lock().data.connected.is_empty(), "not connected");
+        // After the refresh the create ran, it is a sandbox with no ADE, not a T3 one.
+        let v = &core.state().sandboxes[0];
+        assert_eq!((v.id.as_str(), v.ades.clone()), ("m1", vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_plain_sandbox_has_no_ade_and_a_v0_1_one_has_t3_after_a_refresh() {
+        // The API sends an empty object for a sandbox with no metadata.
+        for (metadata, has) in [
+            (serde_json::json!({}), vec![]),
+            (serde_json::json!({"instabox-bridge": "t3"}), vec![Ade::T3]),
+        ] {
+            let (_server, base) = cmux_server(metadata.clone()).await;
+            let (core, _) = core_full(
+                base.clone(),
+                Arc::new(MemoryKeyStore::default()),
+                Arc::new(MemorySshStore::default()),
+                PathBuf::from("/nonexistent"),
+            );
+            sign_in_as(&core, &base, 7);
+            core.refresh(false).await;
+            let j = serde_json::to_value(&core.state().sandboxes[0]).unwrap();
+            assert_eq!(j["ades"], serde_json::json!(has), "{metadata}");
+            assert_eq!(core.lock().data.ades_of("m1"), has);
+            // An action with no ADE asked still picks T3 for either.
+            assert_eq!(core.lock().data.ade_of("m1"), Some(Ade::T3));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_in_t3_of_a_sandbox_with_no_mark_sets_t3_up_first() {
+        // Even when it is in the connected set, a sandbox without the T3 mark has no T3.
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some("0.1.11".into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        let _ = core.open_in_ade("m1", Some(Ade::T3)).await;
+        assert!(
+            !opened
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.starts_with("t3code://")),
+            "{:?}",
+            opened.lock().unwrap()
+        );
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(execs.iter().any(|e| e.contains("v=0.1.11")), "T3 setup ran");
     }
 
     #[tokio::test]

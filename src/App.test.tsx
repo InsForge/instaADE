@@ -1083,6 +1083,24 @@ test("T3 mode keeps the first-run card away and T3's own wording", async () => {
   for (const name of ["Open in T3 Code", "Pair again", "Reinstall T3"]) expect(screen.getByRole("button", { name })).toBeTruthy();
 });
 
+test("in T3 mode a plain sandbox offers Install T3 Code, and a v0.1.x one Open", async () => {
+  // A sandbox created in plain Instabox has no mark, so no ADEs. One v0.1.x connected has t3.
+  show({}, [
+    { id: "p", name: "plain", connected: false, ades: [], t3Version: null },
+    { id: "o", name: "old", ades: ["t3"] },
+  ]);
+  const plain = within(await screen.findByText("plain").then(() => rowOf("plain")));
+  expect(plain.getByText("No T3 Code here yet")).toBeTruthy();
+  expect(plain.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(plain.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
+  expect(within(rowOf("old")).getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
+  await userEvent.click(screen.getByText("plain"));
+  expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(screen.queryByText("T3 CodeIn use")).toBeNull();
+  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
+  expect(chips.queryAllByRole("listitem").filter((li) => li.className.includes("chip"))).toEqual([]);
+});
+
 // ---- details: the ADEs on a sandbox ----
 
 test("details show a chip for each ADE on the sandbox and a dashed one to add another", async () => {

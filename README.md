@@ -65,7 +65,7 @@ A sandbox can have several ADEs. Its metadata marks them with two keys:
 - `instabox-ades` lists every ADE id, comma separated, in the order they were added, such as `t3,cmux`.
 - `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating it as connected. Else it is the first id of the list.
 
-Instabox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key counts as T3.
+Instabox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key, such as one made in plain Instabox, has no ADE, so each ADE offers Install on it. Only an action that must pick an ADE when none was named uses T3 for it.
 
 ## Roadmap
 
