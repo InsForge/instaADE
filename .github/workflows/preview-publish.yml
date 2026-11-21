@@ -1,0 +1,198 @@
+name: Preview publish
+
+# Stage two of a preview. Everything here is main's code: it never checks out or runs the
+# pull request's code. When Preview build succeeds, it checks the pull request still carries
+# the preview-build label and that its author is in .github/PREVIEW_AUTHORS, takes the label
+# off (one label, one build), checks the build is Instabox Preview, signs and notarizes it,
+# and publishes it on the rolling instabox-preview prerelease. Closing the pull request, or
+# removing the label before the build is published, deletes its files there.
+on:
+  workflow_run:
+    workflows: [Preview build]
+    types: [completed]
+  pull_request_target:
+    types: [closed, unlabeled]
+
+permissions:
+  contents: read
+
+env:
+  TAG: instabox-preview
+
+jobs:
+  resolve:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    outputs:
+      pr: ${{ steps.check.outputs.pr }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      # main, for the list of authors.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
+            --jq "[.[] | select(.state == \"open\" and .head.sha == \"$SHA\")][0].number // empty")
+          if [ -z "$pr" ]; then
+            echo "No open pull request has $SHA as its head. Nothing to publish."
+            exit 0
+          fi
+          info=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json author,labels,headRefOid)
+          if [ "$(jq -r .headRefOid <<<"$info")" != "$SHA" ]; then
+            echo "#$pr has a newer commit than the build. Nothing to publish."
+            exit 0
+          fi
+          if ! jq -e '.labels | any(.name == "preview-build")' <<<"$info" >/dev/null; then
+            echo "#$pr no longer carries the preview-build label. Nothing to publish."
+            exit 0
+          fi
+          author=$(jq -r .author.login <<<"$info")
+          if ! grep -v '^#' .github/PREVIEW_AUTHORS | tr -d ' \r' | grep -qxF "$author"; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/preview-build" >/dev/null || true
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" \
+              --body "This preview was not signed: $author is not in .github/PREVIEW_AUTHORS."
+            exit 0
+          fi
+          # Take the label now, so it covers this build only. A removal by this token starts
+          # no workflow, so the cleanup job does not run for it.
+          if ! gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/preview-build" >/dev/null; then
+            echo "The label was removed before this build could take it. Nothing to publish."
+            exit 0
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  sign:
+    needs: resolve
+    if: needs.resolve.outputs.pr != ''
+    # The signing secrets live in this environment, which only main may use.
+    environment: preview
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # main, for the signing script.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-${{ matrix.target }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/build
+      - name: Check, sign, notarize and staple
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          .github/scripts/sign-preview.sh "$RUNNER_TEMP/build/preview.zip" "${{ matrix.arch }}" \
+            "$RUNNER_TEMP/signed/Instabox-Preview-pr$PR-${SHA::7}-${{ matrix.arch }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-${{ matrix.target }}
+          path: ${{ runner.temp }}/signed/*.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [resolve, sign]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: signed-*
+          merge-multiple: true
+          path: files
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-x86_64-pc-windows-msvc
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: windows
+      - name: Publish on the instabox-preview prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          prefix="Instabox-Preview-pr$PR-"
+          mv windows/preview.exe "files/$prefix${SHA::7}-x64-setup.exe"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main --prerelease --latest=false \
+              --title "Instabox Preview" \
+              --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. Instabox Preview installs next to Instabox and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs."
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
+            { grep "^$prefix" || true; } |
+            while read -r name; do
+              gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+            done
+          gh release upload "$TAG" files/* --repo "$GITHUB_REPOSITORY"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          short=${SHA::7}
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Instabox Preview for $short is ready.
+
+          - macOS, Apple silicon: $base/$prefix$short-arm64.dmg
+          - macOS, Intel: $base/$prefix$short-x86_64.dmg
+          - Windows: $base/$prefix$short-x64-setup.exe (not signed yet, SmartScreen asks once)
+
+          It installs next to Instabox. Add the preview-build label again to build a newer commit."
+
+  cleanup:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'closed' || github.event.label.name == 'preview-build')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Delete this pull request's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
+            { grep "^Instabox-Preview-pr$PR-" || true; } |
+            while read -r name; do
+              gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+            done

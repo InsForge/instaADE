@@ -135,11 +135,12 @@ A local build is not notarized, so macOS blocks it on other Macs.
 
 ### Share a preview build
 
-To let others try a branch, build Instabox Preview in CI. It is signed and notarized like a release, and it installs next to Instabox with its own sign-in.
+To let others try a pull request, build Instabox Preview in CI. It installs next to Instabox and keeps its own sign-in. The macOS `.dmg` is signed and notarized like a release. The Windows installer is not signed yet, so SmartScreen asks once.
 
-1. Add the `preview-build` label to the pull request, or run **Preview build** from the Actions tab on your branch.
-2. A maintainer approves the run.
-3. Download the `.dmg` or the Windows installer under **Artifacts** on the run page. The pull request gets a comment with the link.
+1. Add the `preview-build` label to the pull request. The pull request's author must be listed in `.github/PREVIEW_AUTHORS`.
+2. **Preview build** builds the app from the pull request without any secrets. **Preview publish** then runs main's code only: it checks the author and the app, signs and notarizes it, and takes the label off.
+3. The files go to the `instabox-preview` prerelease, and the pull request gets a comment with direct links. They download without a GitHub account.
+4. To build a newer commit, add the label again. Closing the pull request deletes its files.
 
 ## Contributing
 
