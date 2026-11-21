@@ -206,7 +206,7 @@ test("clicking a row opens its details and Back returns to the list", async () =
   expect(screen.getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
   // The line under a row is part of the row too, except for its button.
-  await userEvent.click(screen.getByText("no IDE connected"));
+  await userEvent.click(screen.getByText("no ADE connected"));
   expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
   expect(screen.queryByText("dev-1")).toBeNull();
 });
@@ -385,7 +385,7 @@ test("each row shows at most one line, by priority", async () => {
   expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
 
   const install = within(rowOf("p-install"));
-  expect(install.getByText("no IDE connected")).toBeTruthy();
+  expect(install.getByText("no ADE connected")).toBeTruthy();
   await userEvent.click(install.getByRole("button", { name: "Connect" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "d", ade: "t3" });
 
@@ -1168,7 +1168,7 @@ test("in T3 mode a plain sandbox offers Install T3 Code, and a v0.1.x one Open",
     { id: "o", name: "old", ades: ["t3"] },
   ]);
   const plain = within(await screen.findByText("plain").then(() => rowOf("plain")));
-  expect(plain.getByText("no IDE connected")).toBeTruthy();
+  expect(plain.getByText("no ADE connected")).toBeTruthy();
   expect(plain.getByRole("button", { name: "Connect" })).toBeTruthy();
   expect(plain.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
   expect(within(rowOf("old")).getByRole("img", { name: "T3 Code" })).toBeTruthy();
@@ -1256,4 +1256,45 @@ test("details put Status first in Power and show per-ADE update and Open actions
   expect(cmux.queryByText("Needs update")).toBeNull();
   await userEvent.click(cmux.getByRole("button", { name: "Open in cmux" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "cmux" });
+});
+
+test("a row says connected only when this computer can open the sandbox", async () => {
+  show(mac, [
+    { id: "a", name: "here", ades: ["t3"] },
+    // T3 was set up from another computer and is not paired from this one.
+    { id: "b", name: "elsewhere", ades: ["t3"], connected: false },
+    // cmux opens from a link, so it needs no pairing here.
+    { id: "c", name: "link", ades: ["cmux"], connected: false },
+    { id: "d", name: "none", ades: [], connected: false },
+  ]);
+  await screen.findByText("here");
+  expect(within(rowOf("here")).getByText("connected")).toBeTruthy();
+  expect(within(rowOf("elsewhere")).getByText("not connected on this Mac")).toBeTruthy();
+  expect(within(rowOf("link")).getByText("connected")).toBeTruthy();
+  expect(within(rowOf("none")).getByText("no ADE connected")).toBeTruthy();
+});
+
+test("details offer Open only for an ADE whose app is on this computer", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    // Windows lists only T3. The sandbox also has cmux, set up from a Mac.
+    show({ ades: [t3Ade] }, [{ ades: ["t3", "cmux"] }]);
+    await userEvent.click(await screen.findByText("dev-1"));
+    const section = screen.getByRole("region", { name: "Connected ADE" });
+    const cmux = within(within(section).getByText("cmux").closest(".connected-ade-row") as HTMLElement);
+    expect(cmux.queryByRole("button", { name: "Open in cmux" })).toBeNull();
+    expect(cmux.getByText("Not available on this PC")).toBeTruthy();
+    const t3 = within(within(section).getByText("T3 Code").closest(".connected-ade-row") as HTMLElement);
+    expect(t3.getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
+  } finally {
+    ua.mockRestore();
+  }
+});
+
+test("details without T3 Code on this computer say so instead of Open", async () => {
+  show(noT3, [{ ades: ["t3"] }]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  const section = screen.getByRole("region", { name: "Connected ADE" });
+  expect(within(section).queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
+  expect(within(section).getByText("Not installed on this Mac")).toBeTruthy();
 });

@@ -46,6 +46,14 @@ export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);
 /** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link. */
 export const pairs = (id: AdeId) => id === "t3";
 
+/** True when the ADE's app is on this computer, so it can open sandboxes here. */
+export const onThisComputer = (state: AppState, id: AdeId) => localAde(state, id)?.version != null;
+
+/** True when this computer can open sandbox `s` in `id` now: the app is here, the sandbox has
+ * the ADE, and a pairing ADE was paired from here. */
+export const connectedHere = (state: AppState, s: SandboxView, id: AdeId) =>
+  onThisComputer(state, id) && hasAde(s, id) && (!pairs(id) || s.connected);
+
 /** The line under a row that has the ADE. */
 export function readyText(state: AppState, s: SandboxView, id: AdeId): string {
   if (id === "t3") return s.t3Version ? `T3 Code ${s.t3Version}` : "T3 Code";

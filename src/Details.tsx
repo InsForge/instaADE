@@ -15,7 +15,7 @@ import {
   toErrorView,
 } from "./api";
 import type { Agent } from "./api";
-import { adeName, hasAde, localAde, pairs } from "./ades";
+import { adeName, hasAde, localAde, onThisComputer, pairs } from "./ades";
 import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, copyText, isAsleep, isFree, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
@@ -267,11 +267,17 @@ export default function Details({ state, sandbox: s, run, mode, agents, onAgentS
                           Update
                         </button>
                       )}
-                      <button className="btn primary sm" title={`Open in ${adeName(state, id)}`} aria-label={`Open in ${adeName(state, id)}`}
-                        disabled={BUSY.includes(s.state) || !!progress}
-                        onClick={() => onOpen(s.id, id)}>
-                        Open
-                      </button>
+                      {onThisComputer(state, id) ? (
+                        <button className="btn primary sm" title={`Open in ${adeName(state, id)}`} aria-label={`Open in ${adeName(state, id)}`}
+                          disabled={BUSY.includes(s.state) || !!progress}
+                          onClick={() => onOpen(s.id, id)}>
+                          Open
+                        </button>
+                      ) : (
+                        <span className="small muted">
+                          {localAde(state, id) ? `Not installed on ${thisComputer()}` : `Not available on ${thisComputer()}`}
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
