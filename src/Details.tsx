@@ -15,15 +15,16 @@ import {
   toErrorView,
 } from "./api";
 import type { Agent } from "./api";
-import { AdeBadge, adeName, hasAde, localAde, pairs } from "./ades";
+import { adeName, hasAde, localAde, pairs } from "./ades";
 import type { Mode } from "./ades";
-import { AGENTS, agentKey, BUSY, copyText, isAsleep, isFree, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
+import { AGENTS, agentKey, BUSY, copyText, isAsleep, isFree, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
 import { Check, Copy, Plus, Terminal } from "./icons";
 import claudeLogo from "./assets/agents/claude-code.svg";
 import codexLogo from "./assets/agents/codex.svg";
 import Progress from "./Progress";
 import type { AdeId, AppState, SandboxView } from "./types";
+import AdeLogo from "./AdeLogo";
 
 const agentLogos: Record<Agent, string> = { claude: claudeLogo, codex: codexLogo };
 
@@ -45,43 +46,18 @@ export function formatMinutes(m: number): string {
   return r === 0 ? `${h} h` : `${h} h ${r} m`;
 }
 
-/** How the sandbox's T3 compares with T3 Code on this computer. */
-export function t3Relation(s: SandboxView, desktop: string | null): string | null {
-  if (s.desktopBehind) return `Newer than ${thisComputer()}`;
-  if (s.updatePending) return `Older than ${thisComputer()}`;
-  if (s.t3Version && s.t3Version === desktop) return `Same as ${thisComputer()}`;
-  return null;
-}
-
-/** The ADEs on the sandbox as chips, the one in use marked, and a dashed chip to add each other ADE found here. */
-function AdeChips({ state, s, mode, onConnect }: { state: AppState; s: SandboxView; mode: AdeId; onConnect: (id: string, ade: AdeId) => void }) {
+/** Keep the existing ability to add an installed ADE without switching modes first. */
+function ConnectAdes({ state, s, onConnect }: { state: AppState; s: SandboxView; onConnect: (id: string, ade: AdeId) => void }) {
   const more = state.ades.filter((a) => a.version !== null && !hasAde(s, a.id));
+  if (!more.length) return null;
   return (
-    <section className="section">
-      <h2 className="section-label">ADEs on this sandbox</h2>
-      <ul className="chips" aria-label="ADEs on this sandbox">
-        {s.ades.map((id) => (
-          <li key={id} className={`chip${id === mode ? " current" : ""}`}>
-            <AdeBadge id={id} />
-            <span>{adeName(state, id)}</span>
-            {id === mode ? <span className="chip-note accent">In use</span> : id === "t3" && s.t3Version && <span className="chip-note">{s.t3Version}</span>}
-          </li>
-        ))}
-        {more.map((a) => (
-          <li key={a.id}>
-            <button className="chip add" aria-label={`Install ${a.name} on ${s.name}`} disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id, a.id)}>
-              <Plus />
-              {a.name}
-            </button>
-          </li>
-        ))}
-      </ul>
-      {s.ades.length === 0 && more.length === 0 ? (
-        <p className="small muted">No ADE on this sandbox yet.</p>
-      ) : (
-        <p className="small muted">Switching to an ADE that is already here skips the install.</p>
-      )}
-    </section>
+    <div className="chips" aria-label="Connect another ADE">
+      {more.map((a) => (
+        <button key={a.id} className="chip add" aria-label={`Install ${a.name} on ${s.name}`} disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id, a.id)}>
+          <Plus />{a.name}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -128,13 +104,15 @@ type Ssh = { command: string } | { error: string } | null;
 
 export default function Details({ state, sandbox: s, run, mode, agents, onAgentStatus, onOpen, onConnect }: Props) {
   const free = isFree(s, state.tier);
-  // Plain Instabox has no ADE parts. T3 pairs from this computer: Pair again and Reinstall need it.
+  // Pairing and reconnect controls follow the selected ADE; the connection list shows every ADE.
   const ade = mode === "instabox" ? null : mode;
   const has = !!ade && hasAde(s, ade);
   const paired = !!ade && pairs(ade) && has && s.connected;
   const running = s.state === "running";
   const sizeId = useId();
   const sleepId = useId();
+  const powerId = useId();
+  const connectedAdeId = useId();
   const [ssh, setSsh] = useState<Ssh>(null);
   const [copied, setCopied] = useState(false);
   // Resize starts at the sandbox's own size, so Apply shows only once another is picked.
@@ -177,71 +155,18 @@ export default function Details({ state, sandbox: s, run, mode, agents, onAgentS
     setSleepPick(v);
     void run(() => setAutoSleep(s.id, v)).then(() => setSleepPick(null));
   };
-  const relation = t3Relation(s, state.t3);
 
   return (
     <>
       <div className="scroll">
         <div className="stack">
-          <div className="card">
-            <div className="card-head">
-              <StateDot state={s.state} />
-              <span className="strong grow">{stateLabel(s.state)}</span>
-              <span className="small muted">{s.size}</span>
-            </div>
-            <div className="grid2">
-              {ade === "t3" && (
-                <div className="fact">
-                  <span className="small muted">T3</span>
-                  <span className="strong">{s.t3Version ?? (has ? "Unknown" : "Not installed")}</span>
-                  {relation && <span className="small muted">{relation}</span>}
-                </div>
-              )}
-              {ade && ade !== "t3" && (
-                <div className="fact">
-                  <span className="small muted">{adeName(state, ade)}</span>
-                  <span className="strong">{has ? "Set up" : "Not installed"}</span>
-                </div>
-              )}
-              <div className="fact">
-                <span className="small muted">Auto sleep</span>
-                <span className="strong">{s.autoSleep.label}</span>
-                {s.autoSleep.seconds !== 0 && <span className="small muted">When idle</span>}
-              </div>
-            </div>
-            {progress ? (
-              <Progress state={state} run={run} mode={mode} onConnect={onConnect} />
-            ) : ade === "t3" && s.updatePending && !s.desktopBehind ? (
-              <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
-                <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
-                  Update
-                </button>
-              </Line>
-            ) : ade === "t3" && s.desktopBehind ? (
-              <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
-                <button className="btn sm" onClick={() => openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL)}>
-                  Download
-                </button>
-              </Line>
-            ) : null}
-          </div>
-
-          {ade &&
-            (has ? (
-              <button className="btn primary lg" onClick={() => onOpen(s.id, ade)}>
-                Open in {adeName(state, ade)}
-              </button>
-            ) : (
-              <button className="btn primary lg" onClick={() => onConnect(s.id, ade)}>
-                Install {adeName(state, ade)}
-              </button>
-            ))}
-
-          {ade && <AdeChips state={state} s={s} mode={ade} onConnect={onConnect} />}
-
-          <section className="section">
-            <h2 className="section-label">Power</h2>
+          <section className="section" aria-labelledby={powerId}>
+            <h2 id={powerId} className="section-label">Power</h2>
             <div className="group">
+              <div className="group-row power-status" role="group" aria-label="Machine status">
+                <span>Status</span>
+                <span className="power-status-label"><StateDot state={s.state} /><span>{stateLabel(s.state)}</span></span>
+              </div>
               <div className="group-row">
                 <label htmlFor={sleepId}>Auto sleep</label>
                 <select id={sleepId} className="select" value={sleepValue} disabled={free} onChange={(e) => pickSleep(Number(e.target.value))}>
@@ -316,6 +241,52 @@ export default function Details({ state, sandbox: s, run, mode, agents, onAgentS
               )}
             </div>
           </section>
+
+          <section className="section" aria-labelledby={connectedAdeId}>
+            <h2 id={connectedAdeId} className="section-label">Connected ADE</h2>
+            <div className="group connected-ade-group">
+              {s.ades.length ? s.ades.map((id) => {
+                const needsUpdate = id === "t3" && (s.updatePending || s.desktopBehind);
+                return (
+                  <div className="group-row connected-ade-row" key={id}>
+                    <div className="connected-ade-name">
+                      <AdeLogo ade={id} decorative />
+                      <div className="fact">
+                        <span className="connected-ade-title">
+                          <span>{adeName(state, id)}</span>
+                          {needsUpdate && <span className="small amber">Needs update</span>}
+                        </span>
+                        {id === "t3" && s.t3Version && <span className="small muted">{s.t3Version}</span>}
+                      </div>
+                    </div>
+                    <div className="connected-ade-state">
+                      {needsUpdate && !progress && (
+                        <button className="btn sm" disabled={BUSY.includes(s.state)}
+                          title={s.desktopBehind ? `Update T3 Code on ${thisComputer()}` : "Update T3 Code on this sandbox"}
+                          onClick={() => s.desktopBehind ? openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL) : run(() => reinstallT3(s.id))}>
+                          Update
+                        </button>
+                      )}
+                      <button className="btn primary sm" title={`Open in ${adeName(state, id)}`} aria-label={`Open in ${adeName(state, id)}`}
+                        disabled={BUSY.includes(s.state) || !!progress}
+                        onClick={() => onOpen(s.id, id)}>
+                        Open
+                      </button>
+                    </div>
+                  </div>
+                );
+              }) : <div className="group-row"><span className="small muted">No ADE connected</span></div>}
+            </div>
+            {progress && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
+          </section>
+
+          {ade && !has && (
+            <button className="btn primary lg" onClick={() => onConnect(s.id, ade)}>
+              Install {adeName(state, ade)}
+            </button>
+          )}
+
+          {ade && <ConnectAdes state={state} s={s} onConnect={onConnect} />}
 
           <section className="section">
             <h2 className="section-label">Agents</h2>

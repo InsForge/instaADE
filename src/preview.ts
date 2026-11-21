@@ -1,5 +1,5 @@
 import fixture from "./fixtures/state.json";
-import type { AppState, SandboxView } from "./types";
+import type { AdeId, AppState, SandboxView } from "./types";
 
 // In-memory sample data only. This module never calls the native or cloud APIs.
 let state: AppState = {
@@ -52,6 +52,15 @@ export async function invokePreview(command: string, args: Record<string, unknow
     }
     case "pause": patchSandbox({ state: "paused" }); break;
     case "resume": patchSandbox({ state: "running" }); break;
+    case "connect_sandbox": {
+      const sandbox = state.sandboxes.find((s) => s.id === args.id);
+      const ade = args.ade;
+      if (!sandbox || (ade !== "t3" && ade !== "cmux")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      patchSandbox({ ades: [...new Set<AdeId>([...sandbox.ades, ade])],
+        ...(ade === "t3" ? { connected: true, t3Version: state.t3 } : {}) });
+      break;
+    }
+    case "reinstall_t3": patchSandbox({ updatePending: false, t3Version: state.t3 }); break;
     case "delete": state = { ...state, sandboxes: state.sandboxes.filter((s) => s.id !== args.id) }; break;
     case "resize": patchSandbox({ size: `${args.vcpus} vCPU / ${Number(args.memMiB) / 1024} GB` }); break;
     case "set_auto_sleep": {

@@ -129,19 +129,19 @@ test("fixture and sample have the same nested keys", () => {
 
 // ---- list ----
 
-test("a row shows its state, pause or resume, the … menu and Open in T3 Code", async () => {
+test("a row shows state, connected ADEs and compact power controls", async () => {
   show({}, [{}, { id: "b", name: "web", state: "paused", t3Version: null }, { id: "c", name: "old", updatePending: true, t3Version: "0.1.2" }]);
   const row = await screen.findByText("dev-1").then(() => rowOf("dev-1"));
   expect(within(row).getByText("Running")).toBeTruthy();
-  expect(within(row).getByText("T3 Code 0.1.10")).toBeTruthy();
+  expect(within(row).getByRole("img", { name: "T3 Code" })).toBeTruthy();
   expect(within(rowOf("web")).getByText("Paused")).toBeTruthy();
-  expect(within(rowOf("web")).getByText("T3 Code")).toBeTruthy();
-  expect(within(rowOf("old")).getByText("T3 is older than this Mac's 0.1.10")).toBeTruthy();
+  expect(within(rowOf("web")).getByRole("img", { name: "T3 Code" })).toBeTruthy();
+  expect(within(rowOf("old")).getByText("needs update")).toBeTruthy();
   const labels = within(row)
     .getAllByRole("button")
     .slice(1)
     .map((b) => b.getAttribute("aria-label") ?? b.textContent);
-  expect(labels).toEqual(["Pause dev-1", "More actions for dev-1", "Open in T3 Code"]);
+  expect(labels).toEqual(["Pause dev-1", "More actions for dev-1"]);
   expect(screen.getByRole("heading", { name: "Sandboxes 3" })).toBeTruthy();
   expect(screen.getByRole("combobox", { name: "Workspace" }).textContent).toBe("org-me");
 });
@@ -206,7 +206,7 @@ test("clicking a row opens its details and Back returns to the list", async () =
   expect(screen.getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
   // The line under a row is part of the row too, except for its button.
-  await userEvent.click(screen.getByText("No T3 Code here yet"));
+  await userEvent.click(screen.getByText("no IDE connected"));
   expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
   expect(screen.queryByText("dev-1")).toBeNull();
 });
@@ -373,26 +373,28 @@ test("each row shows at most one line, by priority", async () => {
   expect(progress.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
 
   const update = within(rowOf("p-update"));
-  expect(update.getByText("T3 is older than this Mac's 0.1.10")).toBeTruthy();
+  expect(update.getByText("needs update")).toBeTruthy();
   await userEvent.click(update.getByRole("button", { name: "Update" }));
   expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "b", ade: "t3" });
 
-  // A sandbox ahead of this Mac never offers Update.
+  // Desktop updates open the download; they must never reinstall the sandbox.
   const behind = within(rowOf("p-behind"));
-  expect(behind.getByText("T3 Code on this Mac is older")).toBeTruthy();
-  expect(behind.queryByRole("button", { name: "Update" })).toBeNull();
-  await userEvent.click(behind.getByRole("button", { name: "Download" }));
+  expect(behind.getByText("needs update")).toBeTruthy();
+  await userEvent.click(behind.getByRole("button", { name: "Update" }));
+  expect(invoke).not.toHaveBeenCalledWith("reinstall_t3", { id: "c", ade: "t3" });
   expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
 
   const install = within(rowOf("p-install"));
-  expect(install.getByText("No T3 Code here yet")).toBeTruthy();
-  await userEvent.click(install.getByRole("button", { name: "Install T3 Code" }));
+  expect(install.getByText("no IDE connected")).toBeTruthy();
+  await userEvent.click(install.getByRole("button", { name: "Connect" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "d", ade: "t3" });
 
   expect(within(rowOf("p-behind-unconnected")).queryByText("No T3 Code here yet")).toBeNull();
   const open = within(rowOf("p-open"));
-  expect(open.getByText("T3 Code 0.1.10")).toBeTruthy();
-  await userEvent.click(open.getByRole("button", { name: "Open in T3 Code" }));
+  expect(open.getByText("connected")).toBeTruthy();
+  expect(open.queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(screen.getByText("p-open"));
+  await userEvent.click(screen.getByRole("button", { name: "Open in T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "f", ade: "t3" });
 });
 
@@ -580,7 +582,7 @@ test("free limit offers Connect on the sandbox without the ADE, not create", asy
   expect(await screen.findByText("The free plan has one sandbox")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Connect to T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "t3" });
-  expect(within(rowOf("dev-1")).getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(within(rowOf("dev-1")).getByRole("button", { name: "Connect" })).toBeTruthy();
 });
 
 test("free limit in plain Instabox offers no Connect", async () => {
@@ -684,7 +686,7 @@ test("details of a sandbox T3 is on but not paired from here: Open pairs it", as
 test("details show the T3 version against this Mac and the free plan line", async () => {
   show({}, [{}]);
   await userEvent.click(await screen.findByText("dev-1"));
-  expect(screen.getByText("Same as this Mac")).toBeTruthy();
+  expect(within(screen.getByRole("region", { name: "Connected ADE" })).getByText("0.1.10")).toBeTruthy();
   expect(screen.getByText("Can run 1 h 20 m more")).toBeTruthy();
   expect(screen.getByText("Free plan")).toBeTruthy();
   // Delete sits at the end of the page, under the agents with their logos.
@@ -774,19 +776,20 @@ test("details: auto sleep applies on change; the free plan cannot change it", as
   expect((screen.getByLabelText("Size") as HTMLSelectElement).disabled).toBe(true);
 });
 
-test("desktopBehind never offers Update", async () => {
+test("desktopBehind Update opens the desktop download", async () => {
   show({}, [{ desktopBehind: true, updatePending: true }]);
   await userEvent.click(await screen.findByText("dev-1"));
-  expect(screen.getByText("Newer than this Mac")).toBeTruthy();
-  expect(screen.getByText("T3 Code on this Mac is older")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(screen.getByText("Needs update")).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: "Update" }));
+  expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
+  expect(calls("reinstall_t3")).toHaveLength(0);
   expect(screen.queryByRole("button", { name: "Reinstall T3" })).toBeNull();
 });
 
 test("updatePending offers Update that reinstalls", async () => {
   show({}, [{ updatePending: true, t3Version: "0.1.2" }]);
   await userEvent.click(await screen.findByText("dev-1"));
-  expect(screen.getByText("Older than this Mac")).toBeTruthy();
+  expect(screen.getByText("Needs update")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Update" }));
   expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "a", ade: "t3" });
 });
@@ -986,9 +989,11 @@ test("picking an ADE switches the background and the row actions, and is remembe
   expect(switcher().getAttribute("aria-label")).toBe("ADE: cmux. Switch ADE");
   // A switch shows no notice: each row's Install or Open says enough.
   expect(screen.queryByText(/Switched to/)).toBeNull();
-  // T3's lines are gone; each row offers cmux.
-  expect(within(rowOf("dev-1")).getByText("No cmux here yet")).toBeTruthy();
-  expect(within(rowOf("web")).getByText("Ready for cmux")).toBeTruthy();
+  // All connected ADEs stay visible; Connect targets the newly selected cmux.
+  expect(within(rowOf("dev-1")).getByRole("button", { name: "Connect" }).title).toBe("Connect to cmux");
+  expect(within(rowOf("dev-1")).getByRole("img", { name: "T3 Code" })).toBeTruthy();
+  expect(within(rowOf("web")).getByRole("img", { name: "cmux" })).toBeTruthy();
+  expect(within(rowOf("web")).queryByRole("button", { name: "Connect" })).toBeNull();
 
   // Plain Instabox has T3's plain black background.
   await userEvent.click(switcher());
@@ -1006,17 +1011,21 @@ test("cmux rows: Open runs open_in_t3 with cmux, Install sets it up, neither add
     { id: "c", name: "busy", ades: ["cmux"], state: "waking" },
   ]);
   const install = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
-  await userEvent.click(install.getByRole("button", { name: "Install cmux" }));
+  await userEvent.click(install.getByRole("button", { name: "Connect" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
   // cmux asks in its own window. The popover adds no notice once the action is done.
   await act(async () => {});
   expect(screen.queryByText(/Confirm the/)).toBeNull();
 
-  await userEvent.click(within(rowOf("web")).getByRole("button", { name: "Open in cmux" }));
+  await userEvent.click(screen.getByText("web"));
+  await userEvent.click(screen.getByRole("button", { name: "Open in cmux" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "cmux" });
   await act(async () => {});
   expect(screen.queryByText(/Confirm the/)).toBeNull();
-  expect((within(rowOf("busy")).getByRole("button", { name: "Open in cmux" }) as HTMLButtonElement).disabled).toBe(true);
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await userEvent.click(screen.getByText("busy"));
+  expect((screen.getByRole("button", { name: "Open in cmux" }) as HTMLButtonElement).disabled).toBe(true);
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
 
   // The menu offers the same, with no T3 pairing or reinstall.
   await openMenu("web");
@@ -1044,7 +1053,7 @@ test("installing cmux shows a progress line with no time left", async () => {
   expect(row.getByText("Opening cmux")).toBeTruthy();
 });
 
-test("plain Instabox: sandboxes only, with no Open, Install, Connect or Reinstall", async () => {
+test("plain Instabox shows existing connections in details without selecting an ADE", async () => {
   picked("instabox");
   show({ ...mac, tier: "pro" }, [{ free: false }, { id: "b", name: "web", connected: false, ades: [] }]);
   await screen.findByText("dev-1");
@@ -1058,7 +1067,8 @@ test("plain Instabox: sandboxes only, with no Open, Install, Connect or Reinstal
   await userEvent.keyboard("{Escape}");
 
   await userEvent.click(screen.getByText("dev-1"));
-  for (const name of [/^Open in (T3|cmux)/, /^Install/, "Pair again", "Reinstall T3", "Reconnect"]) expect(screen.queryByRole("button", { name })).toBeNull();
+  expect(screen.getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
+  for (const name of [/^Install/, "Pair again", "Reinstall T3", "Reconnect"]) expect(screen.queryByRole("button", { name })).toBeNull();
   expect(screen.queryByText("ADEs on this sandbox")).toBeNull();
   expect(screen.queryByText("cmux mode")).toBeNull();
 
@@ -1158,26 +1168,28 @@ test("in T3 mode a plain sandbox offers Install T3 Code, and a v0.1.x one Open",
     { id: "o", name: "old", ades: ["t3"] },
   ]);
   const plain = within(await screen.findByText("plain").then(() => rowOf("plain")));
-  expect(plain.getByText("No T3 Code here yet")).toBeTruthy();
-  expect(plain.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
+  expect(plain.getByText("no IDE connected")).toBeTruthy();
+  expect(plain.getByRole("button", { name: "Connect" })).toBeTruthy();
   expect(plain.queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
-  expect(within(rowOf("old")).getByRole("button", { name: "Open in T3 Code" })).toBeTruthy();
+  expect(within(rowOf("old")).getByRole("img", { name: "T3 Code" })).toBeTruthy();
   await userEvent.click(screen.getByText("plain"));
   expect(screen.getByRole("button", { name: "Install T3 Code" })).toBeTruthy();
   expect(screen.queryByText("T3 CodeIn use")).toBeNull();
-  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
-  expect(chips.queryAllByRole("listitem").filter((li) => li.className.includes("chip"))).toEqual([]);
+  const section = within(screen.getByRole("region", { name: "Connected ADE" }));
+  expect(section.getByText("No ADE connected")).toBeTruthy();
+  expect(section.queryByRole("button")).toBeNull();
 });
 
 // ---- details: the ADEs on a sandbox ----
 
-test("details show a chip for each ADE on the sandbox and a dashed one to add another", async () => {
+test("details show an Open button for each connected ADE and preserve adding another", async () => {
   picked("cmux");
   show(mac, [{ ades: ["t3", "cmux"] }, { id: "b", name: "web", ades: ["t3"] }]);
   await userEvent.click(await screen.findByText("dev-1"));
-  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
-  expect(chips.getAllByRole("listitem").map((c) => c.textContent)).toEqual(["T3 Code0.1.10", "cmuxIn use"]);
-  expect(chips.queryByRole("button")).toBeNull();
+  const section = within(screen.getByRole("region", { name: "Connected ADE" }));
+  expect(section.getAllByRole("button").map((button) => button.textContent)).toEqual(["Open", "Open"]);
+  await userEvent.click(section.getByRole("button", { name: "Open in T3 Code" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "t3" });
 
   // cmux has nothing to reinstall: Reconnect runs its prep again and opens it.
   expect(screen.queryByRole("button", { name: /Reinstall|Pair again/ })).toBeNull();
@@ -1199,12 +1211,49 @@ test("details show a chip for each ADE on the sandbox and a dashed one to add an
 test("details in T3 mode offer adding cmux, never an ADE not found here", async () => {
   show({ ades: [t3Ade, { ...cmuxAde, version: null }] }, [{}]);
   await userEvent.click(await screen.findByText("dev-1"));
-  const chips = within(screen.getByRole("list", { name: "ADEs on this sandbox" }));
-  expect(chips.getAllByRole("listitem").map((c) => c.textContent)).toEqual(["T3 CodeIn use"]);
+  const section = within(screen.getByRole("region", { name: "Connected ADE" }));
+  expect(section.getByText("T3 Code")).toBeTruthy();
+  expect(section.getByRole("button", { name: "Open in T3 Code" }).textContent).toBe("Open");
   expect(screen.queryByRole("button", { name: /Install cmux/ })).toBeNull();
   cleanup();
   show(mac, [{}]);
   await userEvent.click(await screen.findByText("dev-1"));
   await userEvent.click(screen.getByRole("button", { name: "Install cmux on dev-1" }));
   expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
+});
+
+test("machine cards prioritize updates from another ADE over connecting the selected ADE", async () => {
+  picked("cmux");
+  const { state } = show(mac, [{ ades: ["t3"], updatePending: true }]);
+  await screen.findByText("dev-1");
+  const row = within(rowOf("dev-1"));
+  expect(row.getByRole("img", { name: "T3 Code" })).toBeTruthy();
+  expect(row.queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(row.getByRole("button", { name: "Update" }));
+  expect(invoke).toHaveBeenCalledWith("reinstall_t3", { id: "a", ade: "t3" });
+  act(() => emit({ ...state, sandboxes: [{ ...state.sandboxes[0], updatePending: false }] }));
+  await userEvent.click(row.getByRole("button", { name: "Connect" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "cmux" });
+});
+
+test("details put Status first in Power and show per-ADE update and Open actions below it", async () => {
+  show(mac, [{ ades: ["t3", "cmux"], updatePending: true }]);
+  await userEvent.click(await screen.findByText("dev-1"));
+  const power = screen.getByRole("region", { name: "Power" });
+  const status = within(power).getByRole("group", { name: "Machine status" });
+  expect(document.querySelector(".stack")?.firstElementChild).toBe(power);
+  expect(status.parentElement?.firstElementChild).toBe(status);
+  expect(within(status).getByText("Status")).toBeTruthy();
+  expect(within(status).getByText("Running")).toBeTruthy();
+  expect(within(status).queryByText("4 vCPU / 8 GB")).toBeNull();
+  const section = screen.getByRole("region", { name: "Connected ADE" });
+  expect(power.nextElementSibling).toBe(section);
+  const t3 = within(within(section).getByText("T3 Code").closest(".connected-ade-row") as HTMLElement);
+  expect(t3.getByText("Needs update")).toBeTruthy();
+  expect(t3.getByRole("button", { name: "Update" })).toBeTruthy();
+  const cmux = within(within(section).getByText("cmux").closest(".connected-ade-row") as HTMLElement);
+  expect(cmux.queryByText("Connected")).toBeNull();
+  expect(cmux.queryByText("Needs update")).toBeNull();
+  await userEvent.click(cmux.getByRole("button", { name: "Open in cmux" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "a", ade: "cmux" });
 });

@@ -3,12 +3,15 @@ import type { MouseEvent, ReactNode } from "react";
 import { agentSignIn, isBrowserPreview, pause, reinstallT3, resume, switchOrg, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
 import { AdeMissing, ConnectAdeCard } from "./AdeCards";
-import { adeName, hasAde, localAde, readyText } from "./ades";
+import { adeName, hasAde, localAde } from "./ades";
 import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, cap, isAsleep, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
-import { Dots, ExternalLink, Gear, Plus } from "./icons";
-import pauseIcon from "./assets/main-view/pause.svg";
+import { ExternalLink, Gear, Plus } from "./icons";
+import pauseIcon from "./assets/machine-card/pause.svg";
+import dotsIcon from "./assets/machine-card/dots.svg";
+import runningIcon from "./assets/machine-card/status.svg";
+import AdeLogo from "./AdeLogo";
 import playIcon from "./assets/main-view/play.svg";
 import unfold from "./assets/main-view/unfold.svg";
 import Progress, { ProgressBar, stepText } from "./Progress";
@@ -36,11 +39,9 @@ export type RowLine =
 /** Plain Instabox shows no ADE line; an ADE mode shows Open or Install on every row. */
 export function rowLine(s: SandboxView, state: AppState, agents: AgentCache, mode: Mode): RowLine {
   if (state.progress && state.progress.machineId === s.id) return { kind: "progress" };
-  if (mode === "t3") {
-    // A sandbox ahead of this computer never offers Update.
-    if (s.updatePending && !s.desktopBehind) return { kind: "update" };
-    if (s.desktopBehind) return { kind: "desktopBehind" };
-  }
+  // Updates belong to the installed ADE, independently of the selected mode.
+  if (s.updatePending && !s.desktopBehind) return { kind: "update" };
+  if (s.desktopBehind) return { kind: "desktopBehind" };
   if (mode !== "instabox") return { kind: hasAde(s, mode) ? "open" : "install", ade: mode };
   if (s.state === "running") {
     const a = AGENTS.find((x) => agents[agentKey(s.id, x.id)] === false);
@@ -69,9 +70,10 @@ interface RowProps extends ListActions {
   menuOpen: boolean;
 }
 
-function Row({ s, state, run, mode, agents, menuOpen, onOpen, onConnect, onDetails, onMenu, onAgentStatus }: RowProps) {
+function Row({ s, state, run, mode, agents, menuOpen, onConnect, onDetails, onMenu, onAgentStatus }: RowProps) {
   const line = rowLine(s, state, agents, mode);
   const busy = BUSY.includes(s.state);
+  const adeNeedsUpdate = s.updatePending || s.desktopBehind;
   const [powerPending, setPowerPending] = useState(false);
   const powerLabel = s.state === "running" ? "Pause" : "Resume";
   const changePower = () => {
@@ -85,15 +87,15 @@ function Row({ s, state, run, mode, agents, menuOpen, onOpen, onConnect, onDetai
     onDetails(s.id);
   };
   return (
-    <li className="row" onClick={open}>
+    <li className="row machine-card" onClick={open}>
       <div className="row-top">
         <button className="row-open" onClick={() => onDetails(s.id)}>
-          <StateDot state={s.state} />
+          {s.state === "running" ? <img className="machine-state-dot" src={runningIcon} alt="" /> : <StateDot state={s.state} />}
           <span className="row-text">
             <span className="row-title">
-              <span className="name">{s.name}</span>
+              <span className="name" title={s.name}>{s.name}</span>
+              <span className="state">{stateLabel(s.state)}</span>
             </span>
-            <span className="row-meta">{stateLabel(s.state)}</span>
           </span>
         </button>
         <div className="row-controls">
@@ -109,39 +111,30 @@ function Row({ s, state, run, mode, agents, menuOpen, onOpen, onConnect, onDetai
             aria-expanded={menuOpen}
             onClick={(e) => onMenu(s.id, e.currentTarget)}
           >
-            <Dots />
+            <img src={dotsIcon} alt="" />
           </button>
         </div>
       </div>
-      {line?.kind === "progress" && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
-      {line?.kind === "update" && (
-        <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
-          <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
+      <div className="machine-ade-row">
+        <div className="machine-ade-summary" role="group" aria-label="Connected development environments">
+          {s.ades.map((id) => <AdeLogo key={id} ade={id} />)}
+          <span className={adeNeedsUpdate ? "machine-ade-status needs-update" : "machine-ade-status"}>
+            {adeNeedsUpdate ? "needs update" : s.ades.length ? "connected" : "no IDE connected"}
+          </span>
+        </div>
+        {line?.kind === "update" || line?.kind === "desktopBehind" ? (
+          <button className="btn sm" disabled={busy}
+            title={s.desktopBehind ? `Update T3 Code on ${thisComputer()}` : "Update T3 Code on this sandbox"}
+            onClick={() => s.desktopBehind ? openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL) : run(() => reinstallT3(s.id))}>
             Update
           </button>
-        </Line>
-      )}
-      {line?.kind === "desktopBehind" && (
-        <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
-          <button className="btn sm" onClick={() => openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL)}>
-            Download
+        ) : line?.kind === "install" ? (
+          <button className="btn sm" disabled={busy} title={`Connect to ${adeName(state, line.ade)}`} onClick={() => onConnect(s.id, line.ade)}>
+            <AdeLogo ade={line.ade} decorative />Connect
           </button>
-        </Line>
-      )}
-      {line?.kind === "open" && (
-        <Line text={readyText(state, s, line.ade)}>
-          <button className="btn sm primary" disabled={busy} onClick={() => onOpen(s.id, line.ade)}>
-            Open in {adeName(state, line.ade)}
-          </button>
-        </Line>
-      )}
-      {line?.kind === "install" && (
-        <Line text={`No ${adeName(state, line.ade)} here yet`}>
-          <button className="btn sm accent-outline" disabled={busy} onClick={() => onConnect(s.id, line.ade)}>
-            Install {adeName(state, line.ade)}
-          </button>
-        </Line>
-      )}
+        ) : null}
+      </div>
+      {line?.kind === "progress" && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
       {line?.kind === "agent" && (
         <Line tone="amber" text={`${line.label} needs a sign-in`}>
           <button

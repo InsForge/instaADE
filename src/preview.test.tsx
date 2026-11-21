@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { StrictMode } from "react";
@@ -32,4 +32,18 @@ test("browser preview renders, navigates and updates sample data without native 
   await userEvent.click(screen.getByRole("option", { name: "org-team" }));
   expect(screen.getByRole("combobox", { name: "Workspace" }).textContent).toBe("org-team");
   await expect(openInAde("a", "t3")).rejects.toMatchObject({ kind: "other", message: expect.stringContaining("browser preview") });
+});
+
+test("preview update and connect actions preserve other connected ADEs", async () => {
+  render(<App />);
+  await screen.findByText("website");
+  const website = within(screen.getByText("website").closest("li")!);
+  await userEvent.click(website.getByRole("button", { name: "Update" }));
+  expect(website.queryByRole("button", { name: "Update" })).toBeNull();
+  const design = within(screen.getByText("design-system").closest("li")!);
+  expect(design.getByRole("img", { name: "cmux" })).toBeTruthy();
+  await userEvent.click(design.getByRole("button", { name: "Connect" }));
+  expect(design.queryByRole("button", { name: "Connect" })).toBeNull();
+  expect(design.getByRole("img", { name: "cmux" })).toBeTruthy();
+  expect(design.getByRole("img", { name: "T3 Code" })).toBeTruthy();
 });
