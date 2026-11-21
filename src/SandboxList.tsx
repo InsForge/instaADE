@@ -3,7 +3,7 @@ import type { MouseEvent, ReactNode } from "react";
 import { agentSignIn, isBrowserPreview, pause, reinstallT3, resume, switchOrg, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
 import { AdeMissing, ConnectAdeCard } from "./AdeCards";
-import { adeName, hasAde, localAde } from "./ades";
+import { adeName, connectedHere, hasAde, localAde } from "./ades";
 import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, cap, isAsleep, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
@@ -119,7 +119,13 @@ function Row({ s, state, run, mode, agents, menuOpen, onConnect, onDetails, onMe
         <div className="machine-ade-summary" role="group" aria-label="Connected development environments">
           {s.ades.map((id) => <AdeLogo key={id} ade={id} />)}
           <span className={adeNeedsUpdate ? "machine-ade-status needs-update" : "machine-ade-status"}>
-            {adeNeedsUpdate ? "needs update" : s.ades.length ? "connected" : "no IDE connected"}
+            {adeNeedsUpdate
+              ? "needs update"
+              : s.ades.some((id) => connectedHere(state, s, id))
+                ? "connected"
+                : s.ades.length
+                  ? `not connected on ${thisComputer()}`
+                  : "no ADE connected"}
           </span>
         </div>
         {line?.kind === "update" || line?.kind === "desktopBehind" ? (
