@@ -4,8 +4,9 @@ import orcaLogo from '../assets/ade/orca.svg';
 import cmuxLogo from '../assets/ade/cmux.png';
 import paradevLogo from '../assets/ade/paradev.svg';
 
-const logoUrls: Record<Ade, string> = { t3: t3Logo, orca: orcaLogo, cmux: cmuxLogo, paradev: paradevLogo };
-export const adeLogoUrl = (ade: Ade) => logoUrls[ade];
+/** Superset has no logo yet: it is drawn with its letter (AdeBadge). */
+const logoUrls: Partial<Record<Ade, string>> = { t3: t3Logo, orca: orcaLogo, cmux: cmuxLogo, paradev: paradevLogo };
+export const adeLogoUrl = (ade: Ade): string | undefined => logoUrls[ade];
 
 export type CubeLogo = { canvas: HTMLCanvasElement; pixels: Uint8ClampedArray; width: number; height: number };
 const logos = new Map<Ade, Promise<CubeLogo | null>>();
@@ -13,7 +14,9 @@ const logos = new Map<Ade, Promise<CubeLogo | null>>();
 export function loadAdeLogo(ade: Ade): Promise<CubeLogo | null> {
   const cached = logos.get(ade);
   if (cached) return cached;
+  const url = adeLogoUrl(ade);
   const result = new Promise<CubeLogo | null>((resolve) => {
+    if (!url) { resolve(null); return; }
     const image = new Image();
     image.onload = () => {
       const canvas = document.createElement('canvas');
@@ -32,7 +35,7 @@ export function loadAdeLogo(ade: Ade): Promise<CubeLogo | null> {
         width: 180, height: 180 * canvas.height / canvas.width });
     };
     image.onerror = () => resolve(null);
-    image.src = adeLogoUrl(ade);
+    image.src = url;
   });
   logos.set(ade, result);
   return result;

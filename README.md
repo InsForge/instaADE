@@ -77,7 +77,7 @@ Instabox reads the ids in `instabox-ades`, then the `instabox-bridge` id when th
 - ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link.
 - How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux).
 - Flow: `src-tauri/src/sandbox/connect.rs` sets the ADE up and adds its id to the sandbox's mark. `src-tauri/src/sandbox/sync.rs` keeps the versions in step for an ADE that pins them. `open_in_ade` in `src-tauri/src/app.rs` opens it.
-- UI: `src/ades.tsx` holds each ADE's colors, badge and text, and `src/mode.ts` the ADE the user picked. The switcher is `src/AdeSwitcher.tsx`.
+- UI: `src/ades.tsx` holds what the app does with each ADE (its badge, names and text), `src/mode.ts` the ADE the user picked, and `src/ade.ts` with `src/hero/` each ADE's look (logo and background). The switcher is `src/AdeSwitcher.tsx`.
 - A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command.
 
 Pull requests that add an ADE are welcome.
@@ -109,7 +109,7 @@ bun install
 
 - For browser-only UI development, run `bun run dev` and open `http://localhost:1420`. It shows labeled sample data; refresh to reset. Use the menu bar app for real sandbox and desktop actions.
 - The default layout removes the hero and uses its colors as the app background, fading to black over the top 200px. Open `http://localhost:1420/?layout=hero` to compare the original hero layout.
-- In both the browser preview and Mac app, cmux demonstrates the missing-install state, Paradev shows four sample machines, and Orca shows the empty state. These placeholder machines never call the sandbox API; T3 Code uses the real API in the Mac app.
+- The browser preview never calls the app or the instabox API. Actions that need them, such as Open or Install, show an error there.
 - Set `INSTABOX_API_URL` to point the app at another API.
 - Set `INSTABOX_API_KEY` to sign in with an API key instead of the browser.
 - You do not need an installer to see a change.

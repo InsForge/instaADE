@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import App from "./App";
-import { openInT3, pause } from "./api";
+import { openInAde, pause } from "./api";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -31,5 +31,5 @@ test("browser preview renders, navigates and updates sample data without native 
   await userEvent.click(screen.getByRole("combobox", { name: "Workspace" }));
   await userEvent.click(screen.getByRole("option", { name: "org-team" }));
   expect(screen.getByRole("combobox", { name: "Workspace" }).textContent).toBe("org-team");
-  await expect(openInT3("a")).rejects.toMatchObject({ kind: "other", message: expect.stringContaining("browser preview") });
+  await expect(openInAde("a", "t3")).rejects.toMatchObject({ kind: "other", message: expect.stringContaining("browser preview") });
 });

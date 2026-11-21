@@ -1,19 +1,15 @@
-import { useState } from "react";
 import { setStartAtLogin, signOut } from "./api";
-import { CheckT3Button } from "./Setup";
+import { CheckAdesButton } from "./AdeCards";
+import { AdeBadge, COMING_SOON } from "./ades";
 import { cap, openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
 import type { AppState } from "./types";
-import { ADES } from "./ade";
-import { adeLogoUrl } from "./hero/ade-logo";
 
+/** Settings. The organization is picked in the list's footer. */
 export default function Settings({ state, run }: { state: AppState; run: Run }) {
   const update = state.update;
-  const name = state.account?.name || state.login || "Signed in";
-  const email = state.account?.email || (state.login?.includes("@") ? state.login : null);
-  const initials = name.trim().split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase();
-  const [failedAvatar, setFailedAvatar] = useState<string | null>(null);
-  const avatar = state.account?.avatarUrl;
+  const name = state.login ?? "Signed in";
+  const initials = name.trim().charAt(0).toUpperCase();
 
   return (
     <div className="scroll settings-view">
@@ -32,13 +28,12 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
           <div className="group">
             <div className="group-row account-profile">
               <span className="account-avatar" aria-hidden="true">
-                {avatar && avatar !== failedAvatar
-                  ? <img src={avatar} alt="" referrerPolicy="no-referrer" onError={() => setFailedAvatar(avatar)} />
-                  : initials}
+                {initials}
               </span>
               <div className="account-identity">
-                <span className="account-name" title={name}>{name}</span>
-                <span className="account-email" title={email ?? undefined}>{email ?? "Email unavailable"}</span>
+                <span className="account-name" title={name}>
+                  {name}
+                </span>
               </div>
               <button className="btn account-sign-out" onClick={() => run(() => signOut())}>
                 Sign out
@@ -48,17 +43,31 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
         </section>
 
         <section className="section">
-          <h2 className="section-label">{cap(thisComputer())}</h2>
+          <div className="section-head">
+            <h2 className="section-label">{cap(thisComputer())}</h2>
+            <CheckAdesButton run={run} text />
+          </div>
           <div className="group">
-            {ADES.map((ade) => <div className="group-row" key={ade.id}>
-              <span className="settings-ade-label">
-                <span className="ade-logo" data-ade={ade.id} aria-hidden="true">
-                  <img src={adeLogoUrl(ade.id)} alt="" />
-                </span>
-                <span>{ade.name}{ade.id === "t3" && <> <span className="muted">{state.t3 ?? "Not found"}</span></>}</span>
-              </span>
-              {ade.id === "t3" ? <CheckT3Button run={run} /> : <span className="small muted">Not checked</span>}
-            </div>)}
+            <ul className="ade-list" aria-label={`ADEs on ${thisComputer()}`}>
+              {state.ades.map((a) => (
+                <li key={a.id} className="group-row">
+                  <span className="settings-ade-label">
+                    <AdeBadge id={a.id} />
+                    <span>{a.name}</span>
+                  </span>
+                  <span className="small muted">{a.version ?? "Not found"}</span>
+                </li>
+              ))}
+              {COMING_SOON.map((a) => (
+                <li key={a.id} className="group-row">
+                  <span className="settings-ade-label">
+                    <AdeBadge id={a.id} />
+                    <span className="muted">{a.name}</span>
+                  </span>
+                  <span className="small muted">Coming soon</span>
+                </li>
+              ))}
+            </ul>
             <div className="group-row plain">
               <label htmlFor="login-switch">Start at login</label>
               <button

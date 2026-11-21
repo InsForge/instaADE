@@ -1,21 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { HeroCube } from "./hero/HeroCube";
 import symbol from "./assets/main-view/instabox-symbol.svg";
-import { adeLogoUrl } from "./hero/ade-logo";
-import unfold from "./assets/main-view/unfold.svg";
-import { ADES } from "./ade";
-import type { Ade } from "./ade";
-import SelectMenu from "./SelectMenu";
+import AdeSwitcher from "./AdeSwitcher";
+import type { Mode } from "./ades";
+import { themeOf } from "./hero/AppBackground";
 import HeroAtmosphere from "./hero/HeroAtmosphere";
 import { useHeroSettings } from "./hero/HeroSettings";
+import type { AppState } from "./types";
 
-function AdeLogo({ ade }: { ade: Ade }) {
-  return <span className="ade-logo" data-ade={ade} aria-hidden="true"><img src={adeLogoUrl(ade)} alt="" /></span>;
+interface Props {
+  state: AppState;
+  mode: Mode;
+  switcherOpen: boolean;
+  onSwitcherOpenChange: (open: boolean) => void;
+  onChoose: (mode: Mode) => void;
+  showHero?: boolean;
 }
 
-export default function MainHeader({ ade, onAdeChange, showHero = false }: { ade: Ade; onAdeChange: (ade: Ade) => void; showHero?: boolean }) {
-  const selected = ADES.find((item) => item.id === ade)!;
-  const settings = useHeroSettings(ade);
+/** The list's header: the instabox mark and the ADE switcher, over the mode's background. */
+export default function MainHeader({ state, mode, switcherOpen, onSwitcherOpenChange, onChoose, showHero = false }: Props) {
+  const theme = themeOf(mode);
+  const settings = useHeroSettings(theme);
   const toolbar = useRef<HTMLElement>(null);
   const [stuck, setStuck] = useState(false);
 
@@ -42,18 +47,14 @@ export default function MainHeader({ ade, onAdeChange, showHero = false }: { ade
         <div className="main-wordmark" role="img" aria-label="Instabox">
           <img className="main-wordmark-symbol" src={symbol} alt="" />
         </div>
-        <SelectMenu className="ade-picker" label="Development environment" value={ade}
-          onChange={(value) => onAdeChange(value as Ade)}
-          options={ADES.map((item) => ({ value: item.id, label: item.name,
-            content: <><AdeLogo ade={item.id} /><span className="selection-label">{item.name}</span></> }))}>
-          <AdeLogo ade={selected.id} />
-          <img src={unfold} alt="" />
-        </SelectMenu>
+        <AdeSwitcher state={state} mode={mode} open={switcherOpen} onOpenChange={onSwitcherOpenChange} onChoose={onChoose} />
       </header>
-      {showHero && <div className="main-hero" style={settings.style}>
-        <HeroAtmosphere ade={ade} patternSettings={settings.values} />
-        <HeroCube ade={ade} />
-      </div>}
+      {showHero && (
+        <div className="main-hero" style={settings.style}>
+          <HeroAtmosphere ade={theme} patternSettings={settings.values} />
+          <HeroCube ade={theme} />
+        </div>
+      )}
     </>
   );
 }

@@ -359,14 +359,6 @@ pre {
   gap: 4px;
 }
 
-.ade-connection {
-  color: var(--muted);
-}
-
-.ade-connection[data-status="connected"] {
-  color: var(--green);
-}
-
 .main-view .workspace-footer {
   padding: 12px;
   gap: 8px;
@@ -1394,35 +1386,16 @@ pre.banner-text {
   font-weight: 600;
   line-height: 1;
 }
-.ade-switch {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  height: 32px;
-  padding: 0 8px 0 6px;
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-.ade-switch:hover,
-.ade-switch[aria-expanded="true"] {
-  background: rgba(255, 255, 255, 0.1);
-}
-.ade-switch[aria-expanded="true"] > svg:last-child {
-  transform: rotate(180deg);
-}
-.ade-switch-name {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-weight: 600;
-}
+/* The switcher's menu hangs under the picker, at the right of the header. */
 .ade-menu {
-  top: 48px;
-  left: 8px;
+  top: 40px;
+  right: 8px;
   width: 304px;
+}
+.ade-item .ade-logo,
+.ade-item .ade-badge {
+  width: 24px;
+  height: 24px;
 }
 .ade-item {
   display: flex;
@@ -1525,18 +1498,30 @@ pre.banner-text {
   width: 20px;
   height: 20px;
 }
-.mode-chip {
+/* The free plan's limits under a sandbox's details. */
+.free-line {
   display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  gap: 6px;
-  height: 24px;
-  padding: 0 8px 0 4px;
-  background: var(--accent-soft);
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px;
+  background: var(--raised);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 12px;
-  color: var(--accent-text);
-  white-space: nowrap;
+  color: var(--muted);
+}
+.free-line > span:first-child {
+  color: var(--text);
+}
+/* The ADEs on this computer, in the settings' This Mac card. */
+.ade-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ade-list > .group-row + .group-row,
+.ade-list + .group-row {
+  border-top: 1px solid var(--divider);
 }
 .chips {
   display: flex;

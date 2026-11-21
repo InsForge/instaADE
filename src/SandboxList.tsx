@@ -1,19 +1,19 @@
 import { useState } from "react";
 import type { MouseEvent, ReactNode } from "react";
-import { agentSignIn, isBrowserPreview, openUrl, pause, reinstallT3, resume, switchOrg, T3_DOWNLOAD_URL } from "./api";
+import { agentSignIn, isBrowserPreview, pause, reinstallT3, resume, switchOrg, T3_DOWNLOAD_URL } from "./api";
 import type { Agent } from "./api";
+import { AdeMissing, ConnectAdeCard, SwitchedHint } from "./AdeCards";
+import { adeName, hasAde, localAde, readyText } from "./ades";
+import type { Mode } from "./ades";
 import { AGENTS, agentKey, BUSY, cap, isAsleep, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
-import { Alert, Dots, ExternalLink, Gear, Plus } from "./icons";
+import { Dots, ExternalLink, Gear, Plus } from "./icons";
 import pauseIcon from "./assets/main-view/pause.svg";
 import playIcon from "./assets/main-view/play.svg";
 import unfold from "./assets/main-view/unfold.svg";
 import Progress, { ProgressBar, stepText } from "./Progress";
-import { T3Missing } from "./Setup";
-import type { AppState, SandboxView } from "./types";
-import { adeName } from "./ade";
-import type { Ade, AdeConnection } from "./ade";
 import SelectMenu from "./SelectMenu";
+import type { AdeId, AppState, SandboxView } from "./types";
 
 const DASHBOARD_URL = "https://dashboard.instabox.sh/dashboard/machines";
 
@@ -28,16 +28,20 @@ export type RowLine =
   | { kind: "progress" }
   | { kind: "update" }
   | { kind: "desktopBehind" }
-  | { kind: "connect" }
+  | { kind: "open"; ade: AdeId }
+  | { kind: "install"; ade: AdeId }
   | { kind: "agent"; agent: Agent; label: string }
   | null;
 
-export function rowLine(s: SandboxView, state: AppState, agents: AgentCache): RowLine {
+/** Plain Instabox shows no ADE line; an ADE mode shows Open or Install on every row. */
+export function rowLine(s: SandboxView, state: AppState, agents: AgentCache, mode: Mode): RowLine {
   if (state.progress && state.progress.machineId === s.id) return { kind: "progress" };
-  // A sandbox ahead of this computer never offers Update.
-  if (s.updatePending && !s.desktopBehind) return { kind: "update" };
-  if (s.desktopBehind) return { kind: "desktopBehind" };
-  if (!s.connected) return { kind: "connect" };
+  if (mode === "t3") {
+    // A sandbox ahead of this computer never offers Update.
+    if (s.updatePending && !s.desktopBehind) return { kind: "update" };
+    if (s.desktopBehind) return { kind: "desktopBehind" };
+  }
+  if (mode !== "instabox") return { kind: hasAde(s, mode) ? "open" : "install", ade: mode };
   if (s.state === "running") {
     const a = AGENTS.find((x) => agents[agentKey(s.id, x.id)] === false);
     if (a) return { kind: "agent", agent: a.id, label: a.label };
@@ -45,30 +49,35 @@ export function rowLine(s: SandboxView, state: AppState, agents: AgentCache): Ro
   return null;
 }
 
-interface RowProps {
-  ade: Ade;
-  connection?: AdeConnection;
-  s: SandboxView;
-  state: AppState;
-  run: Run;
-  agents: AgentCache;
-  menuOpen: boolean;
-  onConnect: (id: string) => void;
-  onAdeConnect: (id: string) => void;
+/** The actions of the list and its rows, which App runs. */
+export interface ListActions {
+  /** Opens the sandbox in the ADE; one without it gets it first. */
+  onOpen: (id: string, ade: AdeId) => void;
+  /** Sets the ADE up on the sandbox, then opens it. */
+  onConnect: (id: string, ade: AdeId) => void;
   onDetails: (id: string) => void;
   onMenu: (id: string, anchor: HTMLElement) => void;
   onAgentStatus: OnAgentStatus;
 }
 
-function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, onAgentStatus, onAdeConnect, ade, connection }: RowProps) {
-  const showAdeConnection = connection === "checking" || connection === "connecting" || ade !== "t3";
-  const line = showAdeConnection ? null : rowLine(s, state, agents);
+interface RowProps extends ListActions {
+  s: SandboxView;
+  state: AppState;
+  run: Run;
+  mode: Mode;
+  agents: AgentCache;
+  menuOpen: boolean;
+}
+
+function Row({ s, state, run, mode, agents, menuOpen, onOpen, onConnect, onDetails, onMenu, onAgentStatus }: RowProps) {
+  const line = rowLine(s, state, agents, mode);
+  const busy = BUSY.includes(s.state);
   const [powerPending, setPowerPending] = useState(false);
   const powerLabel = s.state === "running" ? "Pause" : "Resume";
   const changePower = () => {
     if (powerPending) return;
     setPowerPending(true);
-    void run(() => s.state === "running" ? pause(s.id) : resume(s.id)).finally(() => setPowerPending(false));
+    void run(() => (s.state === "running" ? pause(s.id) : resume(s.id))).finally(() => setPowerPending(false));
   };
   // A click anywhere on the row opens details, except on its buttons.
   const open = (e: MouseEvent) => {
@@ -104,14 +113,7 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
           </button>
         </div>
       </div>
-      {connection && connection !== "connected" && (showAdeConnection || !line) && (
-        <div className="line ade-connection" data-status={connection} role="status" title="Simulated connection check">
-          <span>{connection === "checking" ? `Checking ${adeName(ade)} connection…` : connection === "connecting" ? `Connecting to ${adeName(ade)}…` : `Not connected to ${adeName(ade)}`}</span>
-          {connection === "disconnected" && <button className="btn sm" disabled={BUSY.includes(s.state)}
-            onClick={() => ade === "t3" ? onConnect(s.id) : onAdeConnect(s.id)}>Connect</button>}
-        </div>
-      )}
-      {line?.kind === "progress" && <Progress state={state} run={run} onConnect={onConnect} />}
+      {line?.kind === "progress" && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
       {line?.kind === "update" && (
         <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
           <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
@@ -121,15 +123,22 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
       )}
       {line?.kind === "desktopBehind" && (
         <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
-          <button className="btn sm" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
+          <button className="btn sm" onClick={() => openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL)}>
             Download
           </button>
         </Line>
       )}
-      {line?.kind === "connect" && (
-        <Line text="Not in T3 Code yet">
-          <button className="btn sm" disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id)}>
-            Connect
+      {line?.kind === "open" && (
+        <Line text={readyText(state, s, line.ade)}>
+          <button className="btn sm primary" disabled={busy} onClick={() => onOpen(s.id, line.ade)}>
+            Open in {adeName(state, line.ade)}
+          </button>
+        </Line>
+      )}
+      {line?.kind === "install" && (
+        <Line text={`No ${adeName(state, line.ade)} here yet`}>
+          <button className="btn sm accent-outline" disabled={busy} onClick={() => onConnect(s.id, line.ade)}>
+            Install {adeName(state, line.ade)}
           </button>
         </Line>
       )}
@@ -149,11 +158,23 @@ function Row({ s, state, run, agents, menuOpen, onConnect, onDetails, onMenu, on
 }
 
 /** A create in flight before its sandbox is in the list. */
-function PendingRow({ state, run, pending, onConnect }: { state: AppState; run: Run; pending: PendingCreate | null; onConnect: (id: string) => void }) {
+function PendingRow({
+  state,
+  run,
+  mode,
+  pending,
+  onConnect,
+}: {
+  state: AppState;
+  run: Run;
+  mode: Mode;
+  pending: PendingCreate | null;
+  onConnect: (id: string, ade: AdeId) => void;
+}) {
   const p = state.progress!;
   const name = p.kind === "create" && pending ? pending.name : "New sandbox";
   const size = p.kind === "create" ? pending?.size : undefined;
-  const meta = p.error ? size : [size, stepText(p, state.t3)].filter(Boolean).join(" · ");
+  const meta = p.error ? size : [size, stepText(p, state)].filter(Boolean).join(" · ");
   return (
     <li className="row pending">
       <div className="row-top">
@@ -169,63 +190,79 @@ function PendingRow({ state, run, pending, onConnect }: { state: AppState; run: 
           </div>
         </div>
       </div>
-      {p.error && <Progress state={state} run={run} onConnect={onConnect} />}
+      {p.error && <Progress state={state} run={run} mode={mode} onConnect={onConnect} />}
     </li>
   );
 }
 
-interface Props {
+interface Props extends ListActions {
+  /** The main header and the banners, drawn above the sandbox heading. */
   header: ReactNode;
   showHero?: boolean;
-  ade: Ade;
-  adeMissing: boolean;
-  adeConnections: Record<string, AdeConnection> | null;
   state: AppState;
   run: Run;
+  mode: Mode;
   agents: AgentCache;
   pending: PendingCreate | null;
   menuFor: string | null;
+  /** Plain Instabox before any pick: offer an ADE. */
+  firstRun: boolean;
+  /** The ADE just switched to, while its hint shows. */
+  hint: AdeId | null;
   onNew: () => void;
   onSettings: () => void;
-  onConnect: (id: string) => void;
-  onAdeConnect: (id: string) => void;
-  onDetails: (id: string) => void;
-  onMenu: (id: string, anchor: HTMLElement) => void;
-  onAgentStatus: OnAgentStatus;
+  onPickAde: () => void;
+  onNotNow: () => void;
+  onDismissHint: () => void;
 }
 
-export default function SandboxList({ header, showHero = false, state, run, agents, pending, menuFor, onNew, onSettings, onConnect, onDetails, onMenu, onAgentStatus, onAdeConnect, ade, adeMissing, adeConnections }: Props) {
+export default function SandboxList(props: Props) {
+  const { header, showHero = false, state, run, mode, agents, pending, menuFor, firstRun, hint } = props;
+  const { onNew, onSettings, onPickAde, onNotNow, onDismissHint, onConnect } = props;
   const p = state.progress;
   const showPending = p !== null && !state.sandboxes.some((s) => s.id === p.machineId);
   const empty = state.sandboxes.length === 0 && !showPending;
+  const missing = mode !== "instabox" && localAde(state, mode)?.version == null;
   const organization = state.orgs.find((o) => o.id === state.orgId);
   const workspaceName = organization?.name ?? state.login ?? "Workspace";
-  const heading = !empty && <div className="list-head">
-    <div className="list-heading">
-      <h1 className="list-title">
-        Sandboxes <span className="muted">{state.sandboxes.length}</span>
-      </h1>
+  const heading = !empty && (
+    <div className="list-head">
+      <div className="list-heading">
+        <h1 className="list-title">
+          Sandboxes <span className="muted">{state.sandboxes.length}</span>
+        </h1>
+      </div>
+      <button className="btn primary" onClick={onNew}>
+        <Plus />
+        New sandbox
+      </button>
     </div>
-    <button className="btn primary" onClick={onNew}>
-      <Plus />
-      New sandbox
-    </button>
-  </div>;
+  );
   return (
     <>
-      {!showHero && <div className="main-list-header">{header}{heading}</div>}
+      {!showHero && (
+        <div className="main-list-header">
+          {header}
+          {heading}
+        </div>
+      )}
       <div className={`scroll main-scroll${showHero ? "" : " main-scroll-compact"}`} data-empty={empty}>
-        {showHero && <>{header}{heading}</>}
-        {ade === "t3" && state.t3 === null && (
+        {showHero && (
+          <>
+            {header}
+            {heading}
+          </>
+        )}
+        {mode !== "instabox" && hint === mode && (
           <div className="list-card">
-            <T3Missing run={run} />
+            <SwitchedHint state={state} ade={mode} onDismiss={onDismissHint} />
           </div>
         )}
         {empty ? (
           <div className="empty">
             <div className="empty-copy">
               <h1 className="list-title">No sandboxes</h1>
-              <p>Create one and open it in {adeName(ade)}.</p>
+              <p>{mode === "instabox" ? "Create one to get started." : `Create one and open it in ${adeName(state, mode)}.`}</p>
             </div>
             <button className="btn primary" onClick={onNew}>
               <Plus />
@@ -234,62 +271,53 @@ export default function SandboxList({ header, showHero = false, state, run, agen
           </div>
         ) : (
           <ul className="rows">
-            {showPending && <PendingRow state={state} run={run} pending={pending} onConnect={onConnect} />}
+            {showPending && <PendingRow state={state} run={run} mode={mode} pending={pending} onConnect={onConnect} />}
             {state.sandboxes.map((s) => (
-              <Row
-                key={s.id}
-                ade={ade}
-                connection={adeConnections?.[s.id]}
-                s={s}
-                state={state}
-                run={run}
-                agents={agents}
-                menuOpen={menuFor === s.id}
-                onConnect={onConnect}
-                onAdeConnect={onAdeConnect}
-                onDetails={onDetails}
-                onMenu={onMenu}
-                onAgentStatus={onAgentStatus}
-              />
+              <Row key={s.id} {...props} s={s} agents={agents} menuOpen={menuFor === s.id} />
             ))}
           </ul>
         )}
+        {mode === "instabox" && firstRun && <ConnectAdeCard state={state} onConnect={onPickAde} onNotNow={onNotNow} />}
       </div>
-      {adeMissing && (
+      {mode !== "instabox" && missing && (
         <div className="ade-install-notice">
-          <div className="warn-card" role="status">
-            <div className="warn-head">
-              <span className="warn-icon"><Alert /></span>
-              <div className="warn-text">
-                <span className="strong">{adeName(ade)} is not installed on {thisComputer()}</span>
-                <span className="small soft">Install {adeName(ade)} to connect your sandboxes.</span>
-              </div>
-            </div>
-            <div className="warn-buttons">
-              <button className="btn primary" onClick={() => {
-                if (isBrowserPreview) window.open("https://cmux.com", "_blank", "noopener,noreferrer");
-                else void run(() => openUrl("https://cmux.com"));
-              }}>
-                Install <ExternalLink />
-              </button>
-            </div>
-          </div>
+          <AdeMissing state={state} ade={mode} run={run} />
         </div>
       )}
       <div className="foot workspace-footer">
-        <SelectMenu className="workspace-picker" label="Workspace" value={state.orgId ?? ""} above
-          disabled={state.orgs.length < 2} onChange={(value) => { void run(() => switchOrg(value)); }}
-          options={state.orgs.map((org) => ({ value: org.id, label: org.name,
-            content: <><span className="plan-badge">{cap(org.tier)}</span><span className="selection-label">{org.name}</span></> }))}>
+        <SelectMenu
+          className="workspace-picker"
+          label="Workspace"
+          value={state.orgId ?? ""}
+          above
+          disabled={state.orgs.length < 2}
+          onChange={(value) => {
+            void run(() => switchOrg(value));
+          }}
+          options={state.orgs.map((org) => ({
+            value: org.id,
+            label: org.name,
+            content: (
+              <>
+                <span className="plan-badge">{cap(org.tier)}</span>
+                <span className="selection-label">{org.name}</span>
+              </>
+            ),
+          }))}
+        >
           <span className="workspace-name">{workspaceName}</span>
           <img src={unfold} alt="" />
         </SelectMenu>
         <div className="workspace-actions">
-          <button className="icon-btn hd" aria-label="Open InstaBox dashboard" title="Open dashboard in browser"
+          <button
+            className="icon-btn hd"
+            aria-label="Open InstaBox dashboard"
+            title="Open dashboard in browser"
             onClick={() => {
               if (isBrowserPreview) window.open(DASHBOARD_URL, "_blank", "noopener,noreferrer");
               else openExternal(DASHBOARD_URL);
-            }}>
+            }}
+          >
             <ExternalLink />
           </button>
           <button className="icon-btn hd" aria-label="Settings" title={state.update ? "Update available" : undefined} onClick={onSettings}>

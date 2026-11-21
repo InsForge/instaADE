@@ -1,20 +1,16 @@
 import { invoke as nativeInvoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AdeId, AppState, ErrorView } from "./types";
-import { isPlaceholderId, placeholderMessage } from "./placeholders";
 
+/** `bun run dev` in a browser: sample data from preview.ts, never the native app. */
 export const isBrowserPreview = import.meta.env.DEV && !isTauri();
 const preview = () => import("./preview");
-const invokeBackend = isBrowserPreview
-  ? <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
-      preview().then((p) => p.invokePreview(command, args) as Promise<T>)
-  : nativeInvoke;
-
-// Never send a sample machine ID to Tauri, even from a nested view or menu.
 const invoke = <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
-  isPlaceholderId(args?.id)
-    ? Promise.reject({ kind: "other", message: placeholderMessage })
-    : args === undefined ? invokeBackend<T>(command) : invokeBackend<T>(command, args);
+  isBrowserPreview
+    ? preview().then((p) => p.invokePreview(command, args) as Promise<T>)
+    : args === undefined
+      ? nativeInvoke<T>(command)
+      : nativeInvoke<T>(command, args);
 
 /** Thin wrappers over the Tauri commands. Rejections are ErrorView objects. */
 export type Agent = "claude" | "codex";

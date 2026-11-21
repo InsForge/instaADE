@@ -28,7 +28,7 @@ export function CubeFaces({ ade }: { ade: Ade }) {
     <>
       {['front', 'back', 'left', 'right', 'top', 'bottom'].map((face) => (
         <span key={face} className={`hero-cube-face hero-cube-${face}`}>
-          {face === 'top' && <img className="hero-cube-top-logo" src={adeLogoUrl(ade)} alt="" />}
+          {face === 'top' && adeLogoUrl(ade) && <img className="hero-cube-top-logo" src={adeLogoUrl(ade)} alt="" />}
         </span>
       ))}
       {roundedEdges.map((style, index) => (

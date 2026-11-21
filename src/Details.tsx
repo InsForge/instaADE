@@ -3,7 +3,6 @@ import {
   agentSignIn,
   agentStatus,
   deleteSandbox,
-  openInT3,
   openSsh,
   pairAgain,
   pause,
@@ -16,25 +15,34 @@ import {
   toErrorView,
 } from "./api";
 import type { Agent } from "./api";
-import { AGENTS, agentKey, copyText, isAsleep, isFree, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
+import { AdeBadge, adeName, hasAde, localAde, pairs } from "./ades";
+import type { Mode } from "./ades";
+import { AGENTS, agentKey, BUSY, copyText, isAsleep, isFree, Line, openExternal, StateDot, stateLabel, thisComputer } from "./common";
 import type { AgentCache, OnAgentStatus, Run } from "./common";
-import { Check, Copy, Terminal } from "./icons";
-import Progress from "./Progress";
-import type { AppState, SandboxView } from "./types";
+import { Check, Copy, Plus, Terminal } from "./icons";
 import claudeLogo from "./assets/agents/claude-code.svg";
 import codexLogo from "./assets/agents/codex.svg";
-import { adeName, type Ade } from "./ade";
+import Progress from "./Progress";
+import type { AdeId, AppState, SandboxView } from "./types";
 
 const agentLogos: Record<Agent, string> = { claude: claudeLogo, codex: codexLogo };
 
 interface Props {
   state: AppState;
-  ade?: Ade;
   sandbox: SandboxView;
   run: Run;
+  mode: Mode;
   agents: AgentCache;
   onAgentStatus: OnAgentStatus;
-  onConnect: (id: string) => void;
+  onOpen: (id: string, ade: AdeId) => void;
+  onConnect: (id: string, ade: AdeId) => void;
+}
+
+export function formatMinutes(m: number): string {
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  if (h === 0) return `${r} m`;
+  return r === 0 ? `${h} h` : `${h} h ${r} m`;
 }
 
 /** How the sandbox's T3 compares with T3 Code on this computer. */
@@ -43,6 +51,38 @@ export function t3Relation(s: SandboxView, desktop: string | null): string | nul
   if (s.updatePending) return `Older than ${thisComputer()}`;
   if (s.t3Version && s.t3Version === desktop) return `Same as ${thisComputer()}`;
   return null;
+}
+
+/** The ADEs on the sandbox as chips, the one in use marked, and a dashed chip to add each other ADE found here. */
+function AdeChips({ state, s, mode, onConnect }: { state: AppState; s: SandboxView; mode: AdeId; onConnect: (id: string, ade: AdeId) => void }) {
+  const more = state.ades.filter((a) => a.version !== null && !hasAde(s, a.id));
+  return (
+    <section className="section">
+      <h2 className="section-label">ADEs on this sandbox</h2>
+      <ul className="chips" aria-label="ADEs on this sandbox">
+        {s.ades.map((id) => (
+          <li key={id} className={`chip${id === mode ? " current" : ""}`}>
+            <AdeBadge id={id} />
+            <span>{adeName(state, id)}</span>
+            {id === mode ? <span className="chip-note accent">In use</span> : id === "t3" && s.t3Version && <span className="chip-note">{s.t3Version}</span>}
+          </li>
+        ))}
+        {more.map((a) => (
+          <li key={a.id}>
+            <button className="chip add" aria-label={`Install ${a.name} on ${s.name}`} disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id, a.id)}>
+              <Plus />
+              {a.name}
+            </button>
+          </li>
+        ))}
+      </ul>
+      {s.ades.length === 0 && more.length === 0 ? (
+        <p className="small muted">No ADE on this sandbox yet.</p>
+      ) : (
+        <p className="small muted">Switching to an ADE that is already here skips the install.</p>
+      )}
+    </section>
+  );
 }
 
 interface AgentRowProps {
@@ -86,8 +126,12 @@ function AgentRow({ id, running, agent, label, signedIn, run, onStatus }: AgentR
 /** The SSH box: nothing asked yet, the login command, or why it could not be made. */
 type Ssh = { command: string } | { error: string } | null;
 
-export default function Details({ state, ade = "t3", sandbox: s, run, agents, onAgentStatus, onConnect }: Props) {
+export default function Details({ state, sandbox: s, run, mode, agents, onAgentStatus, onOpen, onConnect }: Props) {
   const free = isFree(s, state.tier);
+  // Plain Instabox has no ADE parts. T3 pairs from this computer: Pair again and Reinstall need it.
+  const ade = mode === "instabox" ? null : mode;
+  const has = !!ade && hasAde(s, ade);
+  const paired = !!ade && pairs(ade) && has && s.connected;
   const running = s.state === "running";
   const sizeId = useId();
   const sleepId = useId();
@@ -133,7 +177,7 @@ export default function Details({ state, ade = "t3", sandbox: s, run, agents, on
     setSleepPick(v);
     void run(() => setAutoSleep(s.id, v)).then(() => setSleepPick(null));
   };
-  const relation = ade === "t3" ? t3Relation(s, state.t3) : null;
+  const relation = t3Relation(s, state.t3);
 
   return (
     <>
@@ -146,11 +190,19 @@ export default function Details({ state, ade = "t3", sandbox: s, run, agents, on
               <span className="small muted">{s.size}</span>
             </div>
             <div className="grid2">
-              <div className="fact">
-                <span className="small muted">{ade === "t3" ? "T3" : adeName(ade)}</span>
-                <span className="strong">{ade === "t3" ? s.t3Version ?? (s.connected ? "Unknown" : "Not installed") : "Preview"}</span>
-                {relation && <span className="small muted">{relation}</span>}
-              </div>
+              {ade === "t3" && (
+                <div className="fact">
+                  <span className="small muted">T3</span>
+                  <span className="strong">{s.t3Version ?? (has ? "Unknown" : "Not installed")}</span>
+                  {relation && <span className="small muted">{relation}</span>}
+                </div>
+              )}
+              {ade && ade !== "t3" && (
+                <div className="fact">
+                  <span className="small muted">{adeName(state, ade)}</span>
+                  <span className="strong">{has ? "Set up" : "Not installed"}</span>
+                </div>
+              )}
               <div className="fact">
                 <span className="small muted">Auto sleep</span>
                 <span className="strong">{s.autoSleep.label}</span>
@@ -158,31 +210,34 @@ export default function Details({ state, ade = "t3", sandbox: s, run, agents, on
               </div>
             </div>
             {progress ? (
-              <Progress state={state} run={run} onConnect={onConnect} />
-            ) : s.updatePending && !s.desktopBehind ? (
+              <Progress state={state} run={run} mode={mode} onConnect={onConnect} />
+            ) : ade === "t3" && s.updatePending && !s.desktopBehind ? (
               <Line tone="amber" text={state.t3 ? `T3 is older than ${thisComputer()}'s ${state.t3}` : `T3 is older than T3 Code on ${thisComputer()}`}>
                 <button className="btn sm" onClick={() => run(() => reinstallT3(s.id))}>
                   Update
                 </button>
               </Line>
-            ) : s.desktopBehind ? (
+            ) : ade === "t3" && s.desktopBehind ? (
               <Line tone="amber" text={`T3 Code on ${thisComputer()} is older`}>
-                <button className="btn sm" onClick={() => openExternal(T3_DOWNLOAD_URL)}>
+                <button className="btn sm" onClick={() => openExternal(localAde(state, "t3")?.downloadUrl ?? T3_DOWNLOAD_URL)}>
                   Download
                 </button>
               </Line>
             ) : null}
           </div>
 
-          {s.connected ? (
-            <button className="btn primary lg" onClick={() => run(() => openInT3(s.id))}>
-              Open in {adeName(ade)}
-            </button>
-          ) : (
-            <button className="btn primary lg" onClick={() => onConnect(s.id)}>
-              Connect to {adeName(ade)}
-            </button>
-          )}
+          {ade &&
+            (has ? (
+              <button className="btn primary lg" onClick={() => onOpen(s.id, ade)}>
+                Open in {adeName(state, ade)}
+              </button>
+            ) : (
+              <button className="btn primary lg" onClick={() => onConnect(s.id, ade)}>
+                Install {adeName(state, ade)}
+              </button>
+            ))}
+
+          {ade && <AdeChips state={state} s={s} mode={ade} onConnect={onConnect} />}
 
           <section className="section">
             <h2 className="section-label">Power</h2>
@@ -306,7 +361,7 @@ export default function Details({ state, ade = "t3", sandbox: s, run, agents, on
             )}
           </section>
 
-          {s.connected && (
+          {paired && (
             <div className="pair">
               <button className="btn md" onClick={() => run(() => pairAgain(s.id))}>
                 Pair again
@@ -317,6 +372,27 @@ export default function Details({ state, ade = "t3", sandbox: s, run, agents, on
                 </button>
               )}
             </div>
+          )}
+          {ade && !pairs(ade) && has && (
+            // cmux installs nothing to reinstall: Reconnect runs its prep again and opens it.
+            <div className="pair">
+              <button className="btn md" disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id, ade)}>
+                Reconnect
+              </button>
+            </div>
+          )}
+
+          {free && (
+            <p className="free-line">
+              <span>Free plan</span>
+              <span>
+                {s.cooldownMinutes !== null
+                  ? `Cooling down, ready in about ${s.cooldownMinutes} min`
+                  : s.runLeftMinutes !== null
+                    ? `Can run ${formatMinutes(s.runLeftMinutes)} more`
+                    : "Runs up to 8 h at a time"}
+              </span>
+            </p>
           )}
 
           <hr className="delete-divider" />

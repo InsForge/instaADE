@@ -5,7 +5,6 @@ import type { AppState, SandboxView } from "./types";
 let state: AppState = {
   ...(structuredClone(fixture) as AppState),
   login: "preview",
-  account: { name: "Preview User", email: "preview@example.com", avatarUrl: null },
   progress: null,
   error: null,
   update: null,
@@ -16,10 +15,10 @@ let state: AppState = {
       name: ["dev-workspace", "website", "experiment"][i],
     })),
     ...[
-      { id: "preview-api", name: "api-server", state: "running", connected: true },
-      { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false },
-      { id: "preview-design", name: "design-system", state: "running", connected: false },
-      { id: "preview-staging", name: "staging", state: "paused", connected: true },
+      { id: "preview-api", name: "api-server", state: "running", connected: true, ades: ["t3", "cmux"] },
+      { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false, ades: [] },
+      { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux"] },
+      { id: "preview-staging", name: "staging", state: "paused", connected: true, ades: ["t3"] },
     ].map((machine) => ({
       ...fixture.sandboxes[2],
       ...machine,
