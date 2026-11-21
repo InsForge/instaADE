@@ -71,7 +71,7 @@ export function ConnectAdeCard({ state, onConnect, onNotNow }: { state: AppState
       <div className="ade-card-text">
         <span className="strong">Open sandboxes in your ADE</span>
         <span className="small muted">
-          {here}Pick one to get an Open button on every sandbox. Change it or go back to InstaBox from the menu at the top.
+          {here}Pick one to open your sandboxes in it from each sandbox's … menu or its details. Change it or go back to InstaBox from the menu at the top.
         </span>
       </div>
       <div className="ade-card-buttons">
