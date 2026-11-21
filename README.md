@@ -1,9 +1,9 @@
 <div align="center">
   <a href="https://instabox.sh">
-    <img src="src-tauri/icons/128x128@2x.png" alt="Instabox" width="96">
+    <img src="src-tauri/icons/128x128@2x.png" alt="InstaBox" width="96">
   </a>
 
-  <h1>Instabox</h1>
+  <h1>InstaBox</h1>
 
   <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.</p>
 
@@ -28,11 +28,11 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
    - macOS: the `.dmg`, `aarch64` for Apple silicon, `x64` for Intel.
    - Windows: the `x64-setup.exe` installer.
 2. Install it:
-   - macOS: drag Instabox to Applications and open it. It is signed and notarized, so it opens normally.
+   - macOS: drag InstaBox to Applications and open it. It is signed and notarized, so it opens normally.
    - Windows: run the installer. It is not signed yet, so Windows SmartScreen asks once: click **More info**, then **Run anyway**.
-3. Click the Instabox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow).
+3. Click the InstaBox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow).
 4. Sign in with GitHub or Google.
-5. To open sandboxes in an ADE, pick it in the menu at the top (**Instabox** keeps to sandboxes only). If you used T3 Code with Instabox before, it starts in T3 Code.
+5. To open sandboxes in an ADE, pick it in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaBox before, it starts in T3 Code.
 6. Click **New sandbox**, pick a size, then click **Create sandbox**.
 7. Confirm the new environment in T3 Code, or the workspace in cmux.
 
@@ -50,7 +50,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 
 ### T3 Code
 
-Instabox installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
+InstaBox installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
 
 - T3 under `/opt/t3`
 - A `t3-instabox` service that runs the T3 server
@@ -58,14 +58,14 @@ Instabox installs T3 at the same version as your T3 Code desktop app, then pairs
 
 ### cmux (macOS)
 
-cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so Instabox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so Instabox opens it only in the real cmux app in Applications: its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). Instabox checks this when it looks for cmux and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaBox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so InstaBox opens it only in the real cmux app in Applications: its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). InstaBox checks this when it looks for cmux and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
 A sandbox can have several ADEs. Its metadata marks them with two keys:
 
 - `instabox-ades` lists every ADE id, comma separated, in the order they were added, such as `t3,cmux`.
 - `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating it as connected. Else it is the first id of the list.
 
-Instabox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key, such as one made in plain Instabox, has no ADE, so each ADE offers Install on it. Only an action that must pick an ADE when none was named uses T3 for it.
+InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key, such as one made in plain InstaBox, has no ADE, so each ADE offers Install on it. Only an action that must pick an ADE when none was named uses T3 for it.
 
 ## Roadmap
 
@@ -102,9 +102,9 @@ bun install
 
 ### Run with hot reload
 
-1. Quit any installed copy of Instabox. Only one instance runs at a time.
+1. Quit any installed copy of InstaBox. Only one instance runs at a time.
 2. Run `bun tauri dev`.
-3. Click the Instabox icon in the menu bar or system tray.
+3. Click the InstaBox icon in the menu bar or system tray.
 4. Edit the code. UI changes reload at once, and Rust changes rebuild the app.
 
 **Tips:**
@@ -140,7 +140,7 @@ A local build is not notarized, so macOS blocks it on other Macs.
 
 ### Share a preview build
 
-To let others try a pull request, build Instabox Preview in CI. It installs next to Instabox and keeps its own sign-in. The macOS `.dmg` is signed and notarized like a release. The Windows installer is not signed yet, so SmartScreen asks once.
+To let others try a pull request, build Instabox Preview in CI. It installs next to InstaBox and keeps its own sign-in. The macOS `.dmg` is signed and notarized like a release. The Windows installer is not signed yet, so SmartScreen asks once.
 
 1. Add the `preview-build` label to the pull request. The pull request's author must be listed in `.github/PREVIEW_AUTHORS`.
 2. **Preview build** builds the app from the pull request without any secrets. **Preview publish** then runs main's code only: it checks the author and the app, signs and notarizes it, and takes the label off.
