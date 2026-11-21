@@ -422,6 +422,17 @@ mod tests {
     }
 
     #[test]
+    fn orca_joins_the_mark_like_any_other_ade() {
+        let mut md = marked(Some("t3"), Some("t3,cmux"));
+        mark(&mut md, Ade::Orca);
+        assert_eq!(md, marked(Some("t3"), Some("t3,cmux,orca")));
+        assert_eq!(marked_ades(&md), [Ade::T3, Ade::Cmux, Ade::Orca]);
+        let mut md = marked(None, None);
+        mark(&mut md, Ade::Orca);
+        assert_eq!(md, marked(Some("orca"), Some("orca")));
+    }
+
+    #[test]
     fn the_mark_reads_loosely_and_keeps_ids_it_does_not_know() {
         assert_eq!(
             marked_ades(&marked(None, Some(" t3 , cmux "))),
@@ -431,13 +442,13 @@ mod tests {
         assert_eq!(marked_ades(&marked(Some(""), Some(""))), []);
         // ADEs a newer build added stay in the list when this build adds its own, and an
         // unknown instabox-bridge id stays as long as there is no T3.
-        let mut md = marked(Some("orca"), Some("orca,t3"));
+        let mut md = marked(Some("future-ade"), Some("future-ade,t3"));
         assert_eq!(marked_ades(&md), [Ade::T3]);
         mark(&mut md, Ade::Cmux);
-        assert_eq!(md, marked(Some("t3"), Some("orca,t3,cmux")));
-        let mut md = marked(Some("orca"), Some("orca"));
+        assert_eq!(md, marked(Some("t3"), Some("future-ade,t3,cmux")));
+        let mut md = marked(Some("future-ade"), Some("future-ade"));
         mark(&mut md, Ade::Cmux);
-        assert_eq!(md, marked(Some("orca"), Some("orca,cmux")));
+        assert_eq!(md, marked(Some("future-ade"), Some("future-ade,cmux")));
         let mut md = marked(Some("zed"), None);
         mark(&mut md, Ade::Cmux);
         assert_eq!(md, marked(Some("zed"), Some("zed,cmux")));

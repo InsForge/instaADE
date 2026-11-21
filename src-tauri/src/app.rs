@@ -30,6 +30,7 @@ use crate::sandbox::view::{
 };
 use crate::sandbox::{self, SandboxError, connect, lifecycle};
 use crate::ssh::{self, SshTokenStore};
+use crate::ssh_config;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
 const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instabox-bridge/releases/latest";
@@ -786,6 +787,10 @@ fn not_signed_in() -> ErrorView {
 
 type Res<T> = Result<T, ErrorView>;
 
+/// What the user does next in an ADE's app after an action opened it, when opening it does not
+/// finish the job (Orca: connect the host InstaBox wrote). None for every other ADE.
+pub type Notice = Option<String>;
+
 impl Core {
     pub fn new(
         base: Url,
@@ -1419,7 +1424,7 @@ impl Core {
             .ok_or_else(unknown_ade)
     }
 
-    pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<()> {
+    pub async fn create_sandbox(self: &Arc<Self>, a: CreateArgs) -> Res<Notice> {
         let (client, account, org_id) = match self.signed_in_with(|i| i.state.org_id.clone()) {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
@@ -1444,7 +1449,7 @@ impl Core {
         self.begin_progress("create", "creating", None, a.ade, account);
         let (Some(ade), Some(version)) = (a.ade, version) else {
             let r = connect::create(&client, &req, &self.progress_cb(account)).await;
-            return self.finish_create(r, account).await;
+            return self.finish_create(r, account).await.map(|()| None);
         };
         let r =
             connect::create_and_connect(&client, ade, &req, &version, self.progress_cb(account))
@@ -1454,8 +1459,9 @@ impl Core {
 
     /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
     /// installed (never an older version) and paired, then its app opens with the pairing
-    /// link; a link ADE (cmux) gets its prep command, then its link opens.
-    pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
+    /// link; a link ADE (cmux) gets its prep command, then its link opens; an SSH host ADE
+    /// (Orca) gets its host written and its app started.
+    pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<Notice> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
@@ -1483,8 +1489,9 @@ impl Core {
     /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
     /// with it: wake it, sync the ADE, open the app (no setup, no new pairing). A link ADE
     /// (cmux) on a sandbox marked with it: open its link with an SSH token (the link wakes the
-    /// sandbox). Anything else goes through the connect flow.
-    pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<()> {
+    /// sandbox). An SSH host ADE (Orca) on a sandbox marked with it: wake it, write its host
+    /// and start the app. Anything else goes through the connect flow.
+    pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<Notice> {
         let snapshot = self.signed_in_with(|i| {
             // None: the sandbox is marked only with ADEs this build does not know.
             let ade = asked.or_else(|| i.data.ade_of(id));
@@ -1494,6 +1501,7 @@ impl Core {
                     && match a.open() {
                         Open::Pair(_) => connected,
                         Open::Link(_) => true,
+                        Open::SshHost(_) => true,
                     }
             });
             (ready, ade, ade.and_then(|a| i.sync_version(a)))
@@ -1513,7 +1521,7 @@ impl Core {
                 let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            self.open_for(account, p.app_url)
+            self.open_for(account, p.app_url).map(|()| None)
         };
         self.act(account, r).await
     }
@@ -1524,10 +1532,15 @@ impl Core {
     /// loaded: with no app, or one that fails the check, no token is made and nothing opens.
     /// The token comes from `ssh::token`: the stored one while it has more than a day left,
     /// else a new 30-day one.
-    async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<()> {
-        let Open::Link(l) = ade.open() else {
+    ///
+    /// An SSH host ADE (Orca) goes the same way, with its app checked before the token too. It
+    /// wakes the sandbox, writes the token into the sandbox's host in the user's SSH config,
+    /// starts the app and returns what the user does next there.
+    async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
+        let open = ade.open();
+        if let Open::Pair(_) = open {
             return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
-        };
+        }
         let (locate, verify) = (self.locate.clone(), self.verify.clone());
         let checked = tokio::task::spawn_blocking(move || {
             locate(ade).map(|app| {
@@ -1565,16 +1578,45 @@ impl Core {
             })
             .flatten()
             .ok_or_else(account_changed)?;
+        let title = if let Open::SshHost(_) = open {
+            // The user connects from the app next: a running sandbox answers at once. Its name
+            // makes the host's alias, and a sandbox made just now is not in the list yet.
+            let m = sandbox::ensure_running(&client, id)
+                .await
+                .map_err(ErrorView::from)?;
+            if m.name.is_empty() { title } else { m.name }
+        } else {
+            title
+        };
         let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
             .await
             .map_err(ErrorView::from)?;
-        let link = (l.link)(&SshLogin {
-            host: &t.host,
-            port: t.port,
-            user: &t.token,
-            title: &title,
-        });
-        self.open_with(account, &link, Some(&app))
+        match open {
+            Open::Link(l) => {
+                let link = (l.link)(&SshLogin {
+                    host: &t.host,
+                    port: t.port,
+                    user: &t.token,
+                    title: &title,
+                });
+                self.open_with(account, &link, Some(&app)).map(|()| None)
+            }
+            Open::SshHost(h) => {
+                // Written only while the account is current, so a sign-out leaves no token.
+                let alias = guarded(&self.gate(account), || {
+                    ssh_config::write_host(&self.home, id, &title, &t)
+                })
+                .ok_or_else(account_changed)?
+                .map_err(|e| {
+                    ErrorView::other(format!(
+                        "Could not add the sandbox to your SSH config: {e:#}"
+                    ))
+                })?;
+                self.open_with(account, &app.to_string_lossy(), None)?;
+                Ok(Some((h.notice)(&alias)))
+            }
+            Open::Pair(_) => Err(ErrorView::other(format!("{} opens by pairing", ade.name()))),
+        }
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -1706,10 +1748,10 @@ impl Core {
         r: Result<Connected, SandboxError>,
         version: &str,
         account: u64,
-    ) -> Res<()> {
+    ) -> Res<Notice> {
         if self.account() != account {
             // Signed out or switched account while this ran: drop the result.
-            return Ok(());
+            return Ok(None);
         }
         self.step("finish");
         let out = match r {
@@ -1730,7 +1772,7 @@ impl Core {
                     i.rebuild();
                 });
                 let opened = match &c.link {
-                    Some(link) => self.open_for(account, link),
+                    Some(link) => self.open_for(account, link).map(|()| None),
                     None => self.open_link(ade, &c.machine_id, account).await,
                 };
                 let out = self.settle_in(account, opened);
@@ -1833,6 +1875,10 @@ impl Core {
                 i.rebuild();
             });
             self.forget(id, account).await;
+            // Its SSH host (Orca) goes too. A host left behind only fails to connect.
+            let (home, gone) = (self.home.clone(), id.to_string());
+            let _ =
+                tokio::task::spawn_blocking(move || ssh_config::remove_host(&home, &gone)).await;
         }
         r
     }
@@ -2110,6 +2156,7 @@ mod tests {
         s.sign_in_code = None;
         s.set_desktop(Ade::T3, Some("0.1.10".into()));
         s.set_desktop(Ade::Cmux, Some("0.64.25".into()));
+        s.set_desktop(Ade::Orca, Some("1.4.269".into()));
         s.mcp = McpStatus {
             claude_code: Some(true),
             codex: Some(false),
@@ -2691,11 +2738,18 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(
                 s.ades,
-                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Cmux, None)]
+                vec![
+                    AdeView::new(Ade::T3, None),
+                    AdeView::new(Ade::Cmux, None),
+                    AdeView::new(Ade::Orca, None)
+                ]
             );
         }
         if cfg!(windows) {
-            assert_eq!(s.ades, vec![AdeView::new(Ade::T3, None)]);
+            assert_eq!(
+                s.ades,
+                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Orca, None)]
+            );
         }
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
 
@@ -2847,6 +2901,8 @@ mod tests {
                     // It holds an SSH token: only `open_link` opens it, in the app it found.
                     assert!(!allowed_url(&(l.link)(&login)), "{a:?}");
                 }
+                // No link at all: the token goes into the SSH config, never into a URL.
+                Open::SshHost(_) => assert!(!allowed_url("://x"), "{a:?}"),
             }
         }
         assert!(!allowed_url("t3codex://x"));
@@ -4628,5 +4684,238 @@ mod tests {
         // What the refresh loop runs; no command is running.
         core.refresh(false).await;
         assert_account_ended(&core, before, (&store, &keys, &ssh), &signed_out).await;
+    }
+
+    // ---- Orca: an SSH host the app imports ----
+
+    /// The Orca app the test computer has.
+    #[derive(Clone, Copy, PartialEq)]
+    enum OrcaHere {
+        /// Orca's identifier and a signature that passes.
+        Real,
+        /// Orca's identifier, but the signature check fails.
+        BadSignature,
+        Missing,
+    }
+
+    /// A signed-in core with a recording opener, its own home and an Orca.app as `here` says.
+    /// The app is a real bundle on disk, checked by the production identifier check; only
+    /// codesign is replaced by `here`.
+    struct OrcaCore {
+        core: Arc<Core>,
+        opened: Arc<Mutex<Vec<String>>>,
+        app: PathBuf,
+        home: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+    }
+
+    fn orca_core(base: &Url, here: OrcaHere) -> OrcaCore {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let app = ade::orca::test_bundle(dir.path(), ade::orca::BUNDLE_ID, "1.4.269");
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            home.path().to_path_buf(),
+        );
+        let found = app.clone();
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| {
+                (here != OrcaHere::Missing && ade == Ade::Orca).then(|| found.clone())
+            }),
+            Arc::new(move |ade, path| {
+                ade == Ade::Orca && ade::orca::verify_with(path, |_| here != OrcaHere::BadSignature)
+            }),
+        ));
+        sign_in_as(&core, base, 7);
+        OrcaCore {
+            core,
+            opened,
+            app,
+            home,
+            _dir: dir,
+        }
+    }
+
+    const ORCA_NOTICE: &str =
+        "In Orca, connect instabox-dev-1 from the SSH menu, then open /data/home.";
+
+    fn hosts_of(home: &Path) -> String {
+        std::fs::read_to_string(ssh_config::hosts_path(home)).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn open_in_orca_writes_the_host_and_starts_the_verified_app() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core.refresh(false).await;
+        let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
+        // The app itself starts, with no link: Orca imports the host from the SSH config.
+        assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
+        let hosts = hosts_of(o.home.path());
+        assert!(
+            hosts.contains(
+                "# instabox-sandbox m1\nHost instabox-dev-1\n  HostName ssh.example.test\n  \
+                 Port 2222\n  User ibssh_new\n  StrictHostKeyChecking accept-new\n  \
+                 ForwardAgent no\n"
+            ),
+            "{hosts}"
+        );
+        let cfg = std::fs::read_to_string(ssh_config::config_path(o.home.path())).unwrap();
+        assert_eq!(cfg, format!("{}\n", ssh_config::INCLUDE));
+        let r = requests(&server).await;
+        assert!(
+            !r.iter().any(|x| x.ends_with("/exec")),
+            "nothing runs: {r:?}"
+        );
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // Again: the same host, the stored token, the app started once more.
+        let again = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        assert_eq!(again.as_deref(), Some(ORCA_NOTICE));
+        assert_eq!(hosts_of(o.home.path()), hosts);
+        assert_eq!(o.opened.lock().unwrap().len(), 2);
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // Orca pairs nothing, so the sandbox does not join the T3 pairings from here.
+        assert!(!o.core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn open_in_orca_of_a_sandbox_without_it_marks_it_with_no_exec() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core
+            .update(|i| i.state.set_desktop(Ade::Orca, Some("1.4.269".into())));
+        o.core.refresh(false).await;
+        let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
+        assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            !reqs.iter().any(|r| r.url.path().ends_with("/exec")),
+            "Orca installs its own server: nothing runs on the sandbox"
+        );
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,orca");
+        assert!(hosts_of(o.home.path()).contains("Host instabox-dev-1\n"));
+        let s = o.core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        assert!(!o.core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn a_new_sandbox_in_orca_mode_gets_its_host_and_the_notice() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core
+            .update(|i| i.state.set_desktop(Ade::Orca, Some("1.4.269".into())));
+        let notice = o
+            .core
+            .create_sandbox(CreateArgs {
+                name: "dev 1".into(),
+                snapshot_id: None,
+                vcpus: 2,
+                mem_mib: 4096,
+                auto_suspend_after_seconds: Some(1800),
+                ade: Some(Ade::Orca),
+            })
+            .await
+            .unwrap();
+        assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
+        assert!(hosts_of(o.home.path()).contains("Host instabox-dev-1\n"));
+    }
+
+    #[tokio::test]
+    async fn orca_gets_no_host_and_no_token_without_its_verified_app() {
+        for (here, message) in [
+            (
+                OrcaHere::Missing,
+                "Orca is not installed. Install it first.",
+            ),
+            (
+                OrcaHere::BadSignature,
+                "Could not verify the Orca app. Install it again from its official download.",
+            ),
+        ] {
+            let (server, base) = cmux_server(
+                serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}),
+            )
+            .await;
+            let o = orca_core(&base, here);
+            o.core.refresh(false).await;
+            let e = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap_err();
+            assert_eq!(e.message, message);
+            assert!(o.opened.lock().unwrap().is_empty(), "nothing started");
+            let r = requests(&server).await;
+            assert!(!r.iter().any(|x| x.ends_with("/ssh-tokens")), "{r:?}");
+            assert!(
+                !o.home.path().join(".ssh").exists(),
+                "no SSH config written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sandbox_removes_its_orca_host_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "id": "op9", "machineId": "m1", "type": "delete", "state": "succeeded",
+                "machine": null
+            })))
+            .mount(&server)
+            .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core.refresh(false).await;
+        o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        // Another sandbox's host, and a block of the user's own.
+        ssh_config::write_host(o.home.path(), "m2", "web", &ssh_token()).unwrap();
+        let path = ssh_config::hosts_path(o.home.path());
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\nHost mine\n  User me\n");
+        std::fs::write(&path, text).unwrap();
+        o.core.delete("m1").await.unwrap();
+        let hosts = hosts_of(o.home.path());
+        assert!(!hosts.contains("instabox-dev-1"), "{hosts}");
+        assert!(hosts.contains("Host instabox-web\n"), "{hosts}");
+        assert!(hosts.contains("Host mine\n  User me\n"), "{hosts}");
+    }
+
+    #[tokio::test]
+    async fn a_new_token_from_another_action_rewrites_the_orca_host() {
+        let (_server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let home = tempfile::tempdir().unwrap();
+        // The store the app uses: the keychain, wrapped to keep the hosts in step.
+        let store =
+            ssh_config::SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
+        let mut old = ssh_token();
+        old.token = "ibssh_old".into();
+        old.expires_at = Some(Utc::now() + chrono::Duration::hours(2));
+        ssh_config::write_host(home.path(), "m1", "dev 1", &old).unwrap();
+        store.save("m1", &old).unwrap();
+        let o = orca_core(&base, OrcaHere::Real);
+        let client = o.core.client().unwrap();
+        // The SSH command or an agent sign-in asks for a token, and the stored one runs out soon.
+        let t = ssh::token(&client, &store, "m1", &crate::gate::Open)
+            .await
+            .unwrap();
+        assert_eq!(t.token, "ibssh_new");
+        let hosts = hosts_of(home.path());
+        assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
+        assert!(!hosts.contains("ibssh_old"), "{hosts}");
     }
 }

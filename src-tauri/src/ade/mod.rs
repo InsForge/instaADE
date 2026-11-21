@@ -3,6 +3,7 @@
 //! The flows that use them (connect, sync, reinstall) are in `sandbox`.
 
 pub mod cmux;
+pub mod orca;
 pub mod t3;
 
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Every ADE the app knows, in the order the app lists them.
-pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux];
+pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux, Ade::Orca];
 
 /// Exit code of every ADE's setup script when the ADE is busy and its update waits.
 pub const SETUP_EXIT_BUSY: i32 = 3;
@@ -26,6 +27,7 @@ pub enum Ade {
     #[default]
     T3,
     Cmux,
+    Orca,
 }
 
 /// A platform the desktop side of an ADE runs on.
@@ -58,6 +60,9 @@ pub enum Open {
     Pair(Pairing),
     /// The app opens a link, and the desktop app reaches the sandbox over SSH by itself.
     Link(Link),
+    /// The app writes the sandbox as a host in the user's SSH config, which the desktop app
+    /// imports, and starts the desktop app. The user connects the host there.
+    SshHost(SshHost),
 }
 
 /// An ADE opened by a link. `prep` readies the sandbox before the first link (over exec, so
@@ -66,6 +71,13 @@ pub enum Open {
 pub struct Link {
     pub prep: &'static str,
     pub link: fn(&SshLogin<'_>) -> String,
+}
+
+/// An ADE that reaches a sandbox through a host in the user's SSH config (`ssh_config`).
+/// `notice` tells the user what to do in the app, given the host's alias.
+#[derive(Debug, Clone, Copy)]
+pub struct SshHost {
+    pub notice: fn(&str) -> String,
 }
 
 /// What a link needs to reach a sandbox: the SSH gateway, a token as the user, and a title.
@@ -115,6 +127,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::ID,
             Ade::Cmux => cmux::ID,
+            Ade::Orca => orca::ID,
         }
     }
 
@@ -123,6 +136,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::NAME,
             Ade::Cmux => cmux::NAME,
+            Ade::Orca => orca::NAME,
         }
     }
 
@@ -131,6 +145,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::SHORT_NAME,
             Ade::Cmux => cmux::SHORT_NAME,
+            Ade::Orca => orca::SHORT_NAME,
         }
     }
 
@@ -138,6 +153,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::PLATFORMS,
             Ade::Cmux => cmux::PLATFORMS,
+            Ade::Orca => orca::PLATFORMS,
         }
     }
 
@@ -151,6 +167,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::DOWNLOAD_URL,
             Ade::Cmux => cmux::DOWNLOAD_URL,
+            Ade::Orca => orca::DOWNLOAD_URL,
         }
     }
 
@@ -159,6 +176,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::URL_SCHEME,
             Ade::Cmux => cmux::URL_SCHEME,
+            Ade::Orca => orca::URL_SCHEME,
         }
     }
 
@@ -169,6 +187,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::locate(),
             Ade::Cmux => cmux::locate(),
+            Ade::Orca => orca::locate(),
         }
     }
 
@@ -178,17 +197,20 @@ impl Ade {
         match self {
             Ade::T3 => t3::version(path),
             Ade::Cmux => cmux::version(path),
+            Ade::Orca => orca::version(path),
         }
     }
 
     /// True when the app at `path` is the ADE's own, checked again right before the app hands
     /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
-    /// link). T3: the app gets no token from a link, so the path `locate` found stands.
+    /// link). T3: the app gets no token from a link, so the path `locate` found stands. Orca:
+    /// on macOS its identifier and signature, as the app InstaBox starts.
     /// Blocks for a few seconds, so run it off the async runtime.
     pub fn verify(self, path: &Path) -> bool {
         match self {
             Ade::T3 => true,
             Ade::Cmux => cmux::verify(path),
+            Ade::Orca => orca::verify(path),
         }
     }
 
@@ -205,6 +227,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::parse_version(out),
             Ade::Cmux => None,
+            Ade::Orca => None,
         }
     }
 
@@ -214,6 +237,7 @@ impl Ade {
         match self {
             Ade::T3 => true,
             Ade::Cmux => false,
+            Ade::Orca => false,
         }
     }
 
@@ -225,6 +249,7 @@ impl Ade {
         match self {
             Ade::T3 => Some(t3::VERSION_SCRIPT),
             Ade::Cmux => None,
+            Ade::Orca => None,
         }
     }
 
@@ -235,6 +260,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::setup_script(version),
             Ade::Cmux => cmux::PREP_SCRIPT.to_string(),
+            Ade::Orca => String::new(),
         }
     }
 
@@ -243,6 +269,7 @@ impl Ade {
         match self {
             Ade::T3 => Some(t3::STOP_SCRIPT),
             Ade::Cmux => None,
+            Ade::Orca => None,
         }
     }
 
@@ -252,6 +279,7 @@ impl Ade {
         match self {
             Ade::T3 => Some(t3::PROBE),
             Ade::Cmux => None,
+            Ade::Orca => None,
         }
     }
 
@@ -265,6 +293,7 @@ impl Ade {
         match self {
             Ade::T3 => Open::Pair(t3::PAIRING),
             Ade::Cmux => Open::Link(cmux::LINK),
+            Ade::Orca => Open::SshHost(orca::SSH_HOST),
         }
     }
 
@@ -273,6 +302,7 @@ impl Ade {
         match self.open() {
             Open::Pair(p) => Some(p.port),
             Open::Link(_) => None,
+            Open::SshHost(_) => None,
         }
     }
 }
@@ -317,10 +347,11 @@ mod tests {
 
     #[test]
     fn the_registry_lists_t3_then_cmux_by_their_ids() {
-        assert_eq!(ALL, &[Ade::T3, Ade::Cmux]);
+        assert_eq!(ALL, &[Ade::T3, Ade::Cmux, Ade::Orca]);
         assert_eq!(Ade::default(), Ade::T3);
         assert_eq!(Ade::from_id("t3"), Some(Ade::T3));
         assert_eq!(Ade::from_id("cmux"), Some(Ade::Cmux));
+        assert_eq!(Ade::from_id("orca"), Some(Ade::Orca));
         assert_eq!(Ade::from_id("other"), None);
         assert_eq!(Ade::from_id(""), None);
     }
@@ -403,6 +434,32 @@ mod tests {
     }
 
     #[test]
+    fn orca_parts() {
+        let o = Ade::Orca;
+        assert_eq!((o.id(), o.name(), o.short_name()), ("orca", "Orca", "Orca"));
+        assert_eq!(
+            o.download_url(),
+            "https://github.com/stablyai/orca/releases/latest"
+        );
+        assert_eq!(o.url_scheme(), "", "Orca takes no links");
+        // Orca installs its own server on the first connect: nothing to set up or keep in step.
+        assert!(!o.pins_local_version());
+        assert!(!o.reinstalls());
+        assert_eq!(o.port(), None);
+        assert_eq!(o.version_script(), None);
+        assert_eq!(o.stop_script(), None);
+        assert_eq!(o.probe(), None);
+        assert_eq!(o.parse_version("1.4.269"), None);
+        assert_eq!(o.setup_script("ignored"), "");
+        let Open::SshHost(h) = o.open() else {
+            panic!("Orca opens through an SSH host")
+        };
+        assert_eq!((h.notice)("instabox-x"), orca::notice("instabox-x"));
+        assert_eq!(o.platforms(), &[Platform::MacOs, Platform::Windows]);
+        assert_eq!(o.runs_here(), cfg!(any(target_os = "macos", windows)));
+    }
+
+    #[test]
     fn t3_runs_on_every_platform_the_app_ships_for_and_cmux_on_macos_only() {
         for p in [Platform::MacOs, Platform::Windows] {
             assert!(Ade::T3.platforms().contains(&p), "{p:?}");
@@ -410,11 +467,11 @@ mod tests {
         assert_eq!(Ade::Cmux.platforms(), &[Platform::MacOs]);
         if cfg!(target_os = "macos") {
             assert!(Ade::T3.runs_here() && Ade::Cmux.runs_here());
-            assert_eq!(local(), vec![Ade::T3, Ade::Cmux]);
+            assert_eq!(local(), vec![Ade::T3, Ade::Cmux, Ade::Orca]);
         }
         if cfg!(windows) {
             assert!(Ade::T3.runs_here() && !Ade::Cmux.runs_here());
-            assert_eq!(local(), vec![Ade::T3], "no cmux on Windows");
+            assert_eq!(local(), vec![Ade::T3, Ade::Orca], "no cmux on Windows");
         }
     }
 
@@ -439,6 +496,7 @@ mod tests {
                     };
                     assert!((l.link)(&login).starts_with(&scheme), "{a:?}");
                 }
+                Open::SshHost(_) => assert_eq!(a.url_scheme(), "", "{a:?} takes no links"),
             }
         }
     }

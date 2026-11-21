@@ -61,6 +61,7 @@ fn open_target(s: &SandboxView) -> (Ade, bool) {
         && match ade.open() {
             Open::Pair(_) => s.connected,
             Open::Link(_) => true,
+            Open::SshHost(_) => true,
         };
     (ade, ready)
 }
@@ -317,7 +318,7 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                         let _ = match verb.as_str() {
                             "pause" => core.pause(&sandbox).await,
                             "resume" => core.resume(&sandbox).await,
-                            "open" => core.open_in_ade(&sandbox, None).await,
+                            "open" => core.open_in_ade(&sandbox, None).await.map(drop),
                             _ => Ok(()),
                         };
                     });

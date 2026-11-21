@@ -115,18 +115,23 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setView(v);
   };
   const back = () => go({ name: "list" });
+  /** Shows what the user does next in the ADE, when opening it does not finish the job (Orca). */
+  const thenNotice = (opened: Promise<string | null | undefined>) =>
+    opened.then((next) => {
+      if (next) setNotice(next);
+    });
   /** Sets the ADE up on the sandbox, then opens it. The ADE asks to confirm in its own window. */
   const connect = (id: string, ade: AdeId) => {
-    void run(() => connectSandbox(id, ade));
+    void run(() => thenNotice(connectSandbox(id, ade)));
   };
   /** Opens the sandbox in the ADE. */
   const open = (id: string, ade: AdeId) => {
-    void run(() => openInAde(id, ade));
+    void run(() => thenNotice(openInAde(id, ade)));
   };
   const create = (args: CreateArgs, size: string) => {
     setPending({ name: args.name, size });
     go({ name: "list" });
-    void run(() => createSandbox(args));
+    void run(() => thenNotice(createSandbox(args)));
   };
   const toggleMenu = (id: string, anchor: HTMLElement) =>
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));
