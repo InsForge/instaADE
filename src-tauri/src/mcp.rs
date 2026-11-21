@@ -15,7 +15,6 @@ use crate::api::Client;
 use crate::gate::{Gate, guarded};
 use crate::process::{RunError, command, run_bounded};
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "mcp-key";
 const KEY_NAME: &str = "Instabox MCP";
 const KEY_SCOPES: [&str; 4] = [
@@ -50,7 +49,7 @@ pub struct KeyringKeyStore;
 
 impl KeyringKeyStore {
     fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+        keyring::Entry::new(crate::keychain_service(), KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
     }
 }
 

@@ -19,7 +19,6 @@ pub fn account_changed() -> Error {
     }
 }
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const TOKEN_NAME: &str = "Instabox";
 const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const REUSE_MARGIN_HOURS: i64 = 24;
@@ -44,7 +43,7 @@ type TokenMap = HashMap<String, SshToken>;
 
 impl KeyringSshStore {
     fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, SSH_ACCOUNT).map_err(|e| e.to_string())
+        keyring::Entry::new(crate::keychain_service(), SSH_ACCOUNT).map_err(|e| e.to_string())
     }
 
     fn read() -> std::result::Result<TokenMap, String> {

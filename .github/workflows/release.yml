@@ -26,6 +26,8 @@ jobs:
 
   build:
     needs: release
+    # The signing secrets live in this environment, which only v* tags may use.
+    environment: release
     strategy:
       fail-fast: false
       matrix:

@@ -14,7 +14,7 @@ pub mod sandbox;
 pub mod ssh;
 pub mod tray;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
@@ -27,6 +27,21 @@ use crate::ssh::KeyringSshStore;
 
 /// The argument the login item passes, so a start at login does not open the popover.
 const AT_LOGIN: &str = "--at-login";
+
+/// The keychain service before startup sets one: Instabox's identifier.
+const DEFAULT_KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
+static KEYCHAIN_SERVICE: OnceLock<String> = OnceLock::new();
+
+/// The keychain service that holds the app's secrets: the identifier the app was bundled
+/// with, set at startup. Instabox Preview has its own identifier, so it never shares a
+/// sign-in with Instabox.
+pub(crate) fn keychain_service() -> &'static str {
+    service_or_default(KEYCHAIN_SERVICE.get())
+}
+
+fn service_or_default(set: Option<&'static String>) -> &'static str {
+    set.map_or(DEFAULT_KEYCHAIN_SERVICE, String::as_str)
+}
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -42,6 +57,8 @@ pub fn run() {
         .manage(tray::TrayMemo::default())
         .manage(tray::HiddenAt::default())
         .setup(|app| {
+            // Before anything reads the keychain.
+            let _ = KEYCHAIN_SERVICE.set(app.config().identifier.clone());
             let handle = app.handle().clone();
             // A menu-bar app: no Dock icon.
             #[cfg(target_os = "macos")]
@@ -182,4 +199,27 @@ pub fn run() {
             tray::show_popover(_app, None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_KEYCHAIN_SERVICE, service_or_default};
+
+    fn identifier(conf: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(conf).unwrap();
+        v["identifier"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_keychain_service_is_the_bundle_identifier() {
+        let app = identifier(include_str!("../tauri.conf.json"));
+        let preview = identifier(include_str!("../tauri.preview.conf.json"));
+        assert_ne!(app, preview, "a preview installs next to Instabox");
+        // Before startup sets it, the service is Instabox's identifier.
+        assert_eq!(service_or_default(None), app);
+        assert_eq!(DEFAULT_KEYCHAIN_SERVICE, app);
+        // Instabox Preview sets its own identifier, so its secrets live apart.
+        let set: &'static String = Box::leak(Box::new(preview.clone()));
+        assert_eq!(service_or_default(Some(set)), preview);
+    }
 }

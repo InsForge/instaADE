@@ -13,7 +13,6 @@ use url::Url;
 
 use crate::api::{self, ApiErrorBody, Credentials, DeviceStart, Tokens};
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "tokens";
 const REFRESH_MARGIN_SECS: i64 = 60;
 const SLOW_DOWN_SECS: u64 = 5;
@@ -81,7 +80,7 @@ pub struct KeyringStore;
 
 impl KeyringStore {
     fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
+        keyring::Entry::new(crate::keychain_service(), KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
     }
 }
 
