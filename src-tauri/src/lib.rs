@@ -28,6 +28,14 @@ use crate::ssh::KeyringSshStore;
 /// The argument the login item passes, so a start at login does not open the popover.
 const AT_LOGIN: &str = "--at-login";
 
+/// The keychain service that holds the app's secrets: the app's identifier. A preview build
+/// sets `INSTABOX_KEYCHAIN_SERVICE` to its own identifier, so it never shares a sign-in with
+/// Instabox.
+pub(crate) const KEYCHAIN_SERVICE: &str = match option_env!("INSTABOX_KEYCHAIN_SERVICE") {
+    Some(s) if !s.is_empty() => s,
+    _ => "sh.instabox.bridge",
+};
+
 pub fn run() {
     let app = tauri::Builder::default()
         // Single instance first: a second launch opens the running popover.
@@ -182,4 +190,26 @@ pub fn run() {
             tray::show_popover(_app, None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KEYCHAIN_SERVICE;
+
+    fn identifier(conf: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(conf).unwrap();
+        v["identifier"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_keychain_service_is_the_app_identifier() {
+        let app = identifier(include_str!("../tauri.conf.json"));
+        let preview = identifier(include_str!("../tauri.preview.conf.json"));
+        assert_ne!(app, preview, "a preview installs next to Instabox");
+        let expected = match option_env!("INSTABOX_KEYCHAIN_SERVICE") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => app,
+        };
+        assert_eq!(KEYCHAIN_SERVICE, expected);
+    }
 }

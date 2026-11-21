@@ -11,11 +11,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use url::Url;
 
+use crate::KEYCHAIN_SERVICE;
 use crate::api::Client;
 use crate::gate::{Gate, guarded};
 use crate::process::{RunError, command, run_bounded};
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "mcp-key";
 const KEY_NAME: &str = "Instabox MCP";
 const KEY_SCOPES: [&str; 4] = [

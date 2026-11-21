@@ -5,6 +5,7 @@ use std::sync::Mutex as StdMutex;
 
 use chrono::{Duration, Utc};
 
+use crate::KEYCHAIN_SERVICE;
 use crate::api::{Client, Error, Result, SshToken};
 use crate::gate::{Gate, guarded};
 
@@ -19,7 +20,6 @@ pub fn account_changed() -> Error {
     }
 }
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const TOKEN_NAME: &str = "Instabox";
 const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const REUSE_MARGIN_HOURS: i64 = 24;

@@ -11,9 +11,9 @@ use chrono::Utc;
 use tokio::sync::{Mutex, watch};
 use url::Url;
 
+use crate::KEYCHAIN_SERVICE;
 use crate::api::{self, ApiErrorBody, Credentials, DeviceStart, Tokens};
 
-const KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
 const KEYCHAIN_ACCOUNT: &str = "tokens";
 const REFRESH_MARGIN_SECS: i64 = 60;
 const SLOW_DOWN_SECS: u64 = 5;

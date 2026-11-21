@@ -1,0 +1,130 @@
+name: Build
+
+# The signed builds of a release and of a preview share these steps. The signing secrets live
+# in the environment the caller names: `release` (only v* tags) or `preview` (any branch, each
+# run approved by a maintainer).
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The environment that holds the signing secrets.
+        type: string
+        required: true
+      preview:
+        description: Build Instabox Preview, which installs next to Instabox.
+        type: boolean
+        default: false
+      tag:
+        description: The release to upload to. Empty keeps the files as workflow artifacts.
+        type: string
+        default: ""
+
+jobs:
+  build:
+    environment: ${{ inputs.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bundle: dmg
+            ext: dmg
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bundle: dmg
+            ext: dmg
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bundle: nsis
+            ext: exe
+    runs-on: ${{ matrix.os }}
+    env:
+      # A preview merges its own name and identifier into the Tauri config.
+      CONFIG: ${{ inputs.preview && '--config src-tauri/tauri.preview.conf.json' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A pull request builds its head, not the merge with main.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - run: bun install --frozen-lockfile
+      # The keychain service is the app's identifier, so a preview never shares a sign-in
+      # with Instabox.
+      - name: Use the preview identifier for the keychain
+        if: inputs.preview
+        shell: bash
+        run: |
+          id=$(bun -e 'console.log(require("./src-tauri/tauri.preview.conf.json").identifier)')
+          echo "INSTABOX_KEYCHAIN_SERVICE=$id" >> "$GITHUB_ENV"
+      - name: Write the notary key
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
+      # Tauri signs with the Developer ID certificate, then notarizes and staples the app.
+      - name: Build the signed .dmg
+        if: runner.os == 'macOS'
+        run: bun tauri build --target ${{ matrix.target }} --bundles dmg $CONFIG
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/notary.p8
+      # The Windows installer is not signed yet: SmartScreen asks once before it runs.
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bun tauri build --target ${{ matrix.target }} --bundles nsis $CONFIG
+      # A missing secret builds an unsigned app, which macOS reports as damaged. Never ship one.
+      - name: Check the app is signed and notarized
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmgs=(src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "no .dmg was built" >&2
+            exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            mnt=$(mktemp -d)
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+            apps=("$mnt"/*.app)
+            codesign --verify --strict "${apps[0]}"
+            info=$(codesign -dvv "${apps[0]}" 2>&1)
+            grep -q "^Authority=Developer ID Application" <<<"$info"
+            xcrun stapler validate "${apps[0]}"
+            hdiutil detach "$mnt" >/dev/null
+          done
+      - name: Upload the .${{ matrix.ext }} to the release
+        if: inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=(src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/*.${{ matrix.ext }})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no .${{ matrix.ext }} was built" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Keep the .${{ matrix.ext }} as a workflow artifact
+        if: inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: instabox-preview-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/*.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 14

@@ -131,6 +131,16 @@ bun tauri build --bundles dmg
 bun tauri build --bundles nsis
 ```
 
+A local build is not notarized, so macOS blocks it on other Macs.
+
+### Share a preview build
+
+To let others try a branch, build Instabox Preview in CI. It is signed and notarized like a release, and it installs next to Instabox with its own sign-in.
+
+1. Add the `preview-build` label to the pull request, or run **Preview build** from the Actions tab on your branch.
+2. A maintainer approves the run.
+3. Download the `.dmg` or the Windows installer under **Artifacts** on the run page. The pull request gets a comment with the link.
+
 ## Contributing
 
 **Pull requests**: Welcome. To add an ADE, start with [Adding an ADE](#adding-an-ade).
