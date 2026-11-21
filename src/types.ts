@@ -45,7 +45,7 @@ export interface SandboxView {
   name: string;
   state: ViewState;
   size: string;
-  /** Connected from this computer (to any ADE). */
+  /** T3 was paired with it from this computer. cmux never sets it. */
   connected: boolean;
   /** The ADEs set up on the sandbox (its mark), in the order they were added. */
   ades: AdeId[];

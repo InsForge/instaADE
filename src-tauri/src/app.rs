@@ -6,7 +6,7 @@
 //! `lib.rs`, `commands.rs` and `tray.rs`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -41,9 +41,11 @@ pub const FULL_REFRESH: Duration = Duration::from_secs(300);
 
 /// Called with the whole state after every change.
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
-/// Opens a URL in the default handler (browser, or an ADE's app for its links, such as
-/// T3 Code for `t3code://`).
-pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Opens a URL. With an app (the path of an app bundle), in that app only; without one, in the
+/// default handler (browser, or an ADE's app for its links, such as T3 Code for `t3code://`).
+pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send + Sync>;
+/// Finds an ADE's desktop app on this computer (`Ade::locate`).
+pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -157,8 +159,8 @@ pub struct Data {
     pub update_pending: HashSet<String>,
     /// Sandboxes whose ADE is newer than the desktop's: the app on this computer is behind.
     pub desktop_behind: HashSet<String>,
-    /// Sandboxes the signed-in user connected from this computer. Only these get commands
-    /// without a user action.
+    /// Sandboxes the signed-in user paired a pairing ADE (T3) with from this computer. Only
+    /// these get commands without a user action. A link ADE (cmux) never adds one.
     pub connected: HashSet<String>,
     /// The user `connected` was loaded for. `None` until the account is known.
     pub connected_user: Option<i64>,
@@ -467,10 +469,15 @@ pub fn newer_release(current: &str, body: &str) -> Option<UpdateInfo> {
     })
 }
 
-/// URLs the UI may ask the app to open: https, and the links of every ADE's app.
+/// URLs the UI may ask the app to open in the default handler: https, and the links of every
+/// pairing ADE's app. A link ADE's link (cmux) holds an SSH token, so only `open_link` opens
+/// one, and only in the app it found.
 pub fn allowed_url(url: &str) -> bool {
     Url::parse(url).is_ok_and(|u| {
-        u.scheme() == "https" || ade::ALL.iter().any(|a| a.url_scheme() == u.scheme())
+        u.scheme() == "https"
+            || ade::ALL
+                .iter()
+                .any(|a| matches!(a.open(), Open::Pair(_)) && a.url_scheme() == u.scheme())
     })
 }
 
@@ -674,6 +681,8 @@ pub struct Core {
     ssh: Arc<dyn SshTokenStore>,
     connected: Arc<dyn ConnectedStore>,
     open: Opener,
+    /// `Ade::locate`; a test puts its own in place.
+    locate: Locator,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -781,6 +790,7 @@ impl Core {
             ssh,
             connected,
             open,
+            locate: Arc::new(Ade::locate),
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -794,6 +804,13 @@ impl Core {
                 account: 0,
             }),
         }
+    }
+
+    /// Test only: finds the ADEs' apps with `locate` instead of on this computer.
+    #[cfg(test)]
+    fn with_locate(mut self, locate: Locator) -> Core {
+        self.locate = locate;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -865,10 +882,16 @@ impl Core {
         }
     }
 
-    /// Opens `url` only while the flow's account is current.
+    /// Opens `url` in the default handler, only while the flow's account is current.
     fn open_for(self: &Arc<Self>, account: u64, url: &str) -> Res<()> {
+        self.open_with(account, url, None)
+    }
+
+    /// Opens `url` in the app at `app` (else the default handler), only while the flow's
+    /// account is current.
+    fn open_with(self: &Arc<Self>, account: u64, url: &str, app: Option<&Path>) -> Res<()> {
         guarded(&self.gate(account), || {
-            (self.open)(url).map_err(ErrorView::other)
+            (self.open)(url, app).map_err(ErrorView::other)
         })
         .unwrap_or_else(|| Err(account_changed()))
     }
@@ -1037,7 +1060,7 @@ impl Core {
 
     pub fn open_url(&self, url: &str) -> Res<()> {
         let r = if allowed_url(url) {
-            (self.open)(url).map_err(ErrorView::other)
+            (self.open)(url, None).map_err(ErrorView::other)
         } else {
             Err(ErrorView::other("This link cannot be opened"))
         };
@@ -1475,12 +1498,24 @@ impl Core {
         self.act(account, r).await
     }
 
-    /// Opens a link ADE's link to sandbox `id`. The SSH token comes from `ssh::token`: the
-    /// stored one while it has more than a day left, else a new 30-day one. The link holds
-    /// the token, so it goes only to the ADE's own scheme, never to a web page.
+    /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
+    /// in the ADE's app found on this computer, never in whatever handles its scheme; with no
+    /// app found, nothing opens and no token is made. The token comes from `ssh::token`: the
+    /// stored one while it has more than a day left, else a new 30-day one.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<()> {
         let Open::Link(l) = ade.open() else {
             return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
+        };
+        let locate = self.locate.clone();
+        let Some(app) = tokio::task::spawn_blocking(move || locate(ade))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Err(ErrorView::other(format!(
+                "{} is not installed. Install it first.",
+                ade.name()
+            )));
         };
         let (client, title) = self
             .read_in(account, |i| {
@@ -1503,7 +1538,7 @@ impl Core {
             user: &t.token,
             title: &title,
         });
-        self.open_for(account, &link)
+        self.open_with(account, &link, Some(&app))
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -1663,8 +1698,13 @@ impl Core {
                     None => self.open_link(ade, &c.machine_id, account).await,
                 };
                 let out = self.settle_in(account, opened);
-                // After `settle_in`, which clears the error: a failed save stays visible.
-                self.remember(&c.machine_id, account).await;
+                // The connected set says a pairing ADE (T3) was paired from here. A link ADE
+                // (cmux) pairs nothing, so it must not add the sandbox: T3 would then count
+                // as paired here when another computer set it up.
+                if matches!(ade.open(), Open::Pair(_)) {
+                    // After `settle_in`, which clears the error: a failed save stays visible.
+                    self.remember(&c.machine_id, account).await;
+                }
                 out
             }
             Err(e) => {
@@ -1806,7 +1846,7 @@ impl Core {
                 &*self.ssh,
                 id,
                 agent,
-                move |u| open(u).map_err(anyhow::Error::msg),
+                move |u| open(u, None).map_err(anyhow::Error::msg),
                 &gate,
             )
             .await
@@ -2294,7 +2334,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             store,
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ))
@@ -2425,7 +2465,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(FileConnectedStore::new(path)),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2545,7 +2585,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2751,7 +2791,7 @@ mod tests {
     }
 
     #[test]
-    fn every_ade_link_may_be_opened() {
+    fn pairing_links_may_be_opened_by_the_ui_and_token_links_never() {
         for a in ade::ALL {
             match a.open() {
                 Open::Pair(p) => {
@@ -2765,7 +2805,8 @@ mod tests {
                         user: "ibssh_x",
                         title: "box",
                     };
-                    assert!(allowed_url(&(l.link)(&login)), "{a:?}");
+                    // It holds an SSH token: only `open_link` opens it, in the app it found.
+                    assert!(!allowed_url(&(l.link)(&login)), "{a:?}");
                 }
             }
         }
@@ -2783,7 +2824,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             ssh,
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         ));
@@ -2910,7 +2951,7 @@ mod tests {
             keys.clone(),
             ssh.clone(),
             connected.clone(),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
             PathBuf::from("/nonexistent"),
         ));
@@ -2993,7 +3034,7 @@ mod tests {
             keys.clone(),
             ssh.clone(),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(move |s: &AppState| {
                 if !s.signed_in {
                     signal.notify_one();
@@ -3071,7 +3112,7 @@ mod tests {
             keys.clone(),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -3086,7 +3127,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -3108,7 +3149,7 @@ mod tests {
             Arc::new(MemoryKeyStore::default()),
             Arc::new(MemorySshStore::default()),
             Arc::new(MemoryConnectedStore::default()),
-            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(())),
             Arc::new(|_| {}),
             PathBuf::from("/nonexistent"),
         );
@@ -3471,6 +3512,38 @@ mod tests {
         assert_eq!(core.state().progress, before);
     }
 
+    /// What a recording opener writes down: the URL, and the app it had to open it in.
+    fn opened_as(url: &str, app: Option<&Path>) -> String {
+        match app {
+            Some(a) => format!("{url} in {}", a.display()),
+            None => url.to_string(),
+        }
+    }
+
+    /// A core on `base` with a recording opener and the given stores and home, not yet shared.
+    fn recording_core(
+        base: Url,
+        keys: Arc<MemoryKeyStore>,
+        ssh: Arc<MemorySshStore>,
+        home: PathBuf,
+    ) -> (Core, Arc<Mutex<Vec<String>>>) {
+        let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        let core = Core::new(
+            base,
+            keys,
+            ssh,
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(move |u: &str, app: Option<&Path>| {
+                sink.lock().unwrap().push(opened_as(u, app));
+                Ok(())
+            }),
+            Arc::new(|_| {}),
+            home,
+        );
+        (core, opened)
+    }
+
     /// A core on `base` with a recording opener and the given stores and home.
     fn core_full(
         base: Url,
@@ -3478,21 +3551,8 @@ mod tests {
         ssh: Arc<MemorySshStore>,
         home: PathBuf,
     ) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
-        let opened = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = opened.clone();
-        let core = Arc::new(Core::new(
-            base,
-            keys,
-            ssh,
-            Arc::new(MemoryConnectedStore::default()),
-            Arc::new(move |u| {
-                sink.lock().unwrap().push(u.to_string());
-                Ok(())
-            }),
-            Arc::new(|_| {}),
-            home,
-        ));
-        (core, opened)
+        let (core, opened) = recording_core(base, keys, ssh, home);
+        (Arc::new(core), opened)
     }
 
     #[tokio::test]
@@ -3589,22 +3649,44 @@ mod tests {
 
     const CMUX_LINK: &str = "cmux://ssh?host=ssh.example.test&user=ibssh_new&port=2222&title=dev%201&host-key-policy=accept-new";
 
+    /// Where the test cores find the cmux app.
+    const CMUX_APP: &str = "/test/Applications/cmux.app";
+
+    /// A signed-in core with a recording opener that finds cmux at `CMUX_APP`, or nowhere.
+    fn cmux_core(
+        base: &Url,
+        ssh: Arc<MemorySshStore>,
+        cmux_found: bool,
+    ) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            ssh,
+            PathBuf::from("/nonexistent"),
+        );
+        let core = Arc::new(core.with_locate(Arc::new(move |ade| {
+            (cmux_found && ade == Ade::Cmux).then(|| PathBuf::from(CMUX_APP))
+        })));
+        sign_in_as(&core, base, 7);
+        (core, opened)
+    }
+
+    /// The cmux link as the opener got it: always with the cmux app named.
+    fn cmux_opened() -> String {
+        format!("{CMUX_LINK} in {CMUX_APP}")
+    }
+
     #[tokio::test]
-    async fn open_in_cmux_opens_its_link_with_an_ssh_token_and_runs_nothing() {
+    async fn open_in_cmux_opens_its_link_in_the_cmux_app_only() {
         let (server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3,cmux"}))
                 .await;
         let ssh = Arc::new(MemorySshStore::default());
-        let (core, opened) = core_full(
-            base.clone(),
-            Arc::new(MemoryKeyStore::default()),
-            ssh.clone(),
-            PathBuf::from("/nonexistent"),
-        );
-        sign_in_as(&core, &base, 7);
+        let (core, opened) = cmux_core(&base, ssh.clone(), true);
         core.refresh(false).await;
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
-        assert_eq!(*opened.lock().unwrap(), [CMUX_LINK]);
+        // Never the default handler of cmux:// links: the link holds the SSH token.
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened()]);
         let r = requests(&server).await;
         assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
         assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
@@ -3616,25 +3698,40 @@ mod tests {
         // The token is kept, so the next open reuses it.
         assert_eq!(ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
-        assert_eq!(opened.lock().unwrap().len(), 2);
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(), cmux_opened()]);
         let r = requests(&server).await;
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
     }
 
     #[tokio::test]
+    async fn a_cmux_link_never_opens_without_the_cmux_app() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}))
+                .await;
+        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), false);
+        core.refresh(false).await;
+        let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
+        assert_eq!(e.message, "cmux is not installed. Install it first.");
+        assert_eq!(core.state().error, Some(e));
+        assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+        let r = requests(&server).await;
+        assert!(
+            !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+            "no token: {r:?}"
+        );
+        // And the UI cannot open one in the default handler either.
+        assert!(core.open_url(CMUX_LINK).is_err());
+        assert!(opened.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn open_in_cmux_of_a_sandbox_without_it_runs_the_prep_marks_then_opens() {
         let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
-        let (core, opened) = core_full(
-            base.clone(),
-            Arc::new(MemoryKeyStore::default()),
-            Arc::new(MemorySshStore::default()),
-            PathBuf::from("/nonexistent"),
-        );
-        sign_in_as(&core, &base, 7);
+        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), true);
         core.update(|i| i.state.set_desktop(Ade::Cmux, Some("0.64.25".into())));
         core.refresh(false).await;
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
-        assert_eq!(*opened.lock().unwrap(), [CMUX_LINK]);
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened()]);
         let reqs = server.received_requests().await.unwrap();
         let execs: Vec<String> = reqs
             .iter()
@@ -3650,7 +3747,41 @@ mod tests {
         let s = core.state();
         assert_eq!(s.progress, None);
         assert_eq!(s.error, None);
-        assert!(core.lock().data.connected.contains("m1"));
+        // cmux pairs nothing, so the sandbox does not join the set of T3 pairings from here.
+        assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn adding_cmux_here_to_a_t3_sandbox_from_elsewhere_still_needs_t3_pairing() {
+        // Another computer set T3 up and marked the sandbox. This one adds cmux.
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let (core, opened) = cmux_core(&base, Arc::new(MemorySshStore::default()), true);
+        core.update(|i| {
+            i.state.set_desktop(Ade::Cmux, Some("0.64.25".into()));
+            i.state.set_desktop(Ade::T3, Some("0.1.11".into()));
+        });
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert!(!core.lock().data.connected.contains("m1"));
+        assert!(!core.state().sandboxes[0].connected);
+
+        // Open in T3 Code must pair first, not open T3 Code as if this computer had paired.
+        let _ = core.open_in_ade("m1", Some(Ade::T3)).await;
+        assert!(
+            !opened
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.starts_with("t3code://")),
+            "{:?}",
+            opened.lock().unwrap()
+        );
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().any(|r| r.url.path().ends_with("/exec")
+                && String::from_utf8_lossy(&r.body).contains("t3 pair")),
+            "the pairing ran"
+        );
     }
 
     #[tokio::test]
@@ -3876,8 +4007,8 @@ mod tests {
                 Arc::new(MemoryKeyStore::default()),
                 Arc::new(MemorySshStore::default()),
                 store.clone(),
-                Arc::new(move |u| {
-                    sink.lock().unwrap().push(u.to_string());
+                Arc::new(move |u: &str, app: Option<&Path>| {
+                    sink.lock().unwrap().push(opened_as(u, app));
                     Ok(())
                 }),
                 Arc::new(|_| {}),
@@ -4087,7 +4218,7 @@ mod tests {
                 keys.clone(),
                 ssh.clone(),
                 Arc::new(MemoryConnectedStore::default()),
-                Arc::new(|_| Ok(())),
+                Arc::new(|_, _| Ok(())),
                 Arc::new(|_| {}),
                 PathBuf::from("/nonexistent"),
             ));
