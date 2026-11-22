@@ -33,6 +33,9 @@ use crate::ssh::{self, SshTokenStore};
 use crate::ssh_config;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
+/// A sandbox with an InstaBox SSH host (Orca) gets a new token once the stored one has fewer days
+/// left than this, so the host keeps working without a click.
+const HOST_TOKEN_RENEW_DAYS: i64 = 7;
 const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instabox-bridge/releases/latest";
 const RELEASES_PAGE: &str = "https://github.com/InsForge/instabox-bridge/releases/latest";
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
@@ -710,6 +713,8 @@ pub struct Core {
     /// Test only: called at named steps of a flow, so a test can change the account there.
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
+    /// A pass of `renew_ssh_hosts` is running.
+    renewing: std::sync::atomic::AtomicBool,
 }
 
 /// A flow's gate: open only while the account it began under is current.
@@ -819,6 +824,7 @@ impl Core {
             side_effects: Mutex::new(()),
             #[cfg(test)]
             hook: Mutex::new(None),
+            renewing: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 state,
                 data: Data::default(),
@@ -1247,10 +1253,81 @@ impl Core {
         Ok(())
     }
 
-    /// `refresh`, then syncs the sandboxes after a desktop version change in the background.
+    /// `refresh`, then syncs the sandboxes after a desktop version change in the background. A
+    /// full one (at startup, at sign-in and every few minutes) also renews the tokens of the
+    /// SSH hosts in the background.
     pub async fn refresh_and_sync(self: &Arc<Self>, full: bool) {
         let jobs = self.refresh(full).await;
         self.spawn_sync(jobs);
+        if full {
+            let core = self.clone();
+            tokio::spawn(async move { core.renew_ssh_hosts().await });
+        }
+    }
+
+    /// Keeps every SSH host InstaBox wrote (Orca) working without a click. For each sandbox
+    /// with a host, a stored token with fewer than 7 days left, or none, is renewed the way
+    /// `ssh::token` makes one, and the token store rewrites the host's `User` as it saves it.
+    /// A token with 7 days or more is left alone. Tokens are made over the API only, so no
+    /// sandbox wakes. A sandbox the API no longer has loses its host. Every write goes through
+    /// the gate of the account the pass began under, so nothing happens once it changed. A
+    /// failure is logged and tried again on the next full refresh; the popover never shows it.
+    /// One pass runs at a time.
+    async fn renew_ssh_hosts(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.renewing.swap(true, SeqCst) {
+            return;
+        }
+        struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, SeqCst);
+            }
+        }
+        let _done = Done(&self.renewing);
+        let Ok((client, account)) = self.signed_in() else {
+            return;
+        };
+        let home = self.home.clone();
+        let hosts = match tokio::task::spawn_blocking(move || ssh_config::aliases(&home)).await {
+            Ok(Ok(hosts)) => hosts,
+            Ok(Err(e)) => {
+                eprintln!("SSH hosts: could not read them to renew their tokens: {e:#}");
+                return;
+            }
+            Err(_) => return,
+        };
+        let gate = self.gate(account);
+        let margin = chrono::Duration::days(HOST_TOKEN_RENEW_DAYS);
+        for (id, _) in hosts {
+            if self.account() != account {
+                return;
+            }
+            self.step("renew");
+            match ssh::token_within(&client, &*self.ssh, &id, &gate, margin).await {
+                Ok(_) => {}
+                // Gone only when the sandbox itself is gone too, not on any 404.
+                Err(e) if matches!(e.status, 404 | 410) => match client.machine(&id).await {
+                    Err(e) if matches!(e.status, 404 | 410) => {
+                        let home = self.home.clone();
+                        if let Some(Err(e)) = guarded(&gate, || ssh_config::remove_host(&home, &id))
+                        {
+                            eprintln!("SSH host of sandbox {id}: could not remove it: {e:#}");
+                        }
+                    }
+                    _ => eprintln!(
+                        "SSH host of sandbox {id}: could not renew its token: {}",
+                        e.message
+                    ),
+                },
+                Err(e) => {
+                    eprintln!(
+                        "SSH host of sandbox {id}: could not renew its token: {}",
+                        e.message
+                    )
+                }
+            }
+        }
     }
 
     fn spawn_sync(self: &Arc<Self>, jobs: Vec<SyncJob>) {
@@ -3619,7 +3696,7 @@ mod tests {
     fn recording_core(
         base: Url,
         keys: Arc<MemoryKeyStore>,
-        ssh: Arc<MemorySshStore>,
+        ssh: Arc<dyn SshTokenStore>,
         home: PathBuf,
     ) -> (Core, Arc<Mutex<Vec<String>>>) {
         let opened = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -4700,7 +4777,7 @@ mod tests {
 
     /// A signed-in core with a recording opener, its own home and an Orca.app as `here` says.
     /// The app is a real bundle on disk, checked by the production identifier check; only
-    /// codesign is replaced by `here`.
+    /// codesign is replaced by `here`. Its token store keeps the hosts in step, as in the app.
     struct OrcaCore {
         core: Arc<Core>,
         opened: Arc<Mutex<Vec<String>>>,
@@ -4716,7 +4793,10 @@ mod tests {
         let (core, opened) = recording_core(
             base.clone(),
             Arc::new(MemoryKeyStore::default()),
-            Arc::new(MemorySshStore::default()),
+            Arc::new(ssh_config::SyncedStore::new(
+                MemorySshStore::default(),
+                home.path().to_path_buf(),
+            )),
             home.path().to_path_buf(),
         );
         let found = app.clone();
@@ -4917,5 +4997,260 @@ mod tests {
         let hosts = hosts_of(home.path());
         assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
         assert!(!hosts.contains("ibssh_old"), "{hosts}");
+    }
+
+    // ---- Orca: renewing the hosts' tokens ----
+
+    /// A token of `m1` named `token` with `left` until it runs out.
+    fn token_left(token: &str, left: chrono::Duration) -> crate::api::SshToken {
+        crate::api::SshToken {
+            token: token.into(),
+            command: format!("ssh {token}@ssh.example.test"),
+            expires_at: Some(Utc::now() + left),
+            ..ssh_token()
+        }
+    }
+
+    /// Writes the host of `id` with `t` and keeps `t` in the core's token store.
+    fn host_with(o: &OrcaCore, id: &str, t: &crate::api::SshToken) {
+        ssh_config::write_host(o.home.path(), id, "dev 1", t).unwrap();
+        o.core.ssh.save(id, t).unwrap();
+    }
+
+    fn token_requests(r: &[String]) -> usize {
+        r.iter().filter(|x| x.ends_with("/ssh-tokens")).count()
+    }
+
+    #[tokio::test]
+    async fn a_host_token_with_under_7_days_left_is_renewed_and_its_user_rewritten() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let old = token_left(
+            "ibssh_old",
+            chrono::Duration::days(7) - chrono::Duration::hours(1),
+        );
+        host_with(&o, "m1", &old);
+        o.core.renew_ssh_hosts().await;
+        let hosts = hosts_of(o.home.path());
+        assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
+        assert!(!hosts.contains("ibssh_old"), "{hosts}");
+        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        let r = requests(&server).await;
+        assert_eq!(token_requests(&r), 1, "{r:?}");
+        // A token is an API call only: the sandbox is not read, woken or run on.
+        assert_eq!(r, ["POST /v1/machines/m1/ssh-tokens"], "{r:?}");
+        assert_eq!(o.core.state().error, None);
+        // The new token has 30 days: the next pass leaves it alone.
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(token_requests(&requests(&server).await), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_token_with_7_days_or_more_left_is_left_alone() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let kept = token_left(
+            "ibssh_kept",
+            chrono::Duration::days(7) + chrono::Duration::hours(1),
+        );
+        host_with(&o, "m1", &kept);
+        let before = hosts_of(o.home.path());
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(hosts_of(o.home.path()), before);
+        assert!(requests(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_whose_token_is_missing_gets_a_new_one() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        // The host is there, the keychain lost the token.
+        let gone = token_left("ibssh_lost", chrono::Duration::days(20));
+        ssh_config::write_host(o.home.path(), "m1", "dev 1", &gone).unwrap();
+        o.core.renew_ssh_hosts().await;
+        assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
+        assert_eq!(token_requests(&requests(&server).await), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_without_a_host_gets_no_renewal() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        // A token about to run out, with no host: the SSH command renews it when it needs it.
+        o.core
+            .ssh
+            .save("m1", &token_left("ibssh_old", chrono::Duration::hours(30)))
+            .unwrap();
+        o.core.renew_ssh_hosts().await;
+        assert!(requests(&server).await.is_empty());
+        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_old");
+        assert!(!o.home.path().join(".ssh").exists());
+    }
+
+    #[tokio::test]
+    async fn no_renewal_while_signed_out() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let old = token_left("ibssh_old", chrono::Duration::days(1));
+        host_with(&o, "m1", &old);
+        let before = hosts_of(o.home.path());
+        // Signed out without the store's sign-out, so the host is still there to tempt it.
+        o.core.update(|i| i.client = None);
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(hosts_of(o.home.path()), before);
+        assert!(requests(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_renewal_lands_after_an_account_change() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        let b = base.clone();
+        at_step(&o.core, "renew", move |c| sign_in_as(c, &b, 8));
+        let before = o.core.account();
+        o.core.renew_ssh_hosts().await;
+        assert_ne!(
+            o.core.account(),
+            before,
+            "the switch happened during the pass"
+        );
+        // The account change removed the hosts; the old account's pass wrote nothing after it.
+        let hosts = hosts_of(o.home.path());
+        assert!(!hosts.contains("ibssh_new"), "{hosts}");
+        assert!(!hosts.contains("Host instabox-dev-1"), "{hosts}");
+        assert_eq!(o.core.ssh.load("m1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_renewal_shows_no_error_and_runs_again_on_the_next_pass() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let old = token_left("ibssh_old", chrono::Duration::days(2));
+        host_with(&o, "m1", &old);
+        let before = hosts_of(o.home.path());
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(
+            hosts_of(o.home.path()),
+            before,
+            "the host keeps the old token"
+        );
+        assert_eq!(
+            o.core.state().error,
+            None,
+            "a background renewal shows nothing"
+        );
+        o.core.renew_ssh_hosts().await;
+        assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
+        assert_eq!(token_requests(&requests(&server).await), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_the_api_no_longer_has_loses_its_host() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        // m9 is gone: the mock answers 404 for its token and for the sandbox.
+        host_with(
+            &o,
+            "m9",
+            &token_left("ibssh_old9", chrono::Duration::days(1)),
+        );
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        o.core.renew_ssh_hosts().await;
+        let hosts = hosts_of(o.home.path());
+        assert!(!hosts.contains("instabox-sandbox m9"), "{hosts}");
+        assert!(hosts.contains("# instabox-sandbox m1\n"), "{hosts}");
+        assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
+        let r = requests(&server).await;
+        assert!(r.contains(&"GET /v1/machines/m9".to_string()), "{r:?}");
+        assert_eq!(o.core.state().error, None);
+    }
+
+    #[tokio::test]
+    async fn a_token_404_alone_keeps_the_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        // The token call fails with 404, but the sandbox is still there.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        let before = hosts_of(o.home.path());
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(hosts_of(o.home.path()), before);
+    }
+
+    #[tokio::test]
+    async fn one_renewal_pass_at_a_time() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        o.core
+            .renewing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        o.core.renew_ssh_hosts().await;
+        assert!(
+            requests(&server).await.is_empty(),
+            "another pass is running"
+        );
+        o.core
+            .renewing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        o.core.renew_ssh_hosts().await;
+        assert_eq!(token_requests(&requests(&server).await), 1);
+        assert!(
+            !o.core.renewing.load(std::sync::atomic::Ordering::SeqCst),
+            "a finished pass lets the next one run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_refresh_renews_the_host_tokens_and_a_poll_does_not() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        o.core.refresh_and_sync(false).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(hosts_of(o.home.path()).contains("  User ibssh_old\n"));
+        o.core.refresh_and_sync(true).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !hosts_of(o.home.path()).contains("  User ibssh_new\n") {
+            assert!(Instant::now() < deadline, "{}", hosts_of(o.home.path()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

@@ -4,7 +4,9 @@
 //! the blocks it marked and that one `Include` line. Every other line stays as it is.
 //!
 //! A block keeps its alias once written: the ADE knows the host by it. A new token of the
-//! sandbox rewrites the block's `User`, and deleting the sandbox in InstaBox removes it.
+//! sandbox rewrites the block's `User`, and deleting the sandbox in InstaBox removes it. The
+//! app renews the token of every sandbox with a block before it runs out
+//! (`Core::renew_ssh_hosts`).
 
 use std::fs;
 use std::io::Write;
@@ -130,9 +132,8 @@ fn remove_where(home: &Path, gone: impl Fn(&Block) -> bool) -> Result<usize> {
     Ok(doomed.len())
 }
 
-/// Test only: the aliases of the hosts InstaBox wrote, by sandbox id.
-#[cfg(test)]
-fn aliases(home: &Path) -> Result<Vec<(String, String)>> {
+/// The aliases of the hosts InstaBox wrote, by sandbox id.
+pub fn aliases(home: &Path) -> Result<Vec<(String, String)>> {
     check_home(home)?;
     let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let lines = read_lines(&hosts_path(home))?;

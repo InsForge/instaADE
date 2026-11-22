@@ -105,10 +105,21 @@ pub async fn token(
     id: &str,
     gate: &dyn Gate,
 ) -> Result<SshToken> {
+    token_within(client, store, id, gate, Duration::hours(REUSE_MARGIN_HOURS)).await
+}
+
+/// `token`, reusing the stored token only while it has more than `margin` left. A stored token
+/// with no expiry, or none at all, makes a new one.
+pub async fn token_within(
+    client: &Client,
+    store: &dyn SshTokenStore,
+    id: &str,
+    gate: &dyn Gate,
+    margin: Duration,
+) -> Result<SshToken> {
     // A broken store only costs a fresh token, so treat a load failure as a miss.
     if let Ok(Some(t)) = store.load(id)
-        && t.expires_at
-            .is_some_and(|e| e > Utc::now() + Duration::hours(REUSE_MARGIN_HOURS))
+        && t.expires_at.is_some_and(|e| e > Utc::now() + margin)
     {
         return Ok(t);
     }
