@@ -1,7 +1,8 @@
 //! SSH hosts for an ADE that imports them from the user's SSH config (Orca). InstaBox writes
 //! one block per sandbox to `~/.ssh/instabox/config`, and `~/.ssh/config` includes that file
 //! from its first line, before any `Host *`, so the block's options win. InstaBox changes only
-//! the blocks it marked and that one `Include` line. Every other line stays as it is.
+//! the blocks it marked and that one `Include` line. Every other line stays as it is, with its
+//! own line end, and new blocks go after the last line InstaBox wrote.
 //!
 //! A block keeps its alias once written: the ADE knows the host by it. A new token of the
 //! sandbox rewrites the block's `User`, and deleting the sandbox in InstaBox removes it. The
@@ -59,27 +60,40 @@ pub fn write_host(home: &Path, id: &str, name: &str, t: &SshToken) -> Result<Str
     let path = hosts_path(home);
     let mut lines = read_lines(&path)?;
     let blocks = blocks(&lines);
-    let (alias, range) = match blocks.iter().find(|b| b.id == id) {
-        Some(b) => (b.alias.clone(), Some(b.start..b.end)),
-        None => (new_alias(name, id, &blocks), None),
-    };
-    let block = render(id, &alias, t);
-    match range {
-        Some(r) => {
-            lines.splice(r, block);
+    let sep = separator(&lines);
+    match blocks.iter().find(|b| b.id == id) {
+        Some(b) => {
+            let alias = b.alias.clone();
+            replace_block(&mut lines, b, render(id, &alias, t));
+            write_hosts(home, &lines)?;
+            Ok(alias)
         }
         None => {
+            let alias = new_alias(name, id, &blocks);
             if lines.is_empty() {
-                lines.push(HEADER.to_string());
+                lines.push(Line::new(HEADER, sep));
             }
-            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                lines.push(String::new());
+            // After the last line InstaBox wrote, so lines the user added below stay as they
+            // are, down to the end of the file.
+            let at = match blocks.last() {
+                Some(b) => b.end,
+                None if lines[0].text == HEADER => 1,
+                None => lines.len(),
+            };
+            // The line before gets an end if it has none, to start a new line after it.
+            if lines[at - 1].end.is_empty() {
+                lines[at - 1].end = sep;
             }
-            lines.extend(block);
+            let mut new = Vec::new();
+            if !lines[at - 1].text.trim().is_empty() {
+                new.push(Line::new("", sep));
+            }
+            new.extend(render(id, &alias, t).iter().map(|l| Line::new(l, sep)));
+            lines.splice(at..at, new);
+            write_hosts(home, &lines)?;
+            Ok(alias)
         }
     }
-    write_hosts(home, &lines)?;
-    Ok(alias)
 }
 
 /// Rewrites the login of sandbox `id`'s host with `t`, keeping its alias. False when the
@@ -96,10 +110,14 @@ pub fn update_login(home: &Path, id: &str, t: &SshToken) -> Result<bool> {
     };
     check(id, t)?;
     let block = render(id, &b.alias, t);
-    if lines[b.start..b.end] == block[..] {
+    if lines[b.start..b.end]
+        .iter()
+        .map(|l| &l.text)
+        .eq(block.iter())
+    {
         return Ok(false);
     }
-    lines.splice(b.start..b.end, block);
+    replace_block(&mut lines, &b, block);
     write_hosts(home, &lines)?;
     Ok(true)
 }
@@ -126,7 +144,7 @@ fn remove_where(home: &Path, gone: impl Fn(&Block) -> bool) -> Result<usize> {
     for b in doomed.iter().rev() {
         let mut start = b.start;
         // The blank line written before the block goes with it.
-        if start > 0 && lines[start - 1].trim().is_empty() {
+        if start > 0 && lines[start - 1].text.trim().is_empty() {
             start -= 1;
         }
         lines.drain(start..b.end);
@@ -155,17 +173,55 @@ struct Block {
     alias: String,
 }
 
+/// A line of the hosts file and the end it had: `\n`, `\r\n`, or none for a last line without
+/// one. A line InstaBox did not write is written back with its own end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Line {
+    text: String,
+    end: &'static str,
+}
+
+impl Line {
+    fn new(text: &str, end: &'static str) -> Line {
+        Line {
+            text: text.to_string(),
+            end,
+        }
+    }
+}
+
+/// The line end most lines of the file have, for the lines InstaBox writes: `\r\n` when most
+/// do, else `\n`.
+fn separator(lines: &[Line]) -> &'static str {
+    let crlf = lines.iter().filter(|l| l.end == "\r\n").count();
+    let lf = lines.iter().filter(|l| l.end == "\n").count();
+    if crlf > lf { "\r\n" } else { "\n" }
+}
+
+/// Puts `block` in place of the block `b`. Each line keeps the end the line in its place had,
+/// so a new token changes only that text.
+fn replace_block(lines: &mut Vec<Line>, b: &Block, block: Vec<String>) {
+    let sep = separator(lines);
+    let ends: Vec<&'static str> = lines[b.start..b.end].iter().map(|l| l.end).collect();
+    let new: Vec<Line> = block
+        .iter()
+        .enumerate()
+        .map(|(i, text)| Line::new(text, ends.get(i).copied().unwrap_or(sep)))
+        .collect();
+    lines.splice(b.start..b.end, new);
+}
+
 /// The blocks InstaBox wrote: a marker line, then its `Host` line, then the indented lines
 /// under it. The first line that is blank or not indented ends a block, so a block the user
 /// added right after one of these stays theirs.
-fn blocks(lines: &[String]) -> Vec<Block> {
+fn blocks(lines: &[Line]) -> Vec<Block> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let id = lines[i].trim_end().strip_prefix(MARKER).map(str::trim);
+        let id = lines[i].text.trim_end().strip_prefix(MARKER).map(str::trim);
         let alias = lines
             .get(i + 1)
-            .and_then(|l| l.trim_end().strip_prefix("Host "))
+            .and_then(|l| l.text.trim_end().strip_prefix("Host "))
             .map(str::trim);
         let (Some(id), Some(alias)) = (id, alias) else {
             i += 1;
@@ -177,8 +233,8 @@ fn blocks(lines: &[String]) -> Vec<Block> {
         }
         let mut end = i + 2;
         while end < lines.len()
-            && lines[end].starts_with([' ', '\t'])
-            && !lines[end].trim().is_empty()
+            && lines[end].text.starts_with([' ', '\t'])
+            && !lines[end].text.trim().is_empty()
         {
             end += 1;
         }
@@ -271,20 +327,31 @@ fn new_alias(name: &str, id: &str, blocks: &[Block]) -> String {
         .unwrap_or_else(|| format!("{base}-{}", uuid::Uuid::new_v4().simple()))
 }
 
-/// The file's lines without their line ends; none when it does not exist.
-fn read_lines(path: &Path) -> Result<Vec<String>> {
+/// The file's lines, each with the end it had; none when it does not exist.
+fn read_lines(path: &Path) -> Result<Vec<Line>> {
     match fs::read_to_string(path) {
-        Ok(s) => Ok(s
-            .lines()
-            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
-            .collect()),
+        Ok(s) => Ok(split_lines(&s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
-/// Writes the hosts file, only readable by the user, in a directory only they can open.
-fn write_hosts(home: &Path, lines: &[String]) -> Result<()> {
+/// `text` as lines with their ends, so joining them gives `text` back byte for byte.
+fn split_lines(text: &str) -> Vec<Line> {
+    text.split_inclusive('\n')
+        .map(|piece| match piece.strip_suffix("\r\n") {
+            Some(t) => Line::new(t, "\r\n"),
+            None => match piece.strip_suffix('\n') {
+                Some(t) => Line::new(t, "\n"),
+                None => Line::new(piece, ""),
+            },
+        })
+        .collect()
+}
+
+/// Writes the hosts file, only readable by the user, in a directory only they can open. Each
+/// line goes back with its own end.
+fn write_hosts(home: &Path, lines: &[Line]) -> Result<()> {
     let path = hosts_path(home);
     let dir = path.parent().context("no directory for the SSH hosts")?;
     create_private_dirs(dir)?;
@@ -294,8 +361,10 @@ fn write_hosts(home: &Path, lines: &[String]) -> Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("could not protect {}", dir.display()))?;
     }
-    let mut text = lines.join("\n");
-    text.push('\n');
+    let text: String = lines
+        .iter()
+        .flat_map(|l| [l.text.as_str(), l.end])
+        .collect();
     replace(&path, text.as_bytes(), None)
 }
 
@@ -744,11 +813,94 @@ Host instabox-dev-1
         assert_eq!(remove_all(home.path()).unwrap(), 0);
     }
 
+    /// Runs a token update, an add and a removal on a hosts file that holds InstaBox's `m1`
+    /// followed by `user`, and checks after each that `user` is still its last bytes.
+    fn user_part_survives(user: &str) {
+        let home = tempfile::tempdir().unwrap();
+        write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
+        let path = hosts_path(home.path());
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(user.as_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let kept = |step: &str| {
+            let now = fs::read(&path).unwrap();
+            assert!(
+                now.ends_with(user.as_bytes()),
+                "{step}: {:?}",
+                String::from_utf8_lossy(&now)
+            );
+        };
+        assert!(update_login(home.path(), "m1", &tok("ibssh_new")).unwrap());
+        kept("token update");
+        write_host(home.path(), "m2", "web", &tok("ibssh_b")).unwrap();
+        kept("add");
+        assert!(read(&path).contains("Host instabox-web"));
+        assert!(remove_host(home.path(), "m1").unwrap());
+        kept("removal");
+        assert_eq!(remove_all(home.path()).unwrap(), 1);
+        kept("removal of all");
+        assert!(!read(&path).contains("instabox-sandbox m"));
+    }
+
+    #[test]
+    fn a_user_block_with_crlf_is_kept_byte_for_byte() {
+        user_part_survives("Host mine\r\n  User me\r\n");
+    }
+
+    #[test]
+    fn a_user_part_without_a_final_newline_keeps_it() {
+        user_part_survives("\nHost mine\n  User me");
+        user_part_survives("Host mine\r\n  User me");
+    }
+
+    #[test]
+    fn mixed_line_ends_are_kept() {
+        user_part_survives("# a\r\nHost mixed\n  User x\r\n\n# end");
+    }
+
+    #[test]
+    fn instabox_lines_take_the_line_end_most_lines_have() {
+        let home = tempfile::tempdir().unwrap();
+        let path = hosts_path(home.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "Host a\r\n  User a\r\n").unwrap();
+        write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
+        let text = read(&path);
+        assert!(
+            text.starts_with("Host a\r\n  User a\r\n\r\n# instabox-sandbox m1\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.replace("\r\n", "").contains('\n'), "{text:?}");
+        // A token update keeps the ends the block has.
+        update_login(home.path(), "m1", &tok("ibssh_new")).unwrap();
+        assert!(read(&path).contains("  User ibssh_new\r\n"));
+    }
+
+    #[test]
+    fn a_file_of_only_user_lines_without_a_final_newline_gets_one_to_add_after() {
+        // The one change to a user line: a new line needs the line before it to end.
+        let home = tempfile::tempdir().unwrap();
+        let path = hosts_path(home.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "Host a\r\n  User a").unwrap();
+        write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
+        assert!(read(&path).starts_with("Host a\r\n  User a\r\n\r\n# instabox-sandbox m1\r\n"));
+    }
+
+    #[test]
+    fn lines_split_and_join_back_byte_for_byte() {
+        for text in ["", "a", "a\n", "a\r\nb", "a\r\n\r\nb\n", "a\rb\n", "\n\n"] {
+            let joined: String = split_lines(text)
+                .iter()
+                .flat_map(|l| [l.text.as_str(), l.end])
+                .collect();
+            assert_eq!(joined, text);
+        }
+    }
+
     #[test]
     fn a_marker_without_its_host_line_is_not_a_block() {
-        let lines: Vec<String> = ["# instabox-sandbox m1", "", "Host x", "# instabox-sandbox"]
-            .map(String::from)
-            .to_vec();
+        let lines = split_lines("# instabox-sandbox m1\n\nHost x\n# instabox-sandbox");
         assert!(blocks(&lines).is_empty());
     }
 
