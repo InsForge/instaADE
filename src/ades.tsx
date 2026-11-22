@@ -6,16 +6,11 @@ import type { AdeId, AppState, SandboxView } from "./types";
 export type Mode = "instabox" | AdeId;
 
 /** An ADE the switcher lists but the app does not support yet. */
-export type SoonId = "superset" | "paradev";
+export type SoonId = never;
 
-/** The ADEs the switcher shows as coming soon, after the ones the app supports. */
-export const COMING_SOON: { id: SoonId; name: string }[] = [
-  { id: "superset", name: "Superset" },
-  { id: "paradev", name: "Paradev" },
-];
-
-/** Letters for an ADE with no logo image yet. */
-const LETTERS: Partial<Record<AdeId | SoonId, string>> = { superset: "S" };
+/** The ADEs the switcher shows as coming soon, after the ones the app supports. None now:
+ * Orca and Paradev, the last ones listed, are supported. */
+export const COMING_SOON: { id: SoonId; name: string }[] = [];
 
 /** The mark of an ADE (its logo on a tile), or the instabox mark for plain Instabox. */
 export function AdeBadge({ id, size = 20 }: { id: Mode | SoonId; size?: number }) {
@@ -23,12 +18,12 @@ export function AdeBadge({ id, size = 20 }: { id: Mode | SoonId; size?: number }
   const logo = adeLogoUrl(id);
   return (
     <span className="ade-logo" data-ade={id} aria-hidden="true" style={{ width: size, height: size }}>
-      {logo ? <img src={logo} alt="" /> : LETTERS[id]}
+      {logo && <img src={logo} alt="" />}
     </span>
   );
 }
 
-const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux", orca: "Orca" };
+const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux", orca: "Orca", paradev: "Paradev" };
 
 /** The desktop app's name, such as "T3 Code". */
 export const adeName = (state: AppState, id: AdeId) => state.ades.find((a) => a.id === id)?.name ?? NAMES[id];
@@ -43,7 +38,7 @@ export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? 
 export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);
 
 /** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link; Orca
- * connects an SSH host InstaBox writes. */
+ * connects an SSH host InstaBox writes; Paradev runs the sandbox as a host it sets up. */
 export const pairs = (id: AdeId) => id === "t3";
 
 /** True when the ADE's app is on this computer, so it can open sandboxes here. */

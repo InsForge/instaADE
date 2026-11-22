@@ -127,7 +127,8 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setView(v);
   };
   const back = () => go({ name: "list" });
-  /** Shows what the user does next in the ADE, when opening it does not finish the job (Orca). */
+  /** Shows what the user does next in the ADE, when opening it does not finish the job (Orca,
+   * and Paradev while the user sets the host up there). */
   const thenNotice = (opened: Promise<string | null | undefined>) =>
     opened.then((next) => {
       if (next) setNotice(next);

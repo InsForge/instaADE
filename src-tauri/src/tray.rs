@@ -62,6 +62,7 @@ fn open_target(s: &SandboxView) -> (Ade, bool) {
             Open::Pair(_) => s.connected,
             Open::Link(_) => true,
             Open::SshHost(_) => true,
+            Open::Host(_) => true,
         };
     (ade, ready)
 }
@@ -453,6 +454,16 @@ mod tests {
         r.ades = vec![Ade::Cmux, Ade::T3];
         assert_eq!(open_target(&r), (Ade::Cmux, true));
         assert_eq!(open_label(Ade::Cmux, true), "Open in cmux");
+    }
+
+    #[test]
+    fn a_paradev_sandbox_opens_in_paradev_from_any_computer() {
+        // It is marked only once its host runs, and Paradev pairs nothing from here.
+        let mut r = row("a", ViewState::Paused);
+        r.connected = false;
+        r.ades = vec![Ade::Paradev];
+        assert_eq!(open_target(&r), (Ade::Paradev, true));
+        assert_eq!(open_label(Ade::Paradev, true), "Open in Paradev");
     }
 
     const SCREEN: Bounds = Bounds {

@@ -4,7 +4,6 @@ import orcaLogo from '../assets/ade/orca.svg';
 import cmuxLogo from '../assets/ade/cmux.png';
 import paradevLogo from '../assets/ade/paradev.svg';
 
-/** Superset has no logo yet: it is drawn with its letter (AdeBadge). */
 const logoUrls: Partial<Record<Ade, string>> = { t3: t3Logo, orca: orcaLogo, cmux: cmuxLogo, paradev: paradevLogo };
 export const adeLogoUrl = (ade: Ade): string | undefined => logoUrls[ade];
 

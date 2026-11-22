@@ -25,6 +25,7 @@ function setupText(state: AppState, mode: Mode): string | null {
     return `Installs T3${state.t3 ? ` ${state.t3}` : ""}, the same version as T3 Code on ${thisComputer()}. Then the sandbox opens in T3 Code.`;
   }
   const name = adeName(state, mode);
+  if (mode === "paradev") return `Copies the SSH address of the new sandbox and opens ${name}, where you set it up as a host.`;
   return `Sets the sandbox up for ${name}. Then it opens in ${name}.`;
 }
 

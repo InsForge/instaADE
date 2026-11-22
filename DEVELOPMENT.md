@@ -8,8 +8,9 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `app.rs`: the app state and every action. `commands.rs`: the commands the UI calls.
   - `api/`: the instabox API client. `auth.rs`: device sign-in and token storage.
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
-  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`).
+  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`).
   - `ssh_config.rs`: the SSH hosts InstaBox writes for Orca, and the one line it adds to `~/.ssh/config`.
+  - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
 - `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 
@@ -51,6 +52,7 @@ The README section **Adding an ADE** lists the files to touch. The mark that say
 - `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox.
 - A sandbox with no mark has no ADEs. An action that must pick an ADE and was given none uses T3.
 - An id this build does not know is kept when writing and never treated as T3.
+- `paradev` joins the mark only once Paradev's host service runs on the sandbox, since the user sets the host up in Paradev.
 
 ## Preview builds
 

@@ -3,6 +3,7 @@ pub mod agents;
 pub mod api;
 pub mod app;
 pub mod auth;
+pub mod clipboard;
 pub mod commands;
 pub mod connected;
 pub mod errors;
@@ -200,10 +201,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Instabox");
 
-    app.run(|_app, _event| {
+    app.run(|app, event| {
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Reopen { .. } = _event {
-            tray::show_popover(_app, None);
+        if let tauri::RunEvent::Reopen { .. } = event {
+            tray::show_popover(app, None);
+        }
+        // A copied SSH address whose minute is not up yet does not outlive the app.
+        if let tauri::RunEvent::Exit = event
+            && let Some(core) = app.try_state::<Arc<Core>>()
+        {
+            core.on_quit();
         }
     });
 }

@@ -1,9 +1,10 @@
 //! Create a sandbox (or take an existing one), set an ADE up on it and mark it connected.
 //! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
 //! prep command, and the app opens its link afterwards. An SSH host ADE (Orca) gets only the
-//! mark, and the app writes its host afterwards.
+//! mark, and the app writes its host afterwards. A host ADE (Paradev) is only checked: once
+//! its host runs, the sandbox is marked and gets its link.
 
-use crate::ade::{Ade, Open, SETUP_EXIT_BUSY};
+use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
     Client, CreateMachineRequest, ExecRequest, ExecResult, MachineSpec, UpdateMachineRequest,
 };
@@ -42,7 +43,8 @@ pub enum Step {
 pub struct Connected {
     pub machine_id: String,
     /// The pairing link to open. None for a link ADE: the app makes its link with an SSH
-    /// token (`Open::Link`).
+    /// token (`Open::Link`). For a host ADE (`Open::Host`), the link that opens the sandbox
+    /// once its host runs; None while the user still has to set the host up in the app.
     pub link: Option<String>,
     /// The ADE version the sandbox runs: the desktop's after a setup, or its own (newer, or
     /// older with the update pending). None for an ADE that installs nothing there.
@@ -55,6 +57,7 @@ const STDERR_LINES: usize = 20;
 pub(crate) const SETUP_TIMEOUT_SECS: u32 = 600;
 const PAIR_TIMEOUT_SECS: u32 = 60;
 const PREP_TIMEOUT_SECS: u32 = 60;
+const HOST_TIMEOUT_SECS: u32 = 30;
 
 pub(crate) fn tail_lines(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
@@ -197,6 +200,9 @@ async fn install_and_pair(
     if let Open::SshHost(_) = ade.open() {
         return prepare(client, ade, None, id, desktop_version, progress).await;
     }
+    if let Open::Host(h) = ade.open() {
+        return check_host(client, ade, h, id, progress).await;
+    }
     // Never move a sandbox to an older version: when it is ahead of the desktop, only pair.
     let found = match ade.version_script() {
         Some(script) => {
@@ -287,6 +293,81 @@ async fn prepare(
         version: None,
         update_pending: false,
     })
+}
+
+/// Checks a host ADE on the running sandbox, with one exec. When its host runs, the sandbox
+/// gets the ADE in its mark and the link that opens it. Else nothing changes, and the user sets
+/// the host up in the app (`link` is None). InstaBox installs nothing for it either way.
+async fn check_host(
+    client: &Client,
+    ade: Ade,
+    h: Host,
+    id: &str,
+    progress: &impl Fn(Step),
+) -> Result<Connected, SandboxError> {
+    let state = host_state(client, ade, h, id).await?;
+    let link = if state.running {
+        let link = link_of(ade, h, &state)?;
+        // Only a host that runs counts: the mark says the setup is done.
+        mark_connected(client, ade, id).await?;
+        Some(link)
+    } else {
+        None
+    };
+    progress(Step::Done);
+    Ok(Connected {
+        machine_id: id.to_string(),
+        link,
+        version: None,
+        update_pending: false,
+    })
+}
+
+/// Runs a host ADE's script on the running sandbox and reads what it found.
+async fn host_state(
+    client: &Client,
+    ade: Ade,
+    h: Host,
+    id: &str,
+) -> Result<HostState, SandboxError> {
+    let r = client
+        .exec(
+            id,
+            &ExecRequest {
+                cmd: h.script.to_string(),
+                timeout_seconds: Some(HOST_TIMEOUT_SECS),
+            },
+        )
+        .await?;
+    if r.timed_out || r.exit_code != 0 {
+        return Err(setup_failure(ade, &r, HOST_TIMEOUT_SECS));
+    }
+    Ok((h.state)(&r.stdout))
+}
+
+/// The host ADE's link for the sandbox, from its machine id.
+fn link_of(ade: Ade, h: Host, state: &HostState) -> Result<String, SandboxError> {
+    let id = state
+        .machine_id
+        .as_deref()
+        .ok_or_else(|| SandboxError::Setup {
+            ade,
+            stderr_tail: "The sandbox has no valid /etc/machine-id".to_string(),
+        })?;
+    Ok((h.link)(id))
+}
+
+/// The link that opens running sandbox `id`, which has its host set up, in a host ADE: one
+/// exec reads its machine id. Nothing changes on the sandbox or in its mark.
+pub async fn host_link(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
+    let Open::Host(h) = ade.open() else {
+        return Err(SandboxError::Setup {
+            ade,
+            stderr_tail: format!("{} does not run sandboxes as hosts", ade.name()),
+        });
+    };
+    let state = host_state(client, ade, h, id).await?;
+    link_of(ade, h, &state)
 }
 
 /// True when the sandbox reports a version newer than the desktop's. Unreadable means no.
@@ -1205,6 +1286,165 @@ mod tests {
         );
         let c = calls(&server).await;
         assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+    }
+
+    /// A running sandbox with `metadata`, whose exec answers Paradev's host check with `stdout`
+    /// and `code`.
+    async fn running_for_host(
+        server: &MockServer,
+        metadata: serde_json::Value,
+        stdout: &str,
+        code: i32,
+    ) {
+        mock(
+            server,
+            "GET",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", metadata)),
+        )
+        .await;
+        let stderr = if code == 0 { "" } else { "bash: broken" };
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains(
+                "systemctl --user is-active superset-host",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"stdout": stdout, "stderr": stderr, "exitCode": code}),
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        mock(
+            server,
+            "PATCH",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", serde_json::json!({}))),
+        )
+        .await;
+    }
+
+    const HOST_RUNS: &str = "service=active\nmachineid=0123456789abcdef0123456789abcdef\n";
+
+    #[tokio::test]
+    async fn paradev_marks_a_sandbox_only_once_its_host_runs() {
+        let server = MockServer::start().await;
+        running_for_host(
+            &server,
+            serde_json::json!({"a": "1", "instabox-bridge": "t3"}),
+            HOST_RUNS,
+            0,
+        )
+        .await;
+        let steps = Mutex::new(Vec::new());
+        let out = connect_existing(&client(&server), Ade::Paradev, "m1", "2.0.11", |s| {
+            steps.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap();
+        // The link opens a new workspace on the host whose id Paradev derives from the
+        // machine id.
+        assert_eq!(
+            out,
+            Connected {
+                machine_id: "m1".into(),
+                link: Some("superset://new-workspace?host=977b9d5310b351a8e85d4a4b333d5481".into()),
+                version: None,
+                update_pending: false,
+            }
+        );
+        assert_eq!(*steps.lock().unwrap(), vec![Step::Done]);
+        let reqs = server.received_requests().await.unwrap();
+        // One exec (the check, which changes nothing), no port, no pairing.
+        let execs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1);
+        let check: serde_json::Value = serde_json::from_slice(&execs[0].body).unwrap();
+        assert_eq!(check["cmd"], crate::ade::paradev::HOST_SCRIPT);
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ports")));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3,paradev"}})
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_whose_paradev_host_does_not_run_is_left_unmarked() {
+        for stdout in [
+            "service=inactive\nmachineid=0123456789abcdef0123456789abcdef\n",
+            "service=activating\nmachineid=0123456789abcdef0123456789abcdef\n",
+            "service=\nmachineid=\n",
+        ] {
+            let server = MockServer::start().await;
+            running_for_host(&server, serde_json::json!({}), stdout, 0).await;
+            let out = connect_existing(&client(&server), Ade::Paradev, "m1", "2.0.11", |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                out.link, None,
+                "{stdout}: the user sets the host up in Paradev"
+            );
+            let c = calls(&server).await;
+            assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{stdout}: {c:?}");
+            drop(server);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_paradev_check_or_a_running_host_without_machine_id_marks_nothing() {
+        let server = MockServer::start().await;
+        running_for_host(&server, serde_json::json!({}), "", 2).await;
+        let e = connect_existing(&client(&server), Ade::Paradev, "m1", "2.0.11", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e,
+            SandboxError::Setup {
+                ade: Ade::Paradev,
+                stderr_tail: "bash: broken".into()
+            }
+        );
+        assert!(!calls(&server).await.iter().any(|x| x.starts_with("PATCH")));
+
+        let server = MockServer::start().await;
+        running_for_host(
+            &server,
+            serde_json::json!({}),
+            "service=active\nmachineid=uninitialized\n",
+            0,
+        )
+        .await;
+        let e = connect_existing(&client(&server), Ade::Paradev, "m1", "2.0.11", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Setting up Paradev failed:\nThe sandbox has no valid /etc/machine-id"
+        );
+        assert!(!calls(&server).await.iter().any(|x| x.starts_with("PATCH")));
+    }
+
+    #[tokio::test]
+    async fn the_paradev_link_of_a_marked_sandbox_reads_only_its_machine_id() {
+        let server = MockServer::start().await;
+        let md = serde_json::json!({"instabox-bridge": "paradev", "instabox-ades": "paradev"});
+        running_for_host(&server, md, HOST_RUNS, 0).await;
+        let link = host_link(&client(&server), Ade::Paradev, "m1")
+            .await
+            .unwrap();
+        assert_eq!(
+            link,
+            "superset://new-workspace?host=977b9d5310b351a8e85d4a4b333d5481"
+        );
+        let c = calls(&server).await;
+        assert_eq!(c, ["POST /v1/machines/m1/exec"], "no mark, no wake");
+        assert!(host_link(&client(&server), Ade::Cmux, "m1").await.is_err());
+        drop(server);
     }
 
     #[tokio::test]
