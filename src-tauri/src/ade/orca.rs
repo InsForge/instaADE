@@ -56,7 +56,7 @@ pub fn locate() -> Option<PathBuf> {
         dirs.extend(dirs::home_dir().map(|h| h.join("Applications")));
         locate_in(&dirs, verify)
     } else if cfg!(windows) {
-        locate_exe_in(&exe_paths())
+        locate_exe_in(&exe_paths(), verify_exe)
     } else {
         None
     }
@@ -70,12 +70,12 @@ pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<Pat
         .find(|app| verify(app))
 }
 
-/// True when the app at `app` is the real Orca. macOS: its `Info.plist` names `BUNDLE_ID`, and
-/// codesign finds its signature valid and meeting `REQUIREMENT`; blocks for a few seconds.
-/// Windows: the file is still there. Its signature is not checked.
+/// True when the app at `app` is the real Orca, read from disk each time. macOS: its
+/// `Info.plist` names `BUNDLE_ID`, and codesign finds its signature valid and meeting
+/// `REQUIREMENT`; blocks for a few seconds. Windows: `verify_exe`, with no signature check yet.
 pub fn verify(app: &Path) -> bool {
     if cfg!(windows) {
-        app.is_file()
+        verify_exe(app)
     } else {
         verify_with(app, codesign_meets_requirement)
     }
@@ -165,9 +165,44 @@ fn exe_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// The first of `paths` that is a file.
-pub fn locate_exe_in(paths: &[PathBuf]) -> Option<PathBuf> {
-    paths.iter().find(|p| p.is_file()).cloned()
+/// The first of `paths` that is a file `verify` accepts.
+pub fn locate_exe_in(paths: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    paths.iter().find(|p| p.is_file() && verify(p)).cloned()
+}
+
+/// The product name Orca's `Orca.exe` (and its installer) has in its version resource.
+const EXE_PRODUCT_NAME: &str = "Orca";
+
+/// The Windows check of `verify`: `exe` is a PE file whose version resource names the product
+/// `Orca` and holds a version. It reads the file each time and runs nothing. It checks no
+/// signature, so another program built to look like Orca would pass.
+pub fn verify_exe(exe: &Path) -> bool {
+    let Ok(mut f) = File::open(exe) else {
+        return false;
+    };
+    let Ok(resources) = resource_section(&mut f) else {
+        return false;
+    };
+    product_name(&resources).as_deref() == Some(EXE_PRODUCT_NAME)
+        && fixed_version(&resources).is_some()
+}
+
+/// The `ProductName` string of the version resource in `resources`: the UTF-16 text after the
+/// key and its padding.
+fn product_name(resources: &[u8]) -> Option<String> {
+    let key: Vec<u8> = "ProductName\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let at = resources.windows(key.len()).position(|w| w == key)? + key.len();
+    let units: Vec<u16> = (at..resources.len().saturating_sub(1))
+        .step_by(2)
+        .map(|i| u16_at(resources, i))
+        .skip_while(|&u| u == 0)
+        .take_while(|&u| u != 0)
+        .take(256)
+        .collect();
+    String::from_utf16(&units).ok().filter(|n| !n.is_empty())
 }
 
 /// The resource section is read whole; anything larger is not an Orca.exe.
@@ -268,10 +303,16 @@ fn fixed_version(resources: &[u8]) -> Option<String> {
     None
 }
 
-/// Test only: a minimal PE file whose resource section holds a `VS_FIXEDFILEINFO` with the
-/// product version `v` (and a file version that differs, to tell them apart).
+/// Test only: a minimal PE file named Orca whose resource section holds a `VS_FIXEDFILEINFO`
+/// with the product version `v` (and a file version that differs, to tell them apart).
 #[cfg(test)]
 pub(crate) fn test_exe(v: [u16; 4]) -> Vec<u8> {
+    test_exe_named(v, EXE_PRODUCT_NAME)
+}
+
+/// Test only: `test_exe` with the product name `product`.
+#[cfg(test)]
+pub(crate) fn test_exe_named(v: [u16; 4], product: &str) -> Vec<u8> {
     let mut f = vec![0u8; 0x200];
     f[..2].copy_from_slice(b"MZ");
     f[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
@@ -303,6 +344,12 @@ pub(crate) fn test_exe(v: [u16; 4]) -> Vec<u8> {
     let ls = (u32::from(v[2]) << 16) | u32::from(v[3]);
     f[info + 16..info + 20].copy_from_slice(&ms.to_le_bytes());
     f[info + 20..info + 24].copy_from_slice(&ls.to_le_bytes());
+    // The product name, as a String of StringFileInfo: key, padding, value.
+    let name: Vec<u8> = format!("ProductName\0\0{product}\0")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    f[0x280..0x280 + name.len()].copy_from_slice(&name);
     f
 }
 
@@ -432,11 +479,43 @@ mod tests {
         let user = tempfile::tempdir().unwrap();
         let all = tempfile::tempdir().unwrap();
         let paths = [user.path().join("Orca.exe"), all.path().join("Orca.exe")];
-        assert_eq!(locate_exe_in(&paths), None);
-        std::fs::write(&paths[1], b"MZ").unwrap();
-        assert_eq!(locate_exe_in(&paths), Some(paths[1].clone()));
+        assert_eq!(locate_exe_in(&paths, verify_exe), None);
+        std::fs::write(&paths[1], test_exe([1, 4, 269, 0])).unwrap();
+        assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[1].clone()));
+        // A file at the user's path that is not Orca does not hide the real one.
         std::fs::write(&paths[0], b"MZ").unwrap();
-        assert_eq!(locate_exe_in(&paths), Some(paths[0].clone()));
+        assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[1].clone()));
+        std::fs::write(&paths[0], test_exe([1, 4, 269, 0])).unwrap();
+        assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[0].clone()));
+    }
+
+    #[test]
+    fn the_windows_check_wants_a_pe_named_orca_with_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Orca.exe");
+        assert!(!verify_exe(&exe), "missing");
+        std::fs::write(&exe, test_exe([1, 4, 269, 0])).unwrap();
+        assert!(verify_exe(&exe));
+        // Read from the file each time: a file changed since fails at once.
+        let full = test_exe([1, 4, 269, 0]);
+        std::fs::write(&exe, &full[..0x250]).unwrap();
+        assert!(!verify_exe(&exe), "truncated");
+        std::fs::write(&exe, test_exe_named([1, 4, 269, 0], "Notepad")).unwrap();
+        assert!(!verify_exe(&exe), "another program");
+        std::fs::write(&exe, test_exe_named([1, 4, 269, 0], "Orca2")).unwrap();
+        assert!(!verify_exe(&exe), "only the exact name");
+        let mut no_version = test_exe([1, 4, 269, 0]);
+        no_version[0x252..0x256].fill(0);
+        std::fs::write(&exe, &no_version).unwrap();
+        assert!(!verify_exe(&exe), "no version");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        assert!(!verify_exe(&exe), "not an exe");
+        if cfg!(windows) {
+            std::fs::write(&exe, test_exe([1, 4, 269, 0])).unwrap();
+            assert!(verify(&exe), "the production check on Windows");
+            std::fs::write(&exe, &full[..0x250]).unwrap();
+            assert!(!verify(&exe));
+        }
     }
 
     #[test]

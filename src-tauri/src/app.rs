@@ -1640,9 +1640,10 @@ impl Core {
     /// The token comes from `ssh::token`: the stored one while it has more than a day left,
     /// else a new 30-day one.
     ///
-    /// An SSH host ADE (Orca) goes the same way, with its app checked before the token too. It
-    /// wakes the sandbox, writes the token into the sandbox's host in the user's SSH config,
-    /// starts the app and returns what the user does next there.
+    /// An SSH host ADE (Orca) goes the same way. It checks the app, wakes the sandbox, checks
+    /// the app again (the wake can take minutes), makes or loads the token, writes it into the
+    /// sandbox's host in the user's SSH config, starts the app that passed the last check and
+    /// returns what the user does next there.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let open = ade.open();
         if let Open::Pair(_) = open {
@@ -1661,15 +1662,18 @@ impl Core {
             })
             .flatten()
             .ok_or_else(account_changed)?;
-        let title = if let Open::SshHost(_) = open {
+        let (title, app) = if let Open::SshHost(_) = open {
             // The user connects from the app next: a running sandbox answers at once. Its name
             // makes the host's alias, and a sandbox made just now is not in the list yet.
             let m = sandbox::ensure_running(&client, id)
                 .await
                 .map_err(ErrorView::from)?;
-            if m.name.is_empty() { title } else { m.name }
+            // A wake can take minutes: the app is found and checked again right before the
+            // token, and the app that passes this check is the one started.
+            let app = self.checked_app(ade).await?;
+            (if m.name.is_empty() { title } else { m.name }, app)
         } else {
-            title
+            (title, app)
         };
         let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
             .await
@@ -4831,8 +4835,27 @@ mod tests {
 
     fn orca_core(base: &Url, here: OrcaHere) -> OrcaCore {
         let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
         let app = ade::orca::test_bundle(dir.path(), ade::orca::BUNDLE_ID, "1.4.269");
+        orca_core_with(
+            base,
+            dir,
+            app,
+            here != OrcaHere::Missing,
+            Arc::new(move |ade, path| {
+                ade == Ade::Orca && ade::orca::verify_with(path, |_| here != OrcaHere::BadSignature)
+            }),
+        )
+    }
+
+    /// `orca_core` with the app at `app` (found when `found`) and the check `verify`.
+    fn orca_core_with(
+        base: &Url,
+        dir: tempfile::TempDir,
+        app: PathBuf,
+        found: bool,
+        verify: Verifier,
+    ) -> OrcaCore {
+        let home = tempfile::tempdir().unwrap();
         let (core, opened) = recording_core(
             base.clone(),
             Arc::new(MemoryKeyStore::default()),
@@ -4842,14 +4865,10 @@ mod tests {
             )),
             home.path().to_path_buf(),
         );
-        let found = app.clone();
+        let at = app.clone();
         let core = Arc::new(core.with_apps(
-            Arc::new(move |ade| {
-                (here != OrcaHere::Missing && ade == Ade::Orca).then(|| found.clone())
-            }),
-            Arc::new(move |ade, path| {
-                ade == Ade::Orca && ade::orca::verify_with(path, |_| here != OrcaHere::BadSignature)
-            }),
+            Arc::new(move |ade| (found && ade == Ade::Orca).then(|| at.clone())),
+            verify,
         ));
         sign_in_as(&core, base, 7);
         OrcaCore {
@@ -5484,5 +5503,125 @@ mod tests {
             o.core.state().error.map(|e| e.message).as_deref(),
             Some("Orca is not installed. Install it first.")
         );
+    }
+
+    // ---- the app checked again after the wake, and the Windows check ----
+
+    /// Answers the read of `m1` that wakes it, and notes that the wake ran.
+    struct WakeThen {
+        machine: serde_json::Value,
+        woke: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl wiremock::Respond for WakeThen {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.woke.store(true, std::sync::atomic::Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200).set_body_json(self.machine.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orca_app_that_turns_invalid_during_the_wake_gets_no_token_host_or_launch() {
+        use wiremock::Mock;
+        use wiremock::matchers::{method, path};
+        let mark = serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"});
+        let (server, base) = cmux_server(mark.clone()).await;
+        let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(WakeThen {
+                machine: serde_json::json!({
+                    "id": "m1", "name": "dev 1", "state": "running",
+                    "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+                    "metadata": mark, "orgId": "org-me"
+                }),
+                woke: woke.clone(),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let app = ade::orca::test_bundle(dir.path(), ade::orca::BUNDLE_ID, "1.4.269");
+        // The app passes until the wake, then it is replaced by one that fails the check.
+        let replaced = woke.clone();
+        let o = orca_core_with(
+            &base,
+            dir,
+            app,
+            true,
+            Arc::new(move |ade, path| {
+                ade == Ade::Orca
+                    && !replaced.load(std::sync::atomic::Ordering::SeqCst)
+                    && ade::orca::verify_with(path, |_| true)
+            }),
+        );
+        o.core.refresh(false).await;
+        let e = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap_err();
+        assert_eq!(
+            e.message,
+            "Could not verify the Orca app. Install it again from its official download."
+        );
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "the wake ran"
+        );
+        assert_eq!(o.core.state().error, Some(e));
+        let r = requests(&server).await;
+        assert!(
+            !r.iter().any(|x| x.ends_with("/ssh-tokens")),
+            "no token: {r:?}"
+        );
+        assert!(!o.home.path().join(".ssh").exists(), "no host written");
+        assert!(o.opened.lock().unwrap().is_empty(), "nothing started");
+    }
+
+    #[tokio::test]
+    async fn an_orca_exe_that_fails_the_windows_check_is_refused_at_action_time() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Orca.exe");
+        std::fs::write(&exe, ade::orca::test_exe([1, 4, 269, 0])).unwrap();
+        // The Windows check, run here on whatever platform the test runs on.
+        let o = orca_core_with(
+            &base,
+            dir,
+            exe.clone(),
+            true,
+            Arc::new(|ade, path| ade == Ade::Orca && ade::orca::verify_exe(path)),
+        );
+        // A version found when the file was still good.
+        o.core
+            .update(|i| i.state.set_desktop(Ade::Orca, Some("1.4.269".into())));
+        let good = ade::orca::test_exe([1, 4, 269, 0]);
+        for (what, bytes) in [
+            ("truncated", good[..0x250].to_vec()),
+            (
+                "another program",
+                ade::orca::test_exe_named([1, 4, 269, 0], "Notepad"),
+            ),
+        ] {
+            std::fs::write(&exe, &bytes).unwrap();
+            for result in [
+                o.core.connect_sandbox("m1", Some(Ade::Orca)).await,
+                o.core.open_in_ade("m1", Some(Ade::Orca)).await,
+            ] {
+                assert_eq!(
+                    result.unwrap_err().message,
+                    "Could not verify the Orca app. Install it again from its official download.",
+                    "{what}"
+                );
+            }
+        }
+        assert!(
+            requests(&server).await.is_empty(),
+            "nothing woken, marked or made"
+        );
+        assert!(o.opened.lock().unwrap().is_empty());
+        assert!(!o.home.path().join(".ssh").exists());
+        // The real file again: read fresh, it passes and that exe starts.
+        std::fs::write(&exe, &good).unwrap();
+        let notice = o.core.connect_sandbox("m1", Some(Ade::Orca)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
+        assert_eq!(*o.opened.lock().unwrap(), [exe.display().to_string()]);
     }
 }
