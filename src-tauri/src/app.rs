@@ -19,6 +19,7 @@ use crate::ade::{self, Ade, Open, SshLogin};
 use crate::agents::{self, Agent};
 use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, Template};
 use crate::auth::{self, Provider, Session};
+use crate::clipboard::SecretClipboard;
 use crate::connected::ConnectedStore;
 use crate::errors::ErrorView;
 use crate::gate::{Gate, guarded};
@@ -48,8 +49,6 @@ pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send +
 pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
 /// Checks that the app at a path is the ADE's own (`Ade::verify`).
 pub type Verifier = Arc<dyn Fn(Ade, &Path) -> bool + Send + Sync>;
-/// Puts text on this computer's clipboard (`process::copy_to_clipboard`).
-pub type Copier = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Test only: called with the name of a step a flow reached.
 #[cfg(test)]
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -715,8 +714,9 @@ pub struct Core {
     /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
     locate: Locator,
     verify: Verifier,
-    /// The clipboard; a test puts its own in place.
-    copy: Copier,
+    /// The clipboard for secrets, which clears them a minute later; a test puts its own in
+    /// place.
+    clipboard: Arc<SecretClipboard>,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -826,7 +826,7 @@ impl Core {
             open,
             locate: Arc::new(Ade::locate),
             verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
-            copy: Arc::new(crate::process::copy_to_clipboard),
+            clipboard: Arc::new(SecretClipboard::system()),
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -851,10 +851,10 @@ impl Core {
         self
     }
 
-    /// Test only: puts text on `copy` instead of this computer's clipboard.
+    /// Test only: copies secrets to `clipboard` instead of this computer's clipboard.
     #[cfg(test)]
-    fn with_clipboard(mut self, copy: Copier) -> Core {
-        self.copy = copy;
+    fn with_clipboard(mut self, clipboard: SecretClipboard) -> Core {
+        self.clipboard = Arc::new(clipboard);
         self
     }
 
@@ -1659,13 +1659,16 @@ impl Core {
             user: &t.token,
             title: "",
         });
-        // pbcopy blocks for a moment, so off the async runtime.
+        // pbcopy blocks for a moment, so off the async runtime. The address is cleared a minute
+        // later, unless the user copied something else since.
         let core = self.clone();
-        tokio::task::spawn_blocking(move || guarded(&core.gate(account), || (core.copy)(&address)))
-            .await
-            .map_err(|e| ErrorView::other(e.to_string()))?
-            .ok_or_else(account_changed)?
-            .map_err(ErrorView::other)?;
+        tokio::task::spawn_blocking(move || {
+            guarded(&core.gate(account), || core.clipboard.copy(&address))
+        })
+        .await
+        .map_err(|e| ErrorView::other(e.to_string()))?
+        .ok_or_else(account_changed)?
+        .map_err(ErrorView::other)?;
         self.open_with(account, h.setup_link, Some(&app))?;
         Ok(Opened::FinishSetupInAde)
     }
@@ -4189,6 +4192,19 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    /// A clipboard that records what was copied to it.
+    struct RecordingClipboard(Arc<Mutex<Vec<String>>>);
+
+    impl crate::clipboard::Clipboard for RecordingClipboard {
+        fn read(&self) -> Option<String> {
+            self.0.lock().unwrap().last().cloned()
+        }
+        fn write(&self, text: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
     fn paradev_core(base: &Url, here: CmuxHere) -> ParadevCore {
         let dir = tempfile::tempdir().unwrap();
         let id = if here == CmuxHere::OtherId {
@@ -4216,10 +4232,11 @@ mod tests {
                         && ade::paradev::verify_with(path, |_| here != CmuxHere::BadSignature)
                 }),
             )
-            .with_clipboard(Arc::new(move |text: &str| {
-                sink.lock().unwrap().push(text.to_string());
-                Ok(())
-            })),
+            // The minute before the clearing never ends here: crate::clipboard tests that.
+            .with_clipboard(SecretClipboard::new(
+                Arc::new(RecordingClipboard(sink)),
+                Arc::new(|_| Box::pin(std::future::pending())),
+            )),
         );
         sign_in_as(&core, base, 7);
         if here != CmuxHere::Missing {

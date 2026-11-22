@@ -64,7 +64,7 @@ cmux connects over SSH by itself and uploads its own remote part, at the version
 
 Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaBox installs nothing and hands the setup to Paradev:
 
-1. **Install Paradev** wakes the sandbox, copies its SSH address, `ssh://<SSH token>@<gateway>:<port>`, and opens Paradev's host settings.
+1. **Install Paradev** wakes the sandbox, copies its SSH address, `ssh://<SSH token>@<gateway>:<port>`, and opens Paradev's host settings. A minute later InstaBox clears the address from the clipboard, unless you copied something else since.
 2. In Paradev, click **Set up a host over SSH** and paste the address.
 3. Click **Install Paradev** again. InstaBox checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get `paradev` in its mark, and a new workspace on it opens in Paradev.
 

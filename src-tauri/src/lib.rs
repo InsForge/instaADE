@@ -3,6 +3,7 @@ pub mod agents;
 pub mod api;
 pub mod app;
 pub mod auth;
+pub mod clipboard;
 pub mod commands;
 pub mod connected;
 pub mod errors;

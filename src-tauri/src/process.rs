@@ -111,30 +111,6 @@ fn run(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Capt
     Ok((status.code(), o, e))
 }
 
-/// A clipboard write that takes longer counts as failed.
-const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Puts `text` on this computer's clipboard: `pbcopy` on macOS. No other platform needs it
-/// yet (only Paradev, a macOS app, asks for it).
-pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err("Copying to the clipboard is only on macOS for now".to_string());
-    }
-    match run_with_input(
-        command("/usr/bin/pbcopy"),
-        text.as_bytes(),
-        CLIPBOARD_TIMEOUT,
-    ) {
-        Ok((Some(0), _, _)) => Ok(()),
-        Ok((code, _, err)) => Err(format!(
-            "Could not copy to the clipboard (pbcopy exited with {code:?}): {}",
-            String::from_utf8_lossy(&err).trim()
-        )),
-        Err(RunError::Spawn(e)) => Err(format!("Could not copy to the clipboard: {e}")),
-        Err(RunError::TimedOut) => Err("Copying to the clipboard took too long".to_string()),
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
