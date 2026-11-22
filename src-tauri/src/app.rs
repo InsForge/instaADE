@@ -39,6 +39,8 @@ const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
 /// Account data and the desktop ADE versions are read this often.
 pub const FULL_REFRESH: Duration = Duration::from_secs(300);
+/// The longest a quit waits to clear a copied secret.
+const QUIT_WAIT: Duration = Duration::from_secs(1);
 
 /// Called with the whole state after every change.
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
@@ -1097,6 +1099,13 @@ impl Core {
         if ended {
             self.transition(Some(account), Next::Nobody);
         }
+    }
+
+    /// The app is quitting: clears a copied secret whose clearing is still pending, such as
+    /// Paradev's SSH address, when the clipboard still holds exactly it. Waits at most
+    /// `QUIT_WAIT`, and a failure never stops the quit.
+    pub fn on_quit(&self) {
+        self.clipboard.clear_pending_within(QUIT_WAIT);
     }
 
     pub fn set_start_at_login(&self, on: bool) {
@@ -4294,6 +4303,29 @@ mod tests {
         assert_eq!(s.sandboxes[0].ades, vec![]);
         // Paradev pairs nothing from here.
         assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn quitting_clears_the_copied_paradev_address() {
+        let (_server, base) = paradev_server(serde_json::json!({}), "inactive").await;
+        let ParadevCore {
+            core,
+            opened: _,
+            copied,
+            app: _,
+            _dir,
+        } = paradev_core(&base, CmuxHere::Real);
+        core.refresh(false).await;
+        core.on_quit();
+        assert!(copied.lock().unwrap().is_empty(), "nothing to clear yet");
+        let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(Opened::FinishSetupInAde));
+        // The minute is not up: the quit clears it.
+        core.on_quit();
+        assert_eq!(
+            *copied.lock().unwrap(),
+            ["ssh://ibssh_new@ssh.example.test:2222", ""]
+        );
     }
 
     #[tokio::test]

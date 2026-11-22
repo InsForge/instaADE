@@ -57,14 +57,22 @@ impl Clipboard for SystemClipboard {
 pub type Sleep = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Copies secrets and clears each one `CLEAR_AFTER` later. A newer copy restarts the wait: only
-/// the last copy is cleared, a full `CLEAR_AFTER` after it was made.
+/// the last copy is cleared, a full `CLEAR_AFTER` after it was made. When the app quits first,
+/// `clear_pending_within` clears it then.
 pub struct SecretClipboard {
     clipboard: Arc<dyn Clipboard>,
     sleep: Sleep,
-    /// Counts copies, so a wait that a newer copy replaced clears nothing. Its lock is held
-    /// through each copy and each clearing, so a newer copy never lands between a clearing's
-    /// read and its write.
-    copies: Arc<Mutex<u64>>,
+    /// Its lock is held through each copy and each clearing, so a newer copy never lands
+    /// between a clearing's read and its write.
+    copies: Arc<Mutex<Copies>>,
+}
+
+#[derive(Default)]
+struct Copies {
+    /// Counts copies, so a wait that a newer copy replaced clears nothing.
+    count: u64,
+    /// The last secret copied, until it is cleared or left alone.
+    pending: Option<String>,
 }
 
 impl SecretClipboard {
@@ -72,7 +80,7 @@ impl SecretClipboard {
         SecretClipboard {
             clipboard,
             sleep,
-            copies: Arc::new(Mutex::new(0)),
+            copies: Arc::new(Mutex::new(Copies::default())),
         }
     }
 
@@ -95,24 +103,48 @@ impl SecretClipboard {
         let this = {
             let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
             self.clipboard.write(secret)?;
-            *copies += 1;
-            *copies
+            copies.count += 1;
+            copies.pending = Some(secret.to_string());
+            copies.count
         };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return Ok(None);
         };
         let (clipboard, copies) = (self.clipboard.clone(), self.copies.clone());
-        let (wait, secret) = ((self.sleep)(CLEAR_AFTER), secret.to_string());
+        let wait = (self.sleep)(CLEAR_AFTER);
         Ok(Some(rt.spawn(async move {
             wait.await;
             let _ = tokio::task::spawn_blocking(move || {
-                let copies = copies.lock().unwrap_or_else(PoisonError::into_inner);
-                if *copies == this {
-                    clear_if_still(&*clipboard, &secret);
+                let mut copies = copies.lock().unwrap_or_else(PoisonError::into_inner);
+                if copies.count == this {
+                    clear_pending(&mut copies, &*clipboard);
                 }
             })
             .await;
         })))
+    }
+
+    /// The app is quitting: clears the secret whose clearing is still pending, by the same rule
+    /// as `CLEAR_AFTER` (only while the clipboard holds exactly it). Waits at most `wait`, on a
+    /// thread of its own, so a stuck clipboard command never holds up the quit. True when it
+    /// finished in time.
+    pub fn clear_pending_within(&self, wait: Duration) -> bool {
+        let (clipboard, copies) = (self.clipboard.clone(), self.copies.clone());
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut copies = copies.lock().unwrap_or_else(PoisonError::into_inner);
+            clear_pending(&mut copies, &*clipboard);
+            let _ = done.send(());
+        });
+        finished.recv_timeout(wait).is_ok()
+    }
+}
+
+/// Clears the pending secret if the clipboard still holds exactly it. Either way nothing is
+/// pending after.
+fn clear_pending(copies: &mut Copies, clipboard: &dyn Clipboard) {
+    if let Some(secret) = copies.pending.take() {
+        clear_if_still(clipboard, &secret);
     }
 }
 
@@ -329,6 +361,79 @@ mod tests {
         clock.advance(60);
         assert!(settled(&mut task).await);
         assert_eq!(*board.0.lock().unwrap(), [ADDRESS]);
+    }
+
+    const QUIT_WAIT: Duration = Duration::from_secs(1);
+
+    #[tokio::test]
+    async fn quitting_clears_an_address_whose_clearing_is_pending() {
+        let (board, clock, secret) = setup();
+        let mut task = secret.copy_then_clear(ADDRESS).unwrap().unwrap();
+        clock.advance(10);
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some(""));
+        // The minute's clearing later finds nothing left to do.
+        board.user_copies(ADDRESS);
+        clock.advance(50);
+        assert!(settled(&mut task).await);
+        assert_eq!(board.text().as_deref(), Some(ADDRESS));
+        assert_eq!(*board.writes.lock().unwrap(), [ADDRESS, ""]);
+    }
+
+    #[test]
+    fn quitting_never_wipes_what_the_user_copied_since() {
+        let (board, _clock, secret) = setup();
+        secret.copy(ADDRESS).unwrap();
+        board.user_copies("my own note");
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some("my own note"));
+        assert_eq!(*board.writes.lock().unwrap(), [ADDRESS], "no write");
+    }
+
+    #[tokio::test]
+    async fn quitting_after_the_clearing_ran_clears_nothing() {
+        let (board, clock, secret) = setup();
+        let mut task = secret.copy_then_clear(ADDRESS).unwrap().unwrap();
+        clock.advance(60);
+        assert!(settled(&mut task).await);
+        // The user copied the same text again by hand: no clearing is pending for it.
+        board.user_copies(ADDRESS);
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some(ADDRESS));
+        // Nor when nothing was ever copied.
+        let (board, _clock, secret) = setup();
+        board.user_copies("my own note");
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some("my own note"));
+    }
+
+    #[test]
+    fn a_stuck_clipboard_does_not_hold_up_the_quit() {
+        use std::sync::mpsc;
+        struct Stuck(Mutex<Option<mpsc::Receiver<()>>>);
+        impl Clipboard for Stuck {
+            fn read(&self) -> Option<String> {
+                if let Some(rx) = self.0.lock().unwrap().take() {
+                    let _ = rx.recv();
+                }
+                None
+            }
+            fn write(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let (release, rx) = mpsc::channel::<()>();
+        let clock = FakeClock::new();
+        let secret = SecretClipboard::new(Arc::new(Stuck(Mutex::new(Some(rx)))), clock.sleep());
+        secret.copy(ADDRESS).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!secret.clear_pending_within(Duration::from_millis(100)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(release);
     }
 
     #[test]
