@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { connectSandbox, createSandbox, getState, onState, openInAde, toErrorView } from "./api";
+import { connectSandbox, createSandbox, getState, onNotice, onState, openInAde, toErrorView } from "./api";
 import type { Mode } from "./ades";
 import { agentKey } from "./common";
 import type { AgentCache, OnAgentStatus } from "./common";
@@ -46,6 +46,18 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     let gone = false;
     onState(setState).then((u) => (gone ? u() : (off = u)));
     getState().then((s) => setState((cur) => cur ?? s), () => {});
+    return () => {
+      gone = true;
+      off?.();
+    };
+  }, []);
+
+  // A tray action that opened an ADE hands over what to do next there, as the popover's own
+  // actions do.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let gone = false;
+    onNotice(setNotice).then((u) => (gone ? u() : (off = u)));
     return () => {
       gone = true;
       off?.();
@@ -115,18 +127,23 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     setView(v);
   };
   const back = () => go({ name: "list" });
+  /** Shows what the user does next in the ADE, when opening it does not finish the job (Orca). */
+  const thenNotice = (opened: Promise<string | null | undefined>) =>
+    opened.then((next) => {
+      if (next) setNotice(next);
+    });
   /** Sets the ADE up on the sandbox, then opens it. The ADE asks to confirm in its own window. */
   const connect = (id: string, ade: AdeId) => {
-    void run(() => connectSandbox(id, ade));
+    void run(() => thenNotice(connectSandbox(id, ade)));
   };
   /** Opens the sandbox in the ADE. */
   const open = (id: string, ade: AdeId) => {
-    void run(() => openInAde(id, ade));
+    void run(() => thenNotice(openInAde(id, ade)));
   };
   const create = (args: CreateArgs, size: string) => {
     setPending({ name: args.name, size });
     go({ name: "list" });
-    void run(() => createSandbox(args));
+    void run(() => thenNotice(createSandbox(args)));
   };
   const toggleMenu = (id: string, anchor: HTMLElement) =>
     setMenu((m) => (m && m.id === id && m.anchor === anchor ? null : { id, anchor }));

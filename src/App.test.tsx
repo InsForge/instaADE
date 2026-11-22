@@ -10,9 +10,12 @@ const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a), isTauri: () => true }));
 vi.mock("./hero/HeroCube", () => ({ HeroCube: () => null }));
 let emit: (s: AppState) => void = () => {};
+/** Sends a notice the way the back end does after a tray action. */
+let emitNotice: (notice: string) => void = () => {};
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: (_: string, cb: (e: { payload: AppState }) => void) => {
-    emit = (s) => cb({ payload: s });
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => {
+    if (name === "state") emit = (s) => cb({ payload: s });
+    if (name === "notice") emitNotice = (n) => cb({ payload: n });
     return Promise.resolve(() => {});
   },
 }));
@@ -85,6 +88,13 @@ const cmuxAde: AdeView = {
   shortName: "cmux",
   version: "0.64.25",
   downloadUrl: "https://github.com/manaflow-ai/cmux/releases/latest",
+};
+const orcaAde: AdeView = {
+  id: "orca",
+  name: "Orca",
+  shortName: "Orca",
+  version: "1.4.269",
+  downloadUrl: "https://github.com/stablyai/orca/releases/latest",
 };
 /** A Mac with T3 Code and cmux. */
 const mac: Partial<AppState> = { ades: [t3Ade, cmuxAde] };
@@ -823,7 +833,7 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
 test("settings: update, account, the ADEs on this Mac and start at login", async () => {
   show(
     {
-      ades: [t3Ade, { ...cmuxAde, version: null }],
+      ades: [t3Ade, { ...cmuxAde, version: null }, orcaAde],
       orgs: [...sample.orgs, { id: "org-team", name: "team", tier: "pro", personal: false }],
       update: { version: "0.2.0", url: "https://example.com/v0.2.0" },
     },
@@ -835,7 +845,7 @@ test("settings: update, account, the ADEs on this Mac and start at login", async
   expect(ades.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
     "T3 Code0.1.10",
     "cmuxNot found",
-    "OrcaComing soon",
+    "Orca1.4.269",
     "SSupersetComing soon",
     "ParadevComing soon",
   ]);
@@ -934,7 +944,7 @@ test("T3 mode without T3 Code on this Mac shows the card above the list", async 
 // ---- the ADE switcher ----
 
 test("the switcher lists Instabox, the ADEs on this Mac and the ones coming soon", async () => {
-  show(mac, [{}, { id: "b", name: "web", ades: ["t3", "cmux"] }]);
+  show({ ades: [t3Ade, cmuxAde, orcaAde] }, [{}, { id: "b", name: "web", ades: ["t3", "cmux"] }]);
   await screen.findByText("dev-1");
   expect(switcher().getAttribute("aria-label")).toBe("ADE: T3 Code. Switch ADE");
   await userEvent.click(switcher());
@@ -944,12 +954,13 @@ test("the switcher lists Instabox, the ADEs on this Mac and the ones coming soon
     "InstaBox" + "Sandboxes only, no ADE",
     "T3 Code" + "0.1.10 on this Mac · on 2 sandboxes",
     "cmux" + "0.64.25 on this Mac · on 1 sandbox",
-    "OrcaNot supported yetComing soon",
+    "Orca" + "1.4.269 on this Mac",
     "SSupersetNot supported yetComing soon",
     "ParadevNot supported yetComing soon",
   ]);
   expect(items.map((b) => b.getAttribute("aria-checked"))).toEqual(["false", "true", "false", "false", "false", "false"]);
-  for (const b of items.slice(3)) expect((b as HTMLButtonElement).disabled).toBe(true);
+  expect((items[3] as HTMLButtonElement).disabled).toBe(false);
+  for (const b of items.slice(4)) expect((b as HTMLButtonElement).disabled).toBe(true);
   // The checked mode has the focus, so the keyboard can walk the menu.
   expect(document.activeElement).toBe(items[1]);
   await userEvent.keyboard("{Escape}");
@@ -1093,6 +1104,88 @@ test("a new sandbox in cmux mode sets cmux up", async () => {
   expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "cmux" }));
   await act(async () => {});
   expect(screen.queryByText(/Confirm the/)).toBeNull();
+});
+
+const ORCA_NEXT = "In Orca, connect instabox-dev-1 from the SSH menu, then open /data/home.";
+
+test("Orca mode: Connect writes the host and says where to connect it in Orca", async () => {
+  picked("orca");
+  show({ ades: [t3Ade, cmuxAde, orcaAde] }, [{ id: "a", name: "dev-1", ades: ["t3"] }, { id: "b", name: "web", ades: ["orca"] }], {
+    connect_sandbox: () => ORCA_NEXT,
+    open_in_t3: () => "In Orca, connect instabox-web from the SSH menu, then open /data/home.",
+  });
+  await screen.findByText("dev-1");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: Orca. Switch ADE");
+  expect(popover().dataset.mode).toBe("orca");
+  expect(theme()).toBe("orca");
+  // A row without Orca offers Connect; one with it shows Orca's logo.
+  const connect = within(rowOf("dev-1")).getByRole("button", { name: "Connect" });
+  expect(connect.title).toBe("Connect to Orca");
+  expect(within(rowOf("web")).getByRole("img", { name: "Orca" })).toBeTruthy();
+  expect(within(rowOf("web")).queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(connect);
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "orca" });
+  expect((await screen.findByRole("status")).textContent).toBe(ORCA_NEXT);
+
+  // Details open it in Orca, and say again where to connect it.
+  await userEvent.click(screen.getByText("web"));
+  expect(screen.queryByRole("status")).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Open in Orca" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "orca" });
+  expect((await screen.findByRole("status")).textContent).toBe("In Orca, connect instabox-web from the SSH menu, then open /data/home.");
+  // Orca pairs nothing: no T3 pairing or reinstall.
+  for (const name of ["Pair again", "Reinstall T3"]) expect(screen.queryByRole("button", { name })).toBeNull();
+});
+
+test("Orca mode: a failed open shows the error, not the notice", async () => {
+  picked("orca");
+  show({ ades: [t3Ade, orcaAde] }, [{ id: "b", name: "web", ades: ["orca"] }], {
+    open_in_t3: () => Promise.reject({ kind: "other", message: "Could not verify the Orca app. Install it again from its official download." }),
+  });
+  await userEvent.click(await screen.findByText("web"));
+  await userEvent.click(screen.getByRole("button", { name: "Open in Orca" }));
+  expect(await screen.findByText("Could not verify the Orca app. Install it again from its official download.")).toBeTruthy();
+  expect(screen.queryByRole("status")).toBeNull();
+});
+
+test("a new sandbox in Orca mode sets Orca up and says where to connect it", async () => {
+  picked("orca");
+  show({ ades: [t3Ade, orcaAde], tier: "pro" }, [{}], { create_sandbox: () => ORCA_NEXT });
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText("Sets the sandbox up for Orca. Then it opens in Orca.")).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "orca" }));
+  expect((await screen.findByRole("status")).textContent).toBe(ORCA_NEXT);
+});
+
+test("a notice from a tray action shows in the popover like its own", async () => {
+  picked("orca");
+  show({ ades: [t3Ade, orcaAde] }, [{ id: "b", name: "web", ades: ["orca"] }]);
+  await screen.findByText("web");
+  expect(screen.queryByRole("status")).toBeNull();
+  // The tray's Open in Orca ran in the back end.
+  act(() => emitNotice("In Orca, connect instabox-web from the SSH menu, then open /data/home."));
+  expect(screen.getByRole("status").textContent).toBe("In Orca, connect instabox-web from the SSH menu, then open /data/home.");
+  // The next action clears it, as it clears the popover's own notices.
+  await userEvent.click(screen.getByText("web"));
+  expect(screen.queryByRole("status")).toBeNull();
+});
+
+test("an Orca pick holds on Windows too, where the back end lists Orca", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    picked("orca");
+    show({ ades: [t3Ade, orcaAde] }, [{}]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: Orca. Switch ADE");
+    // Without Orca on this computer, the pick falls back to plain InstaBox.
+    cleanup();
+    picked("orca");
+    show({ ades: [t3Ade] }, [{}]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: InstaBox. Switch ADE");
+  } finally {
+    ua.mockRestore();
+  }
 });
 
 // ---- first run and the default mode ----

@@ -36,6 +36,8 @@ export function onPreviewState(cb: (s: AppState) => void) {
 }
 
 export async function invokePreview(command: string, args: Record<string, unknown> = {}): Promise<unknown> {
+  // What the command resolves to, after the state goes out.
+  let result: unknown;
   const patchSandbox = (patch: Partial<SandboxView>) => {
     state = { ...state, sandboxes: state.sandboxes.map((s) => s.id === args.id ? { ...s, ...patch } : s) };
   };
@@ -55,9 +57,10 @@ export async function invokePreview(command: string, args: Record<string, unknow
     case "connect_sandbox": {
       const sandbox = state.sandboxes.find((s) => s.id === args.id);
       const ade = args.ade;
-      if (!sandbox || (ade !== "t3" && ade !== "cmux")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
       patchSandbox({ ades: [...new Set<AdeId>([...sandbox.ades, ade])],
         ...(ade === "t3" ? { connected: true, t3Version: state.t3 } : {}) });
+      if (ade === "orca") result = `In Orca, connect instabox-${sandbox.name} from the SSH menu, then open /data/home.`;
       break;
     }
     case "reinstall_t3": patchSandbox({ updatePending: false, t3Version: state.t3 }); break;
@@ -74,4 +77,5 @@ export async function invokePreview(command: string, args: Record<string, unknow
       throw { kind: "other", message: "This is a browser preview. Use the InstaBox menu bar app for this action." };
   }
   for (const cb of listeners) cb(structuredClone(state));
+  return result;
 }

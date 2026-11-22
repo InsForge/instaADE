@@ -6,11 +6,10 @@ import type { AdeId, AppState, SandboxView } from "./types";
 export type Mode = "instabox" | AdeId;
 
 /** An ADE the switcher lists but the app does not support yet. */
-export type SoonId = "orca" | "superset" | "paradev";
+export type SoonId = "superset" | "paradev";
 
 /** The ADEs the switcher shows as coming soon, after the ones the app supports. */
 export const COMING_SOON: { id: SoonId; name: string }[] = [
-  { id: "orca", name: "Orca" },
   { id: "superset", name: "Superset" },
   { id: "paradev", name: "Paradev" },
 ];
@@ -29,7 +28,7 @@ export function AdeBadge({ id, size = 20 }: { id: Mode | SoonId; size?: number }
   );
 }
 
-const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux" };
+const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux", orca: "Orca" };
 
 /** The desktop app's name, such as "T3 Code". */
 export const adeName = (state: AppState, id: AdeId) => state.ades.find((a) => a.id === id)?.name ?? NAMES[id];
@@ -43,7 +42,8 @@ export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? 
 /** True when the ADE is set up on the sandbox (its mark lists it). */
 export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);
 
-/** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link. */
+/** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link; Orca
+ * connects an SSH host InstaBox writes. */
 export const pairs = (id: AdeId) => id === "t3";
 
 /** True when the ADE's app is on this computer, so it can open sandboxes here. */

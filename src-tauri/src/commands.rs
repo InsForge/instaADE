@@ -12,7 +12,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::ade::Ade;
 use crate::agents::Agent;
-use crate::app::{AppState, Core, CreateArgs, parse_mcp_client, parse_provider};
+use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
 
 type Shared<'a> = State<'a, Arc<Core>>;
@@ -51,7 +51,7 @@ pub async fn create_sandbox(
     memMiB: u32,
     auto_suspend_after_seconds: Option<i64>,
     ade: Option<Ade>,
-) -> Res<()> {
+) -> Res<Notice> {
     core.inner()
         .clone()
         .create_sandbox(CreateArgs {
@@ -66,7 +66,7 @@ pub async fn create_sandbox(
 }
 
 #[tauri::command]
-pub async fn connect_sandbox(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+pub async fn connect_sandbox(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Notice> {
     core.inner().clone().connect_sandbox(&id, ade).await
 }
 
@@ -83,9 +83,10 @@ pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
 }
 
 /// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken and synced) or
-/// cmux (its link, with an SSH token). A sandbox without the ADE gets it first.
+/// cmux (its link, with an SSH token) or Orca (its SSH host, then the app; the answer says what
+/// to do next in Orca). A sandbox without the ADE gets it first.
 #[tauri::command]
-pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<()> {
+pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Notice> {
     core.inner().clone().open_in_ade(&id, ade).await
 }
 
