@@ -715,6 +715,9 @@ pub struct Core {
     hook: Mutex<Option<Hook>>,
     /// A pass of `renew_ssh_hosts` is running.
     renewing: std::sync::atomic::AtomicBool,
+    /// Test only: every line `log` wrote.
+    #[cfg(test)]
+    logs: Mutex<Vec<String>>,
 }
 
 /// A flow's gate: open only while the account it began under is current.
@@ -796,6 +799,18 @@ type Res<T> = Result<T, ErrorView>;
 /// finish the job (Orca: connect the host InstaBox wrote). None for every other ADE.
 pub type Notice = Option<String>;
 
+/// The ids of every sandbox in an account's whole machine list.
+struct Listed {
+    account: u64,
+    ids: HashSet<String>,
+}
+
+/// SSH hosts whose sandbox is not in the whole machine list of `account`.
+struct Gone {
+    account: u64,
+    ids: Vec<String>,
+}
+
 impl Core {
     pub fn new(
         base: Url,
@@ -825,6 +840,8 @@ impl Core {
             #[cfg(test)]
             hook: Mutex::new(None),
             renewing: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            logs: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
                 state,
                 data: Data::default(),
@@ -1155,8 +1172,14 @@ impl Core {
     /// Reads machines, and with `full` also the account, templates, snapshots and the
     /// desktop ADE versions. Lists only; nothing here runs a command on a sandbox.
     pub async fn refresh(self: &Arc<Self>, full: bool) -> Vec<SyncJob> {
+        self.refresh_listed(full).await.0
+    }
+
+    /// `refresh`, also with the ids of every sandbox of the account when its whole machine
+    /// list came back (every page). None when the list failed or the account changed meanwhile.
+    async fn refresh_listed(self: &Arc<Self>, full: bool) -> (Vec<SyncJob>, Option<Listed>) {
         let Ok((client, account, no_me)) = self.signed_in_with(|i| i.data.me.is_none()) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let full = full || no_me;
         let machines = client.machines().await;
@@ -1189,9 +1212,14 @@ impl Core {
                     i.state.error = Some(ErrorView::other(e));
                 }
             }
+            let mut listed = None;
             match machines {
                 Ok(m) => {
                     i.state.progress = prune_progress(i.state.progress.take(), &m);
+                    listed = Some(Listed {
+                        account,
+                        ids: m.iter().map(|m| m.id.clone()).collect(),
+                    });
                     i.data.machines = m;
                 }
                 Err(e) => failure = Some(e.into()),
@@ -1220,7 +1248,7 @@ impl Core {
             }
             let jobs = i.set_desktop_versions(found);
             i.session_flags();
-            jobs
+            (jobs, listed)
         });
         jobs.unwrap_or_default()
     }
@@ -1257,12 +1285,52 @@ impl Core {
     /// full one (at startup, at sign-in and every few minutes) also renews the tokens of the
     /// SSH hosts in the background.
     pub async fn refresh_and_sync(self: &Arc<Self>, full: bool) {
-        let jobs = self.refresh(full).await;
-        self.spawn_sync(jobs);
+        let gone = self.refresh_and_find_gone(full).await;
         if full {
             let core = self.clone();
-            tokio::spawn(async move { core.renew_ssh_hosts().await });
+            tokio::spawn(async move { core.renew_ssh_hosts(gone).await });
         }
+    }
+
+    /// `refresh` and its syncs. A full one also finds the SSH hosts (Orca) whose sandbox the
+    /// account's whole machine list no longer has. Only hosts written before the list was read
+    /// count: one written since may be of a sandbox made after it. None when the list failed,
+    /// was not whole, or the account changed.
+    async fn refresh_and_find_gone(self: &Arc<Self>, full: bool) -> Option<Gone> {
+        let before = if full { self.host_ids().await } else { None };
+        let (jobs, listed) = self.refresh_listed(full).await;
+        self.spawn_sync(jobs);
+        let (before, listed) = (before?, listed?);
+        Some(Gone {
+            account: listed.account,
+            ids: before
+                .into_iter()
+                .filter(|id| !listed.ids.contains(id))
+                .collect(),
+        })
+    }
+
+    /// The sandbox ids of the SSH hosts InstaBox wrote; None when the file cannot be read.
+    async fn host_ids(&self) -> Option<Vec<String>> {
+        let home = self.home.clone();
+        match tokio::task::spawn_blocking(move || ssh_config::aliases(&home)).await {
+            Ok(Ok(hosts)) => Some(hosts.into_iter().map(|(id, _)| id).collect()),
+            Ok(Err(e)) => {
+                self.log(format!("SSH hosts: could not read them: {e:#}"));
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Writes a line to the app's log (stderr). Tests read the lines back.
+    fn log(&self, line: String) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(line);
     }
 
     /// Keeps every SSH host InstaBox wrote (Orca) working without a click. For each sandbox
@@ -1274,12 +1342,13 @@ impl Core {
     /// failure is logged and tried again on the next full refresh; the popover never shows it.
     /// A host that could not take a new token keeps the stored token behind, so the next pass
     /// makes another one and tries again, and a host that fell behind the stored token gets
-    /// it. One pass runs at a time. Returns what it logged.
-    async fn renew_ssh_hosts(self: &Arc<Self>) -> Vec<String> {
+    /// it. The hosts in `gone` (their sandbox is not in the account's whole machine list) are
+    /// removed instead, whatever their token. One pass runs at a time. Returns what it logged.
+    async fn renew_ssh_hosts(self: &Arc<Self>, gone: Option<Gone>) -> Vec<String> {
         use std::sync::atomic::Ordering::SeqCst;
         let mut logged = Vec::new();
         let mut log = |line: String| {
-            eprintln!("{line}");
+            self.log(line.clone());
             logged.push(line);
         };
         if self.renewing.swap(true, SeqCst) {
@@ -1308,11 +1377,25 @@ impl Core {
         };
         let gate = self.gate(account);
         let margin = chrono::Duration::days(HOST_TOKEN_RENEW_DAYS);
+        // Only the list of the account this pass runs for.
+        let gone: HashSet<String> = gone
+            .filter(|g| g.account == account)
+            .map(|g| g.ids.into_iter().collect())
+            .unwrap_or_default();
         for (id, _) in hosts {
             if self.account() != account {
                 return logged;
             }
             self.step("renew");
+            if gone.contains(&id) {
+                let home = self.home.clone();
+                if let Some(Err(e)) = guarded(&gate, || ssh_config::remove_host(&home, &id)) {
+                    log(format!(
+                        "SSH host of sandbox {id}: could not remove it: {e:#}"
+                    ));
+                }
+                continue;
+            }
             match ssh::token_and_save(&client, &*self.ssh, &id, &gate, margin).await {
                 // The store refused the new token, as it does when the host cannot take it.
                 Ok((_, Err(e))) => log(format!("SSH host of sandbox {id}: {e}")),
@@ -1999,10 +2082,18 @@ impl Core {
                 i.rebuild();
             });
             self.forget(id, account).await;
-            // Its SSH host (Orca) goes too. A host left behind only fails to connect.
+            // Its SSH host (Orca) goes too. The delete itself succeeded, so a failure here is
+            // only logged; the next full refresh removes a host whose sandbox is not listed.
             let (home, gone) = (self.home.clone(), id.to_string());
-            let _ =
-                tokio::task::spawn_blocking(move || ssh_config::remove_host(&home, &gone)).await;
+            match tokio::task::spawn_blocking(move || ssh_config::remove_host(&home, &gone)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => self.log(format!(
+                    "SSH host of sandbox {id}: could not remove it: {e:#}"
+                )),
+                Err(e) => self.log(format!(
+                    "SSH host of sandbox {id}: could not remove it: {e}"
+                )),
+            }
         }
         r
     }
@@ -5092,7 +5183,7 @@ mod tests {
             chrono::Duration::days(7) - chrono::Duration::hours(1),
         );
         host_with(&o, "m1", &old);
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         let hosts = hosts_of(o.home.path());
         assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
         assert!(!hosts.contains("ibssh_old"), "{hosts}");
@@ -5103,7 +5194,7 @@ mod tests {
         assert_eq!(r, ["POST /v1/machines/m1/ssh-tokens"], "{r:?}");
         assert_eq!(o.core.state().error, None);
         // The new token has 30 days: the next pass leaves it alone.
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(token_requests(&requests(&server).await), 1);
     }
 
@@ -5117,7 +5208,7 @@ mod tests {
         );
         host_with(&o, "m1", &kept);
         let before = hosts_of(o.home.path());
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(hosts_of(o.home.path()), before);
         assert!(requests(&server).await.is_empty());
     }
@@ -5129,7 +5220,7 @@ mod tests {
         // The host is there, the keychain lost the token.
         let gone = token_left("ibssh_lost", chrono::Duration::days(20));
         ssh_config::write_host(o.home.path(), "m1", "dev 1", &gone).unwrap();
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
         assert_eq!(token_requests(&requests(&server).await), 1);
     }
@@ -5143,7 +5234,7 @@ mod tests {
             .ssh
             .save("m1", &token_left("ibssh_old", chrono::Duration::hours(30)))
             .unwrap();
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert!(requests(&server).await.is_empty());
         assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_old");
         assert!(!o.home.path().join(".ssh").exists());
@@ -5158,7 +5249,7 @@ mod tests {
         let before = hosts_of(o.home.path());
         // Signed out without the store's sign-out, so the host is still there to tempt it.
         o.core.update(|i| i.client = None);
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(hosts_of(o.home.path()), before);
         assert!(requests(&server).await.is_empty());
     }
@@ -5175,7 +5266,7 @@ mod tests {
         let b = base.clone();
         at_step(&o.core, "renew", move |c| sign_in_as(c, &b, 8));
         let before = o.core.account();
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_ne!(
             o.core.account(),
             before,
@@ -5204,7 +5295,7 @@ mod tests {
         let old = token_left("ibssh_old", chrono::Duration::days(2));
         host_with(&o, "m1", &old);
         let before = hosts_of(o.home.path());
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(
             hosts_of(o.home.path()),
             before,
@@ -5215,7 +5306,7 @@ mod tests {
             None,
             "a background renewal shows nothing"
         );
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
         assert_eq!(token_requests(&requests(&server).await), 2);
     }
@@ -5235,7 +5326,7 @@ mod tests {
             "m1",
             &token_left("ibssh_old", chrono::Duration::days(1)),
         );
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         let hosts = hosts_of(o.home.path());
         assert!(!hosts.contains("instabox-sandbox m9"), "{hosts}");
         assert!(hosts.contains("# instabox-sandbox m1\n"), "{hosts}");
@@ -5264,7 +5355,7 @@ mod tests {
             &token_left("ibssh_old", chrono::Duration::days(1)),
         );
         let before = hosts_of(o.home.path());
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(hosts_of(o.home.path()), before);
     }
 
@@ -5280,7 +5371,7 @@ mod tests {
         o.core
             .renewing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert!(
             requests(&server).await.is_empty(),
             "another pass is running"
@@ -5288,7 +5379,7 @@ mod tests {
         o.core
             .renewing
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        o.core.renew_ssh_hosts().await;
+        o.core.renew_ssh_hosts(None).await;
         assert_eq!(token_requests(&requests(&server).await), 1);
         assert!(
             !o.core.renewing.load(std::sync::atomic::Ordering::SeqCst),
@@ -5414,7 +5505,7 @@ mod tests {
             std::fs::rename(&p, &a).unwrap();
             std::fs::create_dir(&p).unwrap();
         });
-        let logged = o.core.renew_ssh_hosts().await;
+        let logged = o.core.renew_ssh_hosts(None).await;
         assert!(
             logged
                 .iter()
@@ -5435,7 +5526,7 @@ mod tests {
         std::fs::rename(&aside, &path).unwrap();
         assert!(hosts_of(o.home.path()).contains("  User ibssh_old\n"));
         // The next pass makes another token and writes it to the host this time.
-        let logged = o.core.renew_ssh_hosts().await;
+        let logged = o.core.renew_ssh_hosts(None).await;
         assert!(logged.is_empty(), "{logged:?}");
         assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
         assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
@@ -5461,7 +5552,7 @@ mod tests {
             &token_left("ibssh_behind", chrono::Duration::days(20)),
         )
         .unwrap();
-        let logged = o.core.renew_ssh_hosts().await;
+        let logged = o.core.renew_ssh_hosts(None).await;
         assert!(logged.is_empty(), "{logged:?}");
         let hosts = hosts_of(o.home.path());
         assert!(hosts.contains("  User ibssh_stored\n"), "{hosts}");
@@ -5623,5 +5714,210 @@ mod tests {
         let notice = o.core.connect_sandbox("m1", Some(Ade::Orca)).await.unwrap();
         assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(*o.opened.lock().unwrap(), [exe.display().to_string()]);
+    }
+
+    // ---- hosts of sandboxes no longer listed ----
+
+    /// A list answer with the sandboxes `ids`, each like m1.
+    fn listing(ids: &[&str]) -> serde_json::Value {
+        let machines: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "name": format!("box {id}"), "state": "running",
+                    "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+                    "metadata": {}, "orgId": "org-me"
+                })
+            })
+            .collect();
+        serde_json::json!({"machines": machines, "nextCursor": null})
+    }
+
+    async fn list_answers(server: &wiremock::MockServer, body: wiremock::ResponseTemplate) {
+        use wiremock::Mock;
+        use wiremock::matchers::{method, path};
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(body)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_cleanup_is_logged_and_the_next_full_refresh_removes_the_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "id": "op9", "machineId": "m1", "type": "delete", "state": "succeeded",
+                "machine": null
+            })))
+            .mount(&server)
+            .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core.refresh(false).await;
+        o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        // The hosts file cannot be written while the sandbox is deleted.
+        let hosts = ssh_config::hosts_path(o.home.path());
+        let aside = hosts.with_extension("aside");
+        std::fs::rename(&hosts, &aside).unwrap();
+        std::fs::create_dir(&hosts).unwrap();
+        o.core.delete("m1").await.unwrap();
+        assert_eq!(o.core.state().error, None, "the delete itself succeeded");
+        let logs = o.core.logs.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("SSH host of sandbox m1: could not remove it")),
+            "{logs:?}"
+        );
+        std::fs::remove_dir(&hosts).unwrap();
+        std::fs::rename(&aside, &hosts).unwrap();
+        assert!(hosts_of(o.home.path()).contains("# instabox-sandbox m1\n"));
+        // The sandbox is gone from the list: the next full refresh removes its host.
+        list_answers(
+            &server,
+            ResponseTemplate::new(200).set_body_json(listing(&[])),
+        )
+        .await;
+        o.core.refresh_and_sync(true).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hosts_of(o.home.path()).contains("instabox-sandbox m1") {
+            assert!(Instant::now() < deadline, "{}", hosts_of(o.home.path()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Answers the machine list with `m1` only, and meanwhile writes the host of `m7`: a
+    /// sandbox made while the list was read, whose host is newer than the list.
+    struct ListWhileCreating {
+        home: PathBuf,
+    }
+
+    impl wiremock::Respond for ListWhileCreating {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let t = token_left("ibssh_m7", chrono::Duration::days(20));
+            ssh_config::write_host(&self.home, "m7", "new", &t).unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(listing(&["m1"]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_of_an_unlisted_sandbox_goes_whatever_its_token_and_a_listed_one_stays() {
+        use wiremock::Mock;
+        use wiremock::matchers::{method, path};
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        Mock::given(method("GET"))
+            .and(path("/v1/machines"))
+            .respond_with(ListWhileCreating {
+                home: o.home.path().to_path_buf(),
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Both tokens have 20 days: no renewal is due.
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_m1", chrono::Duration::days(20)),
+        );
+        host_with(
+            &o,
+            "m9",
+            &token_left("ibssh_m9", chrono::Duration::days(20)),
+        );
+        // m7's token is kept already; its host comes while the list is read.
+        o.core
+            .ssh
+            .save("m7", &token_left("ibssh_m7", chrono::Duration::days(20)))
+            .unwrap();
+        let gone = o.core.refresh_and_find_gone(true).await;
+        o.core.renew_ssh_hosts(gone).await;
+        let hosts = hosts_of(o.home.path());
+        assert!(hosts.contains("# instabox-sandbox m1\n"), "listed: {hosts}");
+        assert!(
+            !hosts.contains("instabox-sandbox m9"),
+            "not listed: {hosts}"
+        );
+        assert!(
+            hosts.contains("# instabox-sandbox m7\n"),
+            "newer than the list: {hosts}"
+        );
+        assert_eq!(token_requests(&requests(&server).await), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_partial_machine_list_removes_no_host() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        for partial in [false, true] {
+            let (server, base) = cmux_server(serde_json::json!({})).await;
+            if partial {
+                // The first page comes back, the second fails.
+                Mock::given(method("GET"))
+                    .and(path("/v1/machines"))
+                    .and(query_param("cursor", "c2"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+                let mut first = listing(&["m2"]);
+                first["nextCursor"] = serde_json::json!("c2");
+                Mock::given(method("GET"))
+                    .and(path("/v1/machines"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(first))
+                    .with_priority(2)
+                    .mount(&server)
+                    .await;
+            } else {
+                list_answers(&server, ResponseTemplate::new(500)).await;
+            }
+            let o = orca_core(&base, OrcaHere::Real);
+            host_with(
+                &o,
+                "m9",
+                &token_left("ibssh_m9", chrono::Duration::days(20)),
+            );
+            let gone = o.core.refresh_and_find_gone(true).await;
+            assert!(gone.is_none(), "partial: {partial}");
+            o.core.renew_ssh_hosts(gone).await;
+            assert!(
+                hosts_of(o.home.path()).contains("# instabox-sandbox m9\n"),
+                "partial: {partial}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_of_another_account_removes_no_host() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        list_answers(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(listing(&[])),
+        )
+        .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m9",
+            &token_left("ibssh_m9", chrono::Duration::days(20)),
+        );
+        let gone = o.core.refresh_and_find_gone(true).await;
+        assert_eq!(
+            gone.as_ref().map(|g| g.ids.clone()),
+            Some(vec!["m9".to_string()])
+        );
+        // The account changed before the pass: the old account's list says nothing now.
+        let gone = gone.map(|g| Gone {
+            account: g.account + 100,
+            ids: g.ids,
+        });
+        o.core.renew_ssh_hosts(gone).await;
+        assert!(hosts_of(o.home.path()).contains("# instabox-sandbox m9\n"));
     }
 }
