@@ -4,8 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::process::{RunError, command, run_bounded, run_with_input};
@@ -62,8 +61,10 @@ pub type Sleep = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>
 pub struct SecretClipboard {
     clipboard: Arc<dyn Clipboard>,
     sleep: Sleep,
-    /// Counts copies, so a wait that a newer copy replaced clears nothing.
-    copies: Arc<AtomicU64>,
+    /// Counts copies, so a wait that a newer copy replaced clears nothing. Its lock is held
+    /// through each copy and each clearing, so a newer copy never lands between a clearing's
+    /// read and its write.
+    copies: Arc<Mutex<u64>>,
 }
 
 impl SecretClipboard {
@@ -71,7 +72,7 @@ impl SecretClipboard {
         SecretClipboard {
             clipboard,
             sleep,
-            copies: Arc::new(AtomicU64::new(0)),
+            copies: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -91,8 +92,12 @@ impl SecretClipboard {
 
     /// `copy`, with the task that clears the secret, so a test can wait for it.
     fn copy_then_clear(&self, secret: &str) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
-        self.clipboard.write(secret)?;
-        let this = self.copies.fetch_add(1, Ordering::SeqCst) + 1;
+        let this = {
+            let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+            self.clipboard.write(secret)?;
+            *copies += 1;
+            *copies
+        };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return Ok(None);
         };
@@ -100,10 +105,13 @@ impl SecretClipboard {
         let (wait, secret) = ((self.sleep)(CLEAR_AFTER), secret.to_string());
         Ok(Some(rt.spawn(async move {
             wait.await;
-            if copies.load(Ordering::SeqCst) != this {
-                return;
-            }
-            let _ = tokio::task::spawn_blocking(move || clear_if_still(&*clipboard, &secret)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                let copies = copies.lock().unwrap_or_else(PoisonError::into_inner);
+                if *copies == this {
+                    clear_if_still(&*clipboard, &secret);
+                }
+            })
+            .await;
         })))
     }
 }
@@ -251,6 +259,55 @@ mod tests {
                 "60 s after the last copy"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_newer_copy_during_a_clearing_is_not_wiped() {
+        use std::sync::mpsc;
+        /// Holds the clearing right after its read, until the test lets it go on.
+        struct SlowRead {
+            inner: FakeClipboard,
+            read: Mutex<Option<mpsc::Sender<()>>>,
+            go: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl Clipboard for SlowRead {
+            fn read(&self) -> Option<String> {
+                let text = self.inner.read();
+                if let Some(read) = self.read.lock().unwrap().take() {
+                    read.send(()).unwrap();
+                    let go = self.go.lock().unwrap().take().unwrap();
+                    go.recv().unwrap();
+                }
+                text
+            }
+            fn write(&self, text: &str) -> Result<(), String> {
+                self.inner.write(text)
+            }
+        }
+        let (read_tx, read_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let board = Arc::new(SlowRead {
+            inner: FakeClipboard::default(),
+            read: Mutex::new(Some(read_tx)),
+            go: Mutex::new(Some(go_rx)),
+        });
+        let clock = FakeClock::new();
+        let secret = Arc::new(SecretClipboard::new(board.clone(), clock.sleep()));
+        let mut task = secret.copy_then_clear(ADDRESS).unwrap().unwrap();
+        clock.advance(60);
+        // The clearing has read the address and not written yet.
+        tokio::task::spawn_blocking(move || read_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let newer = "ssh://ibssh_other@ssh.example.test:2222";
+        let copier = secret.clone();
+        let copy = std::thread::spawn(move || copier.copy(newer).unwrap());
+        // Time for the newer copy to land, if it could.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        go_tx.send(()).unwrap();
+        assert!(settled(&mut task).await);
+        copy.join().unwrap();
+        assert_eq!(board.inner.text().as_deref(), Some(newer));
     }
 
     #[tokio::test]
