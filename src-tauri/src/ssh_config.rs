@@ -83,15 +83,18 @@ pub fn write_host(home: &Path, id: &str, name: &str, t: &SshToken) -> Result<Str
 }
 
 /// Rewrites the login of sandbox `id`'s host with `t`, keeping its alias. False when the
-/// sandbox has no host or the host already has this login.
+/// sandbox has no host (or there is no home, so no hosts) or the host already has this login.
+/// An error only when the hosts file cannot be read or written, or `t` cannot go in it.
 pub fn update_login(home: &Path, id: &str, t: &SshToken) -> Result<bool> {
-    check(id, t)?;
-    check_home(home)?;
+    if !home.is_absolute() {
+        return Ok(false);
+    }
     let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let mut lines = read_lines(&hosts_path(home))?;
     let Some(b) = blocks(&lines).into_iter().find(|b| b.id == id) else {
         return Ok(false);
     };
+    check(id, t)?;
     let block = render(id, &b.alias, t);
     if lines[b.start..b.end] == block[..] {
         return Ok(false);
@@ -455,11 +458,12 @@ impl<S: SshTokenStore> SshTokenStore for SyncedStore<S> {
         self.inner.load(id)
     }
 
+    /// A host that cannot take the new token keeps the stored token behind too, so the next
+    /// renewal makes another and tries the host again. The token in hand still works.
     fn save(&self, id: &str, token: &SshToken) -> std::result::Result<(), String> {
-        // The host follows the token even when the store fails: the token is in use either way.
-        let hosts = update_login(&self.home, id, token);
-        self.inner.save(id, token)?;
-        hosts.map(drop).map_err(|e| format!("{e:#}"))
+        update_login(&self.home, id, token)
+            .map_err(|e| format!("could not update the SSH host of sandbox {id}: {e:#}"))?;
+        self.inner.save(id, token)
     }
 
     fn clear_all(&self) -> std::result::Result<(), String> {
@@ -783,8 +787,43 @@ Host instabox-dev-1
     #[test]
     fn no_home_writes_nothing() {
         assert!(write_host(Path::new(""), "m1", "dev", &tok("ibssh_a")).is_err());
-        assert!(update_login(Path::new(".ssh"), "m1", &tok("ibssh_a")).is_err());
+        // No home, no hosts: a new token has no host to update, and that is no failure.
+        assert!(!update_login(Path::new(".ssh"), "m1", &tok("ibssh_a")).unwrap());
         assert!(remove_all(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn a_failed_host_update_keeps_the_stored_token_behind() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
+        write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
+        store.save("m1", &tok("ibssh_a")).unwrap();
+        // The hosts file cannot be read for a while: it is a folder.
+        let path = hosts_path(home.path());
+        let aside = path.with_extension("aside");
+        fs::rename(&path, &aside).unwrap();
+        fs::create_dir(&path).unwrap();
+        let e = store.save("m1", &tok("ibssh_b")).unwrap_err();
+        assert!(
+            e.contains("could not update the SSH host of sandbox m1"),
+            "{e}"
+        );
+        assert_eq!(
+            store.load("m1").unwrap().unwrap().token,
+            "ibssh_a",
+            "not advanced"
+        );
+        // A token the host cannot hold is refused the same way.
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&aside, &path).unwrap();
+        assert!(store.save("m1", &tok("ibssh_b c")).is_err());
+        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_a");
+        // Once the file is back, the next token goes into both.
+        store.save("m1", &tok("ibssh_b")).unwrap();
+        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_b");
+        assert!(read(&path).contains("  User ibssh_b\n"));
+        // A sandbox with no host saves any token: there is no host to keep in step.
+        store.save("m2", &tok("ibssh_x y")).unwrap();
     }
 
     #[test]

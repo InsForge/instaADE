@@ -1272,11 +1272,18 @@ impl Core {
     /// sandbox wakes. A sandbox the API no longer has loses its host. Every write goes through
     /// the gate of the account the pass began under, so nothing happens once it changed. A
     /// failure is logged and tried again on the next full refresh; the popover never shows it.
-    /// One pass runs at a time.
-    async fn renew_ssh_hosts(self: &Arc<Self>) {
+    /// A host that could not take a new token keeps the stored token behind, so the next pass
+    /// makes another one and tries again, and a host that fell behind the stored token gets
+    /// it. One pass runs at a time. Returns what it logged.
+    async fn renew_ssh_hosts(self: &Arc<Self>) -> Vec<String> {
         use std::sync::atomic::Ordering::SeqCst;
+        let mut logged = Vec::new();
+        let mut log = |line: String| {
+            eprintln!("{line}");
+            logged.push(line);
+        };
         if self.renewing.swap(true, SeqCst) {
-            return;
+            return logged;
         }
         struct Done<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for Done<'_> {
@@ -1286,48 +1293,63 @@ impl Core {
         }
         let _done = Done(&self.renewing);
         let Ok((client, account)) = self.signed_in() else {
-            return;
+            return logged;
         };
         let home = self.home.clone();
         let hosts = match tokio::task::spawn_blocking(move || ssh_config::aliases(&home)).await {
             Ok(Ok(hosts)) => hosts,
             Ok(Err(e)) => {
-                eprintln!("SSH hosts: could not read them to renew their tokens: {e:#}");
-                return;
+                log(format!(
+                    "SSH hosts: could not read them to renew their tokens: {e:#}"
+                ));
+                return logged;
             }
-            Err(_) => return,
+            Err(_) => return logged,
         };
         let gate = self.gate(account);
         let margin = chrono::Duration::days(HOST_TOKEN_RENEW_DAYS);
         for (id, _) in hosts {
             if self.account() != account {
-                return;
+                return logged;
             }
             self.step("renew");
-            match ssh::token_within(&client, &*self.ssh, &id, &gate, margin).await {
-                Ok(_) => {}
+            match ssh::token_and_save(&client, &*self.ssh, &id, &gate, margin).await {
+                // The store refused the new token, as it does when the host cannot take it.
+                Ok((_, Err(e))) => log(format!("SSH host of sandbox {id}: {e}")),
+                // The host holds the token in use, also when it fell behind the stored one.
+                Ok((t, Ok(()))) => {
+                    let home = self.home.clone();
+                    if let Some(Err(e)) =
+                        guarded(&gate, || ssh_config::update_login(&home, &id, &t))
+                    {
+                        log(format!(
+                            "SSH host of sandbox {id}: could not update it: {e:#}"
+                        ));
+                    }
+                }
                 // Gone only when the sandbox itself is gone too, not on any 404.
                 Err(e) if matches!(e.status, 404 | 410) => match client.machine(&id).await {
                     Err(e) if matches!(e.status, 404 | 410) => {
                         let home = self.home.clone();
                         if let Some(Err(e)) = guarded(&gate, || ssh_config::remove_host(&home, &id))
                         {
-                            eprintln!("SSH host of sandbox {id}: could not remove it: {e:#}");
+                            log(format!(
+                                "SSH host of sandbox {id}: could not remove it: {e:#}"
+                            ));
                         }
                     }
-                    _ => eprintln!(
+                    _ => log(format!(
                         "SSH host of sandbox {id}: could not renew its token: {}",
                         e.message
-                    ),
+                    )),
                 },
-                Err(e) => {
-                    eprintln!(
-                        "SSH host of sandbox {id}: could not renew its token: {}",
-                        e.message
-                    )
-                }
+                Err(e) => log(format!(
+                    "SSH host of sandbox {id}: could not renew its token: {}",
+                    e.message
+                )),
             }
         }
+        logged
     }
 
     fn spawn_sync(self: &Arc<Self>, jobs: Vec<SyncJob>) {
@@ -1513,6 +1535,11 @@ impl Core {
             },
             None => None,
         };
+        if let Some(ade) = a.ade
+            && let Err(e) = self.check_app_first(ade).await
+        {
+            return self.settle_in(account, Err(e));
+        }
         let req = NewSandbox {
             name: a.name,
             source: a.snapshot_id.map_or(Source::Standard, Source::Snapshot),
@@ -1551,6 +1578,9 @@ impl Core {
             Ok(v) => v,
             Err(e) => return self.settle_in(account, Err(e)),
         };
+        if let Err(e) = self.check_app_first(ade).await {
+            return self.settle_in(account, Err(e));
+        }
         self.begin_progress(
             "connect",
             "connecting",
@@ -1618,31 +1648,7 @@ impl Core {
         if let Open::Pair(_) = open {
             return Err(ErrorView::other(format!("{} opens by pairing", ade.name())));
         }
-        let (locate, verify) = (self.locate.clone(), self.verify.clone());
-        let checked = tokio::task::spawn_blocking(move || {
-            locate(ade).map(|app| {
-                let ok = verify(ade, &app);
-                (app, ok)
-            })
-        })
-        .await
-        .ok()
-        .flatten();
-        let app = match checked {
-            Some((app, true)) => app,
-            Some((_, false)) => {
-                return Err(ErrorView::other(format!(
-                    "Could not verify the {} app. Install it again from its official download.",
-                    ade.name()
-                )));
-            }
-            None => {
-                return Err(ErrorView::other(format!(
-                    "{} is not installed. Install it first.",
-                    ade.name()
-                )));
-            }
-        };
+        let app = self.checked_app(ade).await?;
         let (client, title) = self
             .read_in(account, |i| {
                 let title = i
@@ -1694,6 +1700,43 @@ impl Core {
             }
             Open::Pair(_) => Err(ErrorView::other(format!("{} opens by pairing", ade.name()))),
         }
+    }
+
+    /// The ADE's app on this computer, found and checked now (cmux and Orca: its identifier and
+    /// signature), never the version found earlier. An error when there is no app or it fails
+    /// the check.
+    async fn checked_app(&self, ade: Ade) -> Res<PathBuf> {
+        let (locate, verify) = (self.locate.clone(), self.verify.clone());
+        let checked = tokio::task::spawn_blocking(move || {
+            locate(ade).map(|app| {
+                let ok = verify(ade, &app);
+                (app, ok)
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+        match checked {
+            Some((app, true)) => Ok(app),
+            Some((_, false)) => Err(ErrorView::other(format!(
+                "Could not verify the {} app. Install it again from its official download.",
+                ade.name()
+            ))),
+            None => Err(ErrorView::other(format!(
+                "{} is not installed. Install it first.",
+                ade.name()
+            ))),
+        }
+    }
+
+    /// For an ADE whose app reaches the sandbox over SSH (cmux, Orca), the app is checked before
+    /// the sandbox is touched: with no app, or one that fails the check, nothing wakes, is
+    /// created or is marked. `open_link` checks it again right before the token.
+    async fn check_app_first(&self, ade: Ade) -> Res<()> {
+        if matches!(ade.open(), Open::Pair(_)) {
+            return Ok(());
+        }
+        self.checked_app(ade).await.map(drop)
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it.
@@ -5252,5 +5295,157 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", hosts_of(o.home.path()));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    // ---- the app is checked before the sandbox is touched ----
+
+    #[tokio::test]
+    async fn orca_install_checks_the_app_before_it_wakes_creates_or_marks() {
+        for (here, message) in [
+            (
+                OrcaHere::Missing,
+                "Orca is not installed. Install it first.",
+            ),
+            (
+                OrcaHere::BadSignature,
+                "Could not verify the Orca app. Install it again from its official download.",
+            ),
+        ] {
+            let (server, base) = cmux_server(serde_json::json!({})).await;
+            let o = orca_core(&base, here);
+            // A version found earlier, from an app that is gone or replaced since.
+            o.core
+                .update(|i| i.state.set_desktop(Ade::Orca, Some("1.4.269".into())));
+            let e = o
+                .core
+                .connect_sandbox("m1", Some(Ade::Orca))
+                .await
+                .unwrap_err();
+            assert_eq!(e.message, message);
+            let e = o
+                .core
+                .create_sandbox(CreateArgs {
+                    name: "dev 1".into(),
+                    snapshot_id: None,
+                    vcpus: 2,
+                    mem_mib: 4096,
+                    auto_suspend_after_seconds: Some(1800),
+                    ade: Some(Ade::Orca),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(e.message, message);
+            // Open on a sandbox without Orca goes through the same check.
+            let e = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap_err();
+            assert_eq!(e.message, message);
+            let r = requests(&server).await;
+            assert!(
+                r.is_empty(),
+                "nothing read, woken, created or marked: {r:?}"
+            );
+            assert_eq!(o.core.state().progress, None);
+            assert!(o.opened.lock().unwrap().is_empty());
+            assert!(!o.home.path().join(".ssh").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cmux_install_checks_the_app_before_it_wakes_or_marks() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(
+            &base,
+            Arc::new(MemorySshStore::default()),
+            CmuxHere::BadSignature,
+        );
+        core.update(|i| i.state.set_desktop(Ade::Cmux, Some("0.64.25".into())));
+        let e = core
+            .connect_sandbox("m1", Some(Ade::Cmux))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.message,
+            "Could not verify the cmux app. Install it again from its official download."
+        );
+        let r = requests(&server).await;
+        assert!(r.is_empty(), "no prep, no mark: {r:?}");
+        assert!(opened.lock().unwrap().is_empty());
+    }
+
+    // ---- a host that cannot take a new token ----
+
+    #[tokio::test]
+    async fn a_host_that_cannot_take_the_new_token_is_logged_and_tried_again() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        host_with(
+            &o,
+            "m1",
+            &token_left("ibssh_old", chrono::Duration::days(1)),
+        );
+        let path = ssh_config::hosts_path(o.home.path());
+        let aside = path.with_extension("aside");
+        let (p, a) = (path.clone(), aside.clone());
+        // Right after the pass read the hosts, the file cannot be read or written.
+        at_step(&o.core, "renew", move |_| {
+            std::fs::rename(&p, &a).unwrap();
+            std::fs::create_dir(&p).unwrap();
+        });
+        let logged = o.core.renew_ssh_hosts().await;
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("could not update the SSH host of sandbox m1")),
+            "{logged:?}"
+        );
+        assert_eq!(
+            o.core.ssh.load("m1").unwrap().unwrap().token,
+            "ibssh_old",
+            "the stored token stays behind the host"
+        );
+        assert_eq!(
+            o.core.state().error,
+            None,
+            "a background renewal shows nothing"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        assert!(hosts_of(o.home.path()).contains("  User ibssh_old\n"));
+        // The next pass makes another token and writes it to the host this time.
+        let logged = o.core.renew_ssh_hosts().await;
+        assert!(logged.is_empty(), "{logged:?}");
+        assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
+        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        assert_eq!(token_requests(&requests(&server).await), 2);
+    }
+
+    #[tokio::test]
+    async fn a_host_behind_the_stored_token_gets_it_without_a_new_one() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        // The store holds a token with 20 days; the host still has another one.
+        o.core
+            .ssh
+            .save(
+                "m1",
+                &token_left("ibssh_stored", chrono::Duration::days(20)),
+            )
+            .unwrap();
+        ssh_config::write_host(
+            o.home.path(),
+            "m1",
+            "dev 1",
+            &token_left("ibssh_behind", chrono::Duration::days(20)),
+        )
+        .unwrap();
+        let logged = o.core.renew_ssh_hosts().await;
+        assert!(logged.is_empty(), "{logged:?}");
+        let hosts = hosts_of(o.home.path());
+        assert!(hosts.contains("  User ibssh_stored\n"), "{hosts}");
+        assert!(requests(&server).await.is_empty(), "no new token");
     }
 }

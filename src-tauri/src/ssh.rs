@@ -117,20 +117,31 @@ pub async fn token_within(
     gate: &dyn Gate,
     margin: Duration,
 ) -> Result<SshToken> {
+    // The token still works this run if saving fails; the next run asks for a new one.
+    token_and_save(client, store, id, gate, margin)
+        .await
+        .map(|(t, _)| t)
+}
+
+/// `token_within`, with what the store answered when it saved a new token (`Ok` for the stored
+/// one). A token that was not saved still works; the caller decides what a failed save means.
+pub async fn token_and_save(
+    client: &Client,
+    store: &dyn SshTokenStore,
+    id: &str,
+    gate: &dyn Gate,
+    margin: Duration,
+) -> Result<(SshToken, std::result::Result<(), String>)> {
     // A broken store only costs a fresh token, so treat a load failure as a miss.
     if let Ok(Some(t)) = store.load(id)
         && t.expires_at.is_some_and(|e| e > Utc::now() + margin)
     {
-        return Ok(t);
+        return Ok((t, Ok(())));
     }
     let t = client.ssh_token(id, TOKEN_NAME, TOKEN_TTL_SECS).await?;
-    // The token still works this run if saving fails; the next run asks for a new one.
     // After a sign-out nothing is saved, and the caller gets no token either.
-    guarded(gate, || {
-        let _ = store.save(id, &t);
-    })
-    .ok_or_else(account_changed)?;
-    Ok(t)
+    let saved = guarded(gate, || store.save(id, &t)).ok_or_else(account_changed)?;
+    Ok((t, saved))
 }
 
 /// The login command to show the user, as the server formatted it.
