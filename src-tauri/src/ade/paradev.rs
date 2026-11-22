@@ -141,11 +141,16 @@ echo "machineid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-i
 /// Opens Paradev's host settings, where the user clicks Set up a host over SSH.
 pub const SETUP_LINK: &str = "superset://settings/hosts";
 
+/// What the user does next, once InstaBox copied the address and opened the host settings.
+pub const NOTICE: &str =
+    "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";
+
 pub const HOST: Host = Host {
     script: HOST_SCRIPT,
     state: parse_host,
     setup_link: SETUP_LINK,
     ssh_address,
+    notice: NOTICE,
     link: workspace_link,
 };
 

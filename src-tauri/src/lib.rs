@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod process;
 pub mod sandbox;
 pub mod ssh;
+pub mod ssh_config;
 pub mod tray;
 
 use std::sync::{Arc, OnceLock};
@@ -25,6 +26,7 @@ use crate::app::{AppState, Core, Opener, api_base};
 use crate::connected::FileConnectedStore;
 use crate::mcp::KeyringKeyStore;
 use crate::ssh::KeyringSshStore;
+use crate::ssh_config::SyncedStore;
 
 /// The argument the login item passes, so a start at login does not open the popover.
 const AT_LOGIN: &str = "--at-login";
@@ -84,7 +86,12 @@ pub fn run() {
             let core = Arc::new(Core::new(
                 api_base(std::env::var("INSTABOX_API_URL").ok()),
                 Arc::new(KeyringKeyStore),
-                Arc::new(KeyringSshStore),
+                // A new token also rewrites the sandbox's SSH host (Orca), and a sign-out removes
+                // every host.
+                Arc::new(SyncedStore::new(
+                    KeyringSshStore,
+                    dirs::home_dir().unwrap_or_default(),
+                )),
                 Arc::new(FileConnectedStore::new(
                     handle
                         .path()

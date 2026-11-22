@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalPosition, Manager, Rect, WebviewWindow, Window};
+use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Rect, WebviewWindow, Window};
 
 use crate::ade::{Ade, Open};
 use crate::app::{AppState, Core};
@@ -60,7 +60,9 @@ fn open_target(s: &SandboxView) -> (Ade, bool) {
     let ready = s.ades.contains(&ade)
         && match ade.open() {
             Open::Pair(_) => s.connected,
-            Open::Link(_) | Open::Host(_) => true,
+            Open::Link(_) => true,
+            Open::SshHost(_) => true,
+            Open::Host(_) => true,
         };
     (ade, ready)
 }
@@ -284,6 +286,25 @@ fn build_menu(app: &AppHandle, rows: &[TrayRow]) -> tauri::Result<Menu<tauri::Wr
     Ok(menu)
 }
 
+/// The event that hands the popover a notice after a tray action: what to do next in the ADE
+/// (Orca: the host to connect). The UI shows it as it shows the notice of its own actions.
+pub const NOTICE_EVENT: &str = "notice";
+
+/// Runs a sandbox action picked in the tray menu: `pause`, `resume` or `open`. A failure shows
+/// in the app's error line, as when the popover runs it. A notice goes to `notify`, which shows
+/// it in the popover; only Open returns one.
+pub async fn run_action(core: &Arc<Core>, verb: &str, sandbox: &str, notify: impl FnOnce(String)) {
+    let notice = match verb {
+        "pause" => core.pause(sandbox).await.map(|()| None),
+        "resume" => core.resume(sandbox).await.map(|()| None),
+        "open" => core.open_in_ade(sandbox, None).await,
+        _ => Ok(None),
+    };
+    if let Ok(Some(notice)) = notice {
+        notify(notice);
+    }
+}
+
 pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
     let menu = build_menu(app, &[])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -310,16 +331,19 @@ pub fn build(app: &AppHandle, core: Arc<Core>) -> tauri::Result<()> {
                     let Some((verb, sandbox)) = other.split_once(':') else {
                         return;
                     };
-                    let (verb, sandbox, core) =
-                        (verb.to_string(), sandbox.to_string(), core.clone());
+                    let (verb, sandbox, core, app) = (
+                        verb.to_string(),
+                        sandbox.to_string(),
+                        core.clone(),
+                        app.clone(),
+                    );
                     tauri::async_runtime::spawn(async move {
-                        // A failure shows in the app's error line.
-                        let _ = match verb.as_str() {
-                            "pause" => core.pause(&sandbox).await,
-                            "resume" => core.resume(&sandbox).await,
-                            "open" => core.open_in_ade(&sandbox, None).await.map(drop),
-                            _ => Ok(()),
-                        };
+                        run_action(&core, &verb, &sandbox, |notice| {
+                            let _ = app.emit(NOTICE_EVENT, notice);
+                            let shown = app.clone();
+                            let _ = app.run_on_main_thread(move || show_popover(&shown, None));
+                        })
+                        .await;
                     });
                 }
             }

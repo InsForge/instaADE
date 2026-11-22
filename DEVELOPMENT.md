@@ -8,7 +8,9 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `app.rs`: the app state and every action. `commands.rs`: the commands the UI calls.
   - `api/`: the instabox API client. `auth.rs`: device sign-in and token storage.
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
-  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `paradev.rs`).
+  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`).
+  - `ssh_config.rs`: the SSH hosts InstaBox writes for Orca, and the one line it adds to `~/.ssh/config`.
+  - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
 - `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 

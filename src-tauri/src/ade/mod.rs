@@ -3,6 +3,7 @@
 //! The flows that use them (connect, sync, reinstall) are in `sandbox`.
 
 pub mod cmux;
+pub mod orca;
 pub mod paradev;
 pub mod t3;
 
@@ -12,7 +13,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Every ADE the app knows, in the order the app lists them.
-pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux, Ade::Paradev];
+pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev];
 
 /// Exit code of every ADE's setup script when the ADE is busy and its update waits.
 pub const SETUP_EXIT_BUSY: i32 = 3;
@@ -20,13 +21,14 @@ pub const SETUP_EXIT_BUSY: i32 = 3;
 /// Where an ADE's setup puts its idle probe. instabox-guest-agent runs every file here.
 pub const ACTIVITY_DIR: &str = "/usr/local/lib/instabox/activity.d";
 
-/// An ADE. Its id (`t3`, `cmux`, `paradev`) is its JSON form and an entry of a connected sandbox's mark.
+/// An ADE. Its id (`t3`, `cmux`, `orca`, `paradev`) is its JSON form and an entry of a connected sandbox's mark.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Ade {
     #[default]
     T3,
     Cmux,
+    Orca,
     Paradev,
 }
 
@@ -60,6 +62,9 @@ pub enum Open {
     Pair(Pairing),
     /// The app opens a link, and the desktop app reaches the sandbox over SSH by itself.
     Link(Link),
+    /// The app writes the sandbox as a host in the user's SSH config, which the desktop app
+    /// imports, and starts the desktop app. The user connects the host there.
+    SshHost(SshHost),
     /// The desktop app runs the sandbox as one of its hosts, which the user sets up in the app.
     Host(Host),
 }
@@ -72,25 +77,24 @@ pub struct Link {
     pub link: fn(&SshLogin<'_>) -> String,
 }
 
-/// What a link needs to reach a sandbox: the SSH gateway, a token as the user, and a title.
+/// An ADE that reaches a sandbox through a host in the user's SSH config (`ssh_config`).
+/// `notice` tells the user what to do in the app, given the host's alias.
 #[derive(Debug, Clone, Copy)]
-pub struct SshLogin<'a> {
-    pub host: &'a str,
-    pub port: u16,
-    pub user: &'a str,
-    pub title: &'a str,
+pub struct SshHost {
+    pub notice: fn(&str) -> String,
 }
 
 /// An ADE that runs the sandbox as one of its hosts (Paradev). The desktop app sets the host
-/// up over SSH by itself, with the user: the app copies `ssh_address` and opens `setup_link`.
-/// `script` reads on the sandbox whether the host runs and its machine id, `state` parses
-/// that, and once the host runs `link` opens the sandbox from its machine id.
+/// up over SSH by itself, with the user: the app copies `ssh_address`, opens `setup_link` and
+/// shows `notice`. `script` reads on the sandbox whether the host runs and its machine id,
+/// `state` parses that, and once the host runs `link` opens the sandbox from its machine id.
 #[derive(Debug, Clone, Copy)]
 pub struct Host {
     pub script: &'static str,
     pub state: fn(&str) -> HostState,
     pub setup_link: &'static str,
     pub ssh_address: fn(&SshLogin<'_>) -> String,
+    pub notice: &'static str,
     pub link: fn(&str) -> String,
 }
 
@@ -101,6 +105,15 @@ pub struct HostState {
     pub running: bool,
     /// The machine id the host is known by; None when it is missing or not valid.
     pub machine_id: Option<String>,
+}
+
+/// What a link needs to reach a sandbox: the SSH gateway, a token as the user, and a title.
+#[derive(Debug, Clone, Copy)]
+pub struct SshLogin<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub user: &'a str,
+    pub title: &'a str,
 }
 
 /// A pairing. `script` prints a one-time code on the sandbox and `code` reads it; `link`
@@ -141,6 +154,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::ID,
             Ade::Cmux => cmux::ID,
+            Ade::Orca => orca::ID,
             Ade::Paradev => paradev::ID,
         }
     }
@@ -150,6 +164,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::NAME,
             Ade::Cmux => cmux::NAME,
+            Ade::Orca => orca::NAME,
             Ade::Paradev => paradev::NAME,
         }
     }
@@ -159,6 +174,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::SHORT_NAME,
             Ade::Cmux => cmux::SHORT_NAME,
+            Ade::Orca => orca::SHORT_NAME,
             Ade::Paradev => paradev::SHORT_NAME,
         }
     }
@@ -167,6 +183,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::PLATFORMS,
             Ade::Cmux => cmux::PLATFORMS,
+            Ade::Orca => orca::PLATFORMS,
             Ade::Paradev => paradev::PLATFORMS,
         }
     }
@@ -181,6 +198,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::DOWNLOAD_URL,
             Ade::Cmux => cmux::DOWNLOAD_URL,
+            Ade::Orca => orca::DOWNLOAD_URL,
             Ade::Paradev => paradev::DOWNLOAD_URL,
         }
     }
@@ -190,6 +208,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::URL_SCHEME,
             Ade::Cmux => cmux::URL_SCHEME,
+            Ade::Orca => orca::URL_SCHEME,
             Ade::Paradev => paradev::URL_SCHEME,
         }
     }
@@ -201,6 +220,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::locate(),
             Ade::Cmux => cmux::locate(),
+            Ade::Orca => orca::locate(),
             Ade::Paradev => paradev::locate(),
         }
     }
@@ -211,19 +231,22 @@ impl Ade {
         match self {
             Ade::T3 => t3::version(path),
             Ade::Cmux => cmux::version(path),
+            Ade::Orca => orca::version(path),
             Ade::Paradev => paradev::version(path),
         }
     }
 
     /// True when the app at `path` is the ADE's own, checked again right before the app hands
-    /// it a secret. cmux and Paradev: the bundle identifier and signature (an SSH token goes
-    /// into cmux's link, and onto the clipboard for Paradev). T3: the app gets no token from a
-    /// link, so the path `locate` found stands.
+    /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
+    /// link). T3: the app gets no token from a link, so the path `locate` found stands. Orca:
+    /// on macOS its identifier and signature, as the app InstaBox starts. Paradev: its
+    /// identifier and signature (it gets the sandbox's SSH address with a token).
     /// Blocks for a few seconds, so run it off the async runtime.
     pub fn verify(self, path: &Path) -> bool {
         match self {
             Ade::T3 => true,
             Ade::Cmux => cmux::verify(path),
+            Ade::Orca => orca::verify(path),
             Ade::Paradev => paradev::verify(path),
         }
     }
@@ -240,7 +263,9 @@ impl Ade {
     pub fn parse_version(self, out: &str) -> Option<String> {
         match self {
             Ade::T3 => t3::parse_version(out),
-            Ade::Cmux | Ade::Paradev => None,
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
         }
     }
 
@@ -249,19 +274,23 @@ impl Ade {
     pub fn pins_local_version(self) -> bool {
         match self {
             Ade::T3 => true,
-            Ade::Cmux | Ade::Paradev => false,
+            Ade::Cmux => false,
+            Ade::Orca => false,
+            Ade::Paradev => false,
         }
     }
 
     // ---- the sandbox ----
 
     /// Prints the ADE's version on the sandbox, or nothing when it is not installed. None for
-    /// an ADE InstaBox installs nothing for (cmux uploads its own remote part, Paradev's app
+    /// an ADE that installs nothing there (cmux uploads its own remote part, Paradev's app
     /// installs its host).
     pub fn version_script(self) -> Option<&'static str> {
         match self {
             Ade::T3 => Some(t3::VERSION_SCRIPT),
-            Ade::Cmux | Ade::Paradev => None,
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
         }
     }
 
@@ -273,6 +302,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::setup_script(version),
             Ade::Cmux => cmux::PREP_SCRIPT.to_string(),
+            Ade::Orca => String::new(),
             Ade::Paradev => paradev::HOST_SCRIPT.to_string(),
         }
     }
@@ -281,7 +311,9 @@ impl Ade {
     pub fn stop_script(self) -> Option<&'static str> {
         match self {
             Ade::T3 => Some(t3::STOP_SCRIPT),
-            Ade::Cmux | Ade::Paradev => None,
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
         }
     }
 
@@ -290,7 +322,9 @@ impl Ade {
     pub fn probe(self) -> Option<Probe> {
         match self {
             Ade::T3 => Some(t3::PROBE),
-            Ade::Cmux | Ade::Paradev => None,
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
         }
     }
 
@@ -304,6 +338,7 @@ impl Ade {
         match self {
             Ade::T3 => Open::Pair(t3::PAIRING),
             Ade::Cmux => Open::Link(cmux::LINK),
+            Ade::Orca => Open::SshHost(orca::SSH_HOST),
             Ade::Paradev => Open::Host(paradev::HOST),
         }
     }
@@ -312,7 +347,9 @@ impl Ade {
     pub fn port(self) -> Option<u16> {
         match self.open() {
             Open::Pair(p) => Some(p.port),
-            Open::Link(_) | Open::Host(_) => None,
+            Open::Link(_) => None,
+            Open::SshHost(_) => None,
+            Open::Host(_) => None,
         }
     }
 }
@@ -357,10 +394,11 @@ mod tests {
 
     #[test]
     fn the_registry_lists_t3_then_cmux_by_their_ids() {
-        assert_eq!(ALL, &[Ade::T3, Ade::Cmux, Ade::Paradev]);
+        assert_eq!(ALL, &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev]);
         assert_eq!(Ade::default(), Ade::T3);
         assert_eq!(Ade::from_id("t3"), Some(Ade::T3));
         assert_eq!(Ade::from_id("cmux"), Some(Ade::Cmux));
+        assert_eq!(Ade::from_id("orca"), Some(Ade::Orca));
         assert_eq!(Ade::from_id("paradev"), Some(Ade::Paradev));
         assert_eq!(Ade::from_id("superset"), None, "one entry, by its new name");
         assert_eq!(Ade::from_id("other"), None);
@@ -445,6 +483,32 @@ mod tests {
     }
 
     #[test]
+    fn orca_parts() {
+        let o = Ade::Orca;
+        assert_eq!((o.id(), o.name(), o.short_name()), ("orca", "Orca", "Orca"));
+        assert_eq!(
+            o.download_url(),
+            "https://github.com/stablyai/orca/releases/latest"
+        );
+        assert_eq!(o.url_scheme(), "", "Orca takes no links");
+        // Orca installs its own server on the first connect: nothing to set up or keep in step.
+        assert!(!o.pins_local_version());
+        assert!(!o.reinstalls());
+        assert_eq!(o.port(), None);
+        assert_eq!(o.version_script(), None);
+        assert_eq!(o.stop_script(), None);
+        assert_eq!(o.probe(), None);
+        assert_eq!(o.parse_version("1.4.269"), None);
+        assert_eq!(o.setup_script("ignored"), "");
+        let Open::SshHost(h) = o.open() else {
+            panic!("Orca opens through an SSH host")
+        };
+        assert_eq!((h.notice)("instabox-x"), orca::notice("instabox-x"));
+        assert_eq!(o.platforms(), &[Platform::MacOs, Platform::Windows]);
+        assert_eq!(o.runs_here(), cfg!(any(target_os = "macos", windows)));
+    }
+
+    #[test]
     fn paradev_parts() {
         let p = Ade::Paradev;
         assert_eq!(
@@ -469,7 +533,9 @@ mod tests {
         };
         assert_eq!(h.script, paradev::HOST_SCRIPT);
         assert_eq!(h.setup_link, "superset://settings/hosts");
+        assert_eq!(h.notice, paradev::NOTICE);
         assert_eq!(p.setup_script("ignored"), paradev::HOST_SCRIPT);
+        assert_eq!(p.platforms(), &[Platform::MacOs]);
     }
 
     #[test]
@@ -481,11 +547,15 @@ mod tests {
         assert_eq!(Ade::Paradev.platforms(), &[Platform::MacOs]);
         if cfg!(target_os = "macos") {
             assert!(Ade::T3.runs_here() && Ade::Cmux.runs_here() && Ade::Paradev.runs_here());
-            assert_eq!(local(), vec![Ade::T3, Ade::Cmux, Ade::Paradev]);
+            assert_eq!(local(), vec![Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev]);
         }
         if cfg!(windows) {
             assert!(Ade::T3.runs_here() && !Ade::Cmux.runs_here() && !Ade::Paradev.runs_here());
-            assert_eq!(local(), vec![Ade::T3], "no cmux or Paradev on Windows");
+            assert_eq!(
+                local(),
+                vec![Ade::T3, Ade::Orca],
+                "no cmux or Paradev on Windows"
+            );
         }
     }
 
@@ -510,6 +580,7 @@ mod tests {
                     };
                     assert!((l.link)(&login).starts_with(&scheme), "{a:?}");
                 }
+                Open::SshHost(_) => assert_eq!(a.url_scheme(), "", "{a:?} takes no links"),
                 Open::Host(h) => {
                     assert!(h.setup_link.starts_with(&scheme), "{a:?}");
                     let id = "0123456789abcdef0123456789abcdef";

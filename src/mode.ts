@@ -5,7 +5,7 @@ import type { AppState } from "./types";
 /** Where the mode a user picked is kept on this computer, per instabox login. */
 export const modeKey = (login: string) => `instabox.ade.${login}`;
 
-const MODES: Mode[] = ["instabox", "t3", "cmux", "paradev"];
+const MODES: Mode[] = ["instabox", "t3", "cmux", "orca", "paradev"];
 
 /** The mode `login` picked on this computer; null when they never picked one. */
 export function savedMode(login: string): Mode | null {

@@ -33,6 +33,13 @@
       "shortName": "cmux",
       "version": "0.64.25",
       "downloadUrl": "https://github.com/manaflow-ai/cmux/releases/latest"
+    },
+    {
+      "id": "orca",
+      "name": "Orca",
+      "shortName": "Orca",
+      "version": "1.4.269",
+      "downloadUrl": "https://github.com/stablyai/orca/releases/latest"
     }
   ],
   "sandboxes": [

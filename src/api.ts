@@ -15,15 +15,13 @@ const invoke = <T,>(command: string, args?: Record<string, unknown>): Promise<T>
 /** Thin wrappers over the Tauri commands. Rejections are ErrorView objects. */
 export type Agent = "claude" | "codex";
 export type McpClient = "claudeCode" | "codex";
-/**
- * How a create, connect or open ended. finishSetupInAde: the ADE's own host setup opened with
- * the sandbox's SSH address on the clipboard (Paradev), so the user finishes there.
- */
-export type Opened = "done" | "finishSetupInAde";
 
 export const getState = () => invoke<AppState>("get_state");
 export const onState = (cb: (s: AppState) => void) =>
   isBrowserPreview ? preview().then((p) => p.onPreviewState(cb)) : listen<AppState>("state", (e) => cb(e.payload));
+/** A notice the back end hands the popover after a tray action, such as which Orca host to connect. */
+export const onNotice = (cb: (notice: string) => void) =>
+  isBrowserPreview ? Promise.resolve(() => {}) : listen<string>("notice", (e) => cb(e.payload));
 
 export const signIn = (provider: "github" | "google") => invoke<void>("sign_in", { provider });
 export const signOut = () => invoke<void>("sign_out");
@@ -36,14 +34,14 @@ export const createSandbox = (a: {
   autoSuspendAfterSeconds?: number;
   /** The ADE to set up; none: a plain sandbox. */
   ade?: AdeId;
-}) => invoke<Opened>("create_sandbox", a);
-/** Sets the ADE up on the sandbox, then opens it. */
-export const connectSandbox = (id: string, ade: AdeId) => invoke<Opened>("connect_sandbox", { id, ade });
+}) => invoke<string | null>("create_sandbox", a);
+/** Sets the ADE up on the sandbox, then opens it. Resolves to what the user does next in the ADE, if anything. */
+export const connectSandbox = (id: string, ade: AdeId) => invoke<string | null>("connect_sandbox", { id, ade });
 export const dismissProgress = () => invoke<void>("dismiss_progress");
 /** Looks for every ADE's desktop app on this computer again. */
 export const refreshAdes = () => invoke<void>("refresh_t3");
 /** Opens the sandbox in the ADE; a sandbox without it gets it first. */
-export const openInAde = (id: string, ade: AdeId) => invoke<Opened>("open_in_t3", { id, ade });
+export const openInAde = (id: string, ade: AdeId) => invoke<string | null>("open_in_t3", { id, ade });
 export const pairAgain = (id: string) => invoke<void>("pair_again", { id, ade: "t3" });
 export const pause = (id: string) => invoke<void>("pause", { id });
 export const resume = (id: string) => invoke<void>("resume", { id });

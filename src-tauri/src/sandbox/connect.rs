@@ -1,7 +1,8 @@
 //! Create a sandbox (or take an existing one), set an ADE up on it and mark it connected.
 //! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
-//! prep command, and the app opens its link afterwards. A host ADE (Paradev) is only checked:
-//! once its host runs, the sandbox is marked and gets its link.
+//! prep command, and the app opens its link afterwards. An SSH host ADE (Orca) gets only the
+//! mark, and the app writes its host afterwards. A host ADE (Paradev) is only checked: once
+//! its host runs, the sandbox is marked and gets its link.
 
 use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
@@ -193,7 +194,11 @@ async fn install_and_pair(
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
     if let Open::Link(l) = ade.open() {
-        return prepare(client, ade, l.prep, id, desktop_version, progress).await;
+        return prepare(client, ade, Some(l.prep), id, desktop_version, progress).await;
+    }
+    // An SSH host ADE (Orca) needs nothing on the sandbox: the app writes the host afterwards.
+    if let Open::SshHost(_) = ade.open() {
+        return prepare(client, ade, None, id, desktop_version, progress).await;
     }
     if let Open::Host(h) = ade.open() {
         return check_host(client, ade, h, id, progress).await;
@@ -254,28 +259,31 @@ async fn install_and_pair(
     })
 }
 
-/// Sets a link ADE up: one run of its prep command, then the mark. Nothing is installed, so
-/// there is no version to compare and no link yet: the app makes it with an SSH token.
+/// Sets a link ADE up: one run of its prep command, if it has one, then the mark. Nothing is
+/// installed, so there is no version to compare and no link yet: the app makes it with an SSH
+/// token. An SSH host ADE (Orca) has no prep command: it only gets the mark.
 async fn prepare(
     client: &Client,
     ade: Ade,
-    prep: &str,
+    prep: Option<&str>,
     id: &str,
     desktop_version: &str,
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
     progress(Step::Installing(desktop_version.to_string()));
-    let r = client
-        .exec(
-            id,
-            &ExecRequest {
-                cmd: prep.to_string(),
-                timeout_seconds: Some(PREP_TIMEOUT_SECS),
-            },
-        )
-        .await?;
-    if r.timed_out || r.exit_code != 0 {
-        return Err(setup_failure(ade, &r, PREP_TIMEOUT_SECS));
+    if let Some(prep) = prep {
+        let r = client
+            .exec(
+                id,
+                &ExecRequest {
+                    cmd: prep.to_string(),
+                    timeout_seconds: Some(PREP_TIMEOUT_SECS),
+                },
+            )
+            .await?;
+        if r.timed_out || r.exit_code != 0 {
+            return Err(setup_failure(ade, &r, PREP_TIMEOUT_SECS));
+        }
     }
     mark_connected(client, ade, id).await?;
     progress(Step::Done);
