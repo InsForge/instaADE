@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { connectSandbox, createSandbox, getState, onState, openInAde, toErrorView } from "./api";
+import { connectSandbox, createSandbox, getState, onNotice, onState, openInAde, toErrorView } from "./api";
 import type { Mode } from "./ades";
 import { agentKey } from "./common";
 import type { AgentCache, OnAgentStatus } from "./common";
@@ -46,6 +46,18 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     let gone = false;
     onState(setState).then((u) => (gone ? u() : (off = u)));
     getState().then((s) => setState((cur) => cur ?? s), () => {});
+    return () => {
+      gone = true;
+      off?.();
+    };
+  }, []);
+
+  // A tray action that opened an ADE hands over what to do next there, as the popover's own
+  // actions do.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let gone = false;
+    onNotice(setNotice).then((u) => (gone ? u() : (off = u)));
     return () => {
       gone = true;
       off?.();

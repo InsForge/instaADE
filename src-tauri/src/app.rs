@@ -5448,4 +5448,41 @@ mod tests {
         assert!(hosts.contains("  User ibssh_stored\n"), "{hosts}");
         assert!(requests(&server).await.is_empty(), "no new token");
     }
+
+    // ---- the tray's actions ----
+
+    #[tokio::test]
+    async fn the_tray_open_in_orca_hands_its_notice_to_the_popover() {
+        let (_server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        o.core.refresh(false).await;
+        let got = Mutex::new(Vec::<String>::new());
+        // Open opens the sandbox's own ADE, Orca here.
+        crate::tray::run_action(&o.core, "open", "m1", |n| got.lock().unwrap().push(n)).await;
+        assert_eq!(*got.lock().unwrap(), [ORCA_NOTICE]);
+        assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
+        // Pause and resume have no notice to hand over.
+        for verb in ["pause", "resume", "unknown"] {
+            crate::tray::run_action(&o.core, verb, "m1", |n| got.lock().unwrap().push(n)).await;
+        }
+        assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_tray_open_shows_its_error_and_no_notice() {
+        let (_server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let o = orca_core(&base, OrcaHere::Missing);
+        o.core.refresh(false).await;
+        let got = Mutex::new(Vec::<String>::new());
+        crate::tray::run_action(&o.core, "open", "m1", |n| got.lock().unwrap().push(n)).await;
+        assert!(got.lock().unwrap().is_empty());
+        assert_eq!(
+            o.core.state().error.map(|e| e.message).as_deref(),
+            Some("Orca is not installed. Install it first.")
+        );
+    }
 }

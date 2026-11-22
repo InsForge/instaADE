@@ -10,9 +10,12 @@ const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a), isTauri: () => true }));
 vi.mock("./hero/HeroCube", () => ({ HeroCube: () => null }));
 let emit: (s: AppState) => void = () => {};
+/** Sends a notice the way the back end does after a tray action. */
+let emitNotice: (notice: string) => void = () => {};
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: (_: string, cb: (e: { payload: AppState }) => void) => {
-    emit = (s) => cb({ payload: s });
+  listen: (name: string, cb: (e: { payload: unknown }) => void) => {
+    if (name === "state") emit = (s) => cb({ payload: s });
+    if (name === "notice") emitNotice = (n) => cb({ payload: n });
     return Promise.resolve(() => {});
   },
 }));
@@ -1154,6 +1157,19 @@ test("a new sandbox in Orca mode sets Orca up and says where to connect it", asy
   await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
   expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "orca" }));
   expect((await screen.findByRole("status")).textContent).toBe(ORCA_NEXT);
+});
+
+test("a notice from a tray action shows in the popover like its own", async () => {
+  picked("orca");
+  show({ ades: [t3Ade, orcaAde] }, [{ id: "b", name: "web", ades: ["orca"] }]);
+  await screen.findByText("web");
+  expect(screen.queryByRole("status")).toBeNull();
+  // The tray's Open in Orca ran in the back end.
+  act(() => emitNotice("In Orca, connect instabox-web from the SSH menu, then open /data/home."));
+  expect(screen.getByRole("status").textContent).toBe("In Orca, connect instabox-web from the SSH menu, then open /data/home.");
+  // The next action clears it, as it clears the popover's own notices.
+  await userEvent.click(screen.getByText("web"));
+  expect(screen.queryByRole("status")).toBeNull();
 });
 
 test("an Orca pick holds on Windows too, where the back end lists Orca", async () => {

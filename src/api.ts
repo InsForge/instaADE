@@ -19,6 +19,9 @@ export type McpClient = "claudeCode" | "codex";
 export const getState = () => invoke<AppState>("get_state");
 export const onState = (cb: (s: AppState) => void) =>
   isBrowserPreview ? preview().then((p) => p.onPreviewState(cb)) : listen<AppState>("state", (e) => cb(e.payload));
+/** A notice the back end hands the popover after a tray action, such as which Orca host to connect. */
+export const onNotice = (cb: (notice: string) => void) =>
+  isBrowserPreview ? Promise.resolve(() => {}) : listen<string>("notice", (e) => cb(e.payload));
 
 export const signIn = (provider: "github" | "google") => invoke<void>("sign_in", { provider });
 export const signOut = () => invoke<void>("sign_out");
