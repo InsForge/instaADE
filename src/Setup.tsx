@@ -8,8 +8,9 @@ import google from "./assets/sign-in/google.svg";
 
 /** Sign-in. An ADE is never asked for here: it is offered after sign-in, in the list. */
 export default function Setup({ state, run }: { state: Pick<AppState, "signInCode">; run: Run }) {
+  // Sign-in has no bar: its empty space drags the window. Its text and buttons do not.
   return (
-    <div className="setup">
+    <div className="setup" data-tauri-drag-region>
       <div className="brand-block">
         <div className="sign-in-logo" role="img" aria-label="InstaBox">
           <img className="sign-in-symbol" src={symbol} alt="" />

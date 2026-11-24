@@ -246,6 +246,28 @@ test("a pushed state replaces the screen", async () => {
   expect(await screen.findByText("other")).toBeTruthy();
 });
 
+test("the top bar of every screen drags the window, and not while the ADE menu is open", async () => {
+  const { state } = show({ signedIn: false }, [{}]);
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  expect(popover().querySelector(".setup")?.getAttribute("data-tauri-drag-region")).toBe("true");
+  act(() => emit({ ...state, signedIn: true }));
+  await screen.findByText("dev-1");
+  const bar = () => popover().querySelector("header")?.getAttribute("data-tauri-drag-region");
+  expect(bar()).toBe("deep");
+  await userEvent.click(switcher());
+  expect(bar()).toBeNull();
+  await userEvent.keyboard("{Escape}");
+  expect(bar()).toBe("deep");
+  await userEvent.click(screen.getByText("dev-1"));
+  expect(screen.getByRole("button", { name: "Back to sandboxes" }).closest("header")?.getAttribute("data-tauri-drag-region")).toBe("deep");
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+  expect(screen.getByRole("button", { name: "Back to sandboxes" }).closest("header")?.getAttribute("data-tauri-drag-region")).toBe("deep");
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await userEvent.click(screen.getByRole("button", { name: "New sandbox" }));
+  expect(screen.getByRole("button", { name: "Back to sandboxes" }).closest("header")?.getAttribute("data-tauri-drag-region")).toBe("deep");
+});
+
 // ---- the … menu ----
 
 test("the menu of a running, connected sandbox", async () => {

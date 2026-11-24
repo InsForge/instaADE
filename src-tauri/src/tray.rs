@@ -93,7 +93,7 @@ pub struct TrayMemo(Mutex<Option<Vec<TrayRow>>>);
 #[derive(Default)]
 pub struct HiddenAt(Mutex<Option<Instant>>);
 
-/// A rectangle in logical points.
+/// A rectangle in logical points, or in physical pixels where a function says so.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
     pub x: f64,
@@ -132,6 +132,29 @@ pub fn corner_origin(window: (f64, f64), work: Bounds) -> (f64, f64) {
     )
 }
 
+/// The popover's top-left corner when the macOS menu-bar icon cannot place it: the top-right
+/// corner of the work area, just under the menu bar.
+pub fn top_corner_origin(window: (f64, f64), work: Bounds) -> (f64, f64) {
+    (
+        (work.x + work.w - window.0 - EDGE).max(work.x),
+        work.y + GAP,
+    )
+}
+
+/// Whether the icon can place the popover: it has a size and lies wholly on one of the screens.
+/// Both are in physical pixels, each at the scale of its own screen, so the icon's own screen
+/// compares correctly whatever the scales.
+pub fn icon_on_screen(icon: Bounds, screens: &[Bounds]) -> bool {
+    icon.w > 0.0
+        && icon.h > 0.0
+        && screens.iter().any(|s| {
+            icon.x >= s.x
+                && icon.y >= s.y
+                && icon.x + icon.w <= s.x + s.w
+                && icon.y + icon.h <= s.y + s.h
+        })
+}
+
 /// A click on the icon also takes focus from an open popover, which hides it first. Without
 /// this check the same click would open it again.
 pub fn hid_just_now(last: Option<Instant>, now: Instant) -> bool {
@@ -145,12 +168,34 @@ fn logical_size(window: &WebviewWindow) -> tauri::Result<(f64, f64)> {
     Ok((win.width, win.height))
 }
 
-/// Places the popover by the icon. False when the icon has no place yet.
+/// Places the popover by the icon. False when the icon has no place yet, or a place off every
+/// screen.
 fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<bool> {
     let p = icon.position.to_physical::<f64>(1.0);
     let mut screen = app.monitor_from_point(p.x, p.y)?;
     // On Windows an icon in the hidden icons flyout reports a place off every screen.
     if cfg!(target_os = "macos") {
+        // An icon off every screen opens the popover in the corner instead.
+        let s = icon.size.to_physical::<f64>(1.0);
+        let screens: Vec<Bounds> = app
+            .available_monitors()?
+            .iter()
+            .map(|m| Bounds {
+                x: m.position().x.into(),
+                y: m.position().y.into(),
+                w: m.size().width.into(),
+                h: m.size().height.into(),
+            })
+            .collect();
+        let icon = Bounds {
+            x: p.x,
+            y: p.y,
+            w: s.width,
+            h: s.height,
+        };
+        if !icon_on_screen(icon, &screens) {
+            return Ok(false);
+        }
         screen = screen.or(app.primary_monitor()?);
     }
     let Some(screen) = screen else {
@@ -183,16 +228,28 @@ fn place(app: &AppHandle, window: &WebviewWindow, icon: Rect) -> tauri::Result<b
     Ok(true)
 }
 
+/// Places the popover in a corner of the main screen's work area: the top-right under the macOS
+/// menu bar, the bottom-right by the Windows notification area.
 fn place_in_corner(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()> {
     let Some(screen) = app.primary_monitor()? else {
         return Ok(());
     };
-    // The window's own scale: `set_position` converts the logical point back with it.
-    let scale = window.scale_factor()?;
+    // The scale `set_position` converts the logical point back with: the window's own on
+    // Windows. macOS takes logical points as they are, so it is the screen's own there.
+    let scale = if cfg!(target_os = "macos") {
+        screen.scale_factor()
+    } else {
+        window.scale_factor()?
+    };
+    let corner = if cfg!(target_os = "macos") {
+        top_corner_origin
+    } else {
+        corner_origin
+    };
     let area = screen.work_area();
     let pos = area.position.to_logical::<f64>(scale);
     let size = area.size.to_logical::<f64>(scale);
-    let (x, y) = corner_origin(
+    let (x, y) = corner(
         logical_size(window)?,
         Bounds {
             x: pos.x,
@@ -215,8 +272,8 @@ pub fn show_popover(app: &AppHandle, icon: Option<Rect>) {
     });
     let placed = icon.is_some_and(|icon| place(app, &w, icon).unwrap_or(false));
     // Windows keeps a new tray icon in the hidden icons flyout, where it has no place. On
-    // macOS an icon not laid out yet leaves the window in its last place.
-    if !placed && cfg!(not(target_os = "macos")) {
+    // macOS the icon may not be laid out yet, or a full menu bar may hide it behind the notch.
+    if !placed {
         let _ = place_in_corner(app, &w);
     }
     let _ = w.show();
@@ -555,6 +612,58 @@ mod tests {
         assert_eq!(corner_origin((376.0, 609.0), work), (896.0, 135.0));
         let tiny = Bounds { h: 500.0, ..work };
         assert_eq!(corner_origin((376.0, 609.0), tiny).1, 0.0);
+    }
+
+    #[test]
+    fn without_a_usable_icon_a_mac_popover_sits_under_the_menu_bar_at_the_right() {
+        // The work area starts under the menu bar.
+        let work = Bounds {
+            x: 0.0,
+            y: 37.0,
+            w: 1512.0,
+            h: 908.0,
+        };
+        assert_eq!(top_corner_origin((360.0, 600.0), work), (1144.0, 41.0));
+        // A work area narrower than the popover keeps its left edge on screen.
+        let narrow = Bounds { w: 300.0, ..work };
+        assert_eq!(top_corner_origin((360.0, 600.0), narrow).0, 0.0);
+    }
+
+    #[test]
+    fn an_icon_off_every_screen_cannot_place_the_popover() {
+        // A Retina screen and a 1x screen to its right, in physical pixels.
+        let screens = [
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                w: 2880.0,
+                h: 1800.0,
+            },
+            Bounds {
+                x: 1440.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+        ];
+        let icon = Bounds {
+            x: 2600.0,
+            y: 0.0,
+            w: 48.0,
+            h: 48.0,
+        };
+        assert!(icon_on_screen(icon, &screens));
+        let off = [
+            Bounds { x: -60.0, ..icon },
+            Bounds { y: -48.0, ..icon },
+            Bounds { x: 3400.0, ..icon },
+            Bounds { y: 1800.0, ..icon },
+        ];
+        for icon in off {
+            assert!(!icon_on_screen(icon, &screens), "{icon:?}");
+        }
+        assert!(!icon_on_screen(Bounds { w: 0.0, ..icon }, &screens));
+        assert!(!icon_on_screen(icon, &[]));
     }
 
     #[test]

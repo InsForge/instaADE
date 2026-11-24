@@ -179,7 +179,8 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
   } else if (!needSetup) {
     const title = current.name === "new" ? "New sandbox" : current.name === "settings" ? "Settings" : (sandbox?.name ?? "");
     header = (
-      <header className="top sub">
+      // The bar drags the window, except on its Back button.
+      <header className="top sub" data-tauri-drag-region="deep">
         <button className="icon-btn hd" aria-label="Back to sandboxes" onClick={back}>
           <Back />
         </button>

@@ -43,9 +43,16 @@ export default function MainHeader({ state, mode, switcherOpen, onSwitcherOpenCh
     };
   }, [showHero]);
 
+  // The bar drags the window, except on its buttons. With the ADE menu open, a press on the bar
+  // closes the menu instead.
   return (
     <>
-      <header ref={toolbar} className={`main-hero-toolbar${showHero ? "" : " main-nav-compact"}`} data-stuck={stuck}>
+      <header
+        ref={toolbar}
+        className={`main-hero-toolbar${showHero ? "" : " main-nav-compact"}`}
+        data-stuck={stuck}
+        data-tauri-drag-region={switcherOpen ? undefined : "deep"}
+      >
         <div className="main-wordmark" role="img" aria-label="InstaBox">
           <img className="main-wordmark-symbol" src={symbol} alt="" />
         </div>
