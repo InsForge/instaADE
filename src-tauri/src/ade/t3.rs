@@ -83,9 +83,6 @@ const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
 /// The port `t3 serve` listens on, published for pairing.
 pub const PORT: u16 = 3774;
 
-/// Opens the T3 Code app without a pairing link.
-pub const APP_URL: &str = "t3code://";
-
 pub const PAIR_SCRIPT: &str =
     r#"t3 pair --base-dir "$HOME/.t3-instabox/$(cat /etc/machine-id)" --label 'Instabox'"#;
 pub const VERSION_SCRIPT: &str = "t3 --version 2>/dev/null || true";
@@ -96,7 +93,6 @@ pub const STOP_SCRIPT: &str =
 pub const PAIRING: Pairing = Pairing {
     script: PAIR_SCRIPT,
     port: PORT,
-    app_url: APP_URL,
     code: parse_pair_code,
     link: pairing_link,
 };

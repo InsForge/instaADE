@@ -1706,11 +1706,12 @@ impl Core {
     }
 
     /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
-    /// with it: wake it, sync the ADE, open the app (no setup, no new pairing). A link ADE
-    /// (cmux) on a sandbox marked with it: open its link with an SSH token (the link wakes the
-    /// sandbox). An SSH host ADE (Orca) on a sandbox marked with it: wake it, write its host
-    /// and start the app. A host ADE (Paradev) on a sandbox marked with it: wake it (the app
-    /// does not), then open its link. Anything else goes through the connect flow.
+    /// with it: wake it, sync the ADE, then open a new pairing link (no setup, no mark change),
+    /// so the app gets the sandbox back even when it lost it. A link ADE (cmux) on a sandbox
+    /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
+    /// host ADE (Orca) on a sandbox marked with it: wake it, write its host and start the app.
+    /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
+    /// its link. Anything else goes through the connect flow.
     pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<Notice> {
         let snapshot = self.signed_in_with(|i| {
             // None: the sandbox is marked only with ADEs this build does not know.
@@ -1744,7 +1745,7 @@ impl Core {
                     .map_err(ErrorView::from)?;
                 return self.open_host(ade, id, Some(&link), account).await;
             }
-            let Open::Pair(p) = ade.open() else {
+            let Open::Pair(_) = ade.open() else {
                 return self.open_link(ade, id, account).await;
             };
             sandbox::ensure_running(&client, id)
@@ -1754,7 +1755,11 @@ impl Core {
                 let out = sandbox::sync::sync(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
             }
-            self.open_for(account, p.app_url).map(|()| None)
+            // The port URL stays the same, so the app updates the environment it saved.
+            let link = connect::pair_link(&client, ade, id)
+                .await
+                .map_err(ErrorView::from)?;
+            self.open_for(account, &link).map(|()| None)
         };
         self.act(account, r).await
     }
@@ -3208,7 +3213,6 @@ mod tests {
         for a in ade::ALL {
             match a.open() {
                 Open::Pair(p) => {
-                    assert!(allowed_url(p.app_url), "{a:?}");
                     assert!(allowed_url(&(p.link)("https://x.test", "c")), "{a:?}");
                 }
                 Open::Link(l) => {
@@ -4411,6 +4415,71 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
         assert!(execs.iter().any(|e| e.contains("v=0.1.11")), "T3 setup ran");
+    }
+
+    #[tokio::test]
+    async fn open_in_t3_of_a_connected_sandbox_pairs_again_on_every_open() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        // T3 is set up from here, at the desktop's version. T3 Code may have lost the sandbox
+        // since, so each Open pairs again instead of only bringing T3 Code to the front.
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        for (cmd, stdout) in [
+            ("t3 --version", "t3 v0.1.11\n"),
+            ("t3 pair", "Token: abc123\n"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/exec"))
+                .and(body_string_contains(cmd))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"stdout": stdout, "stderr": "", "exitCode": 0}),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": "https://3774-m1.example.test", "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some("0.1.11".into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        assert!(core.state().sandboxes[0].connected);
+
+        // Open in the popover, then Open in the tray, which names no ADE.
+        assert_eq!(core.open_in_ade("m1", Some(Ade::T3)).await, Ok(None));
+        crate::tray::run_action(&core, "open", "m1", |_| {}).await;
+        let link =
+            "t3code://pair?pairingUrl=https%3A%2F%2F3774-m1.example.test%2Fpair%23token%3Dabc123";
+        assert_eq!(*opened.lock().unwrap(), [link, link]);
+        assert_eq!(core.state().error, None);
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let pairs = execs.iter().filter(|e| e.contains("t3 pair")).count();
+        assert_eq!(pairs, 2, "a new code on each open");
+        assert!(!execs.iter().any(|e| e.contains("v=0.1.11")), "no setup");
+        assert!(
+            !reqs.iter().any(|r| r.method.as_str() == "PATCH"),
+            "no mark change"
+        );
     }
 
     // ---- Paradev ----

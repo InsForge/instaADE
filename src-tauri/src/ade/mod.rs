@@ -118,12 +118,11 @@ pub struct SshLogin<'a> {
 
 /// A pairing. `script` prints a one-time code on the sandbox and `code` reads it; `link`
 /// turns the URL of the published `port` and the code into a link that pairs the desktop
-/// app. A paired sandbox opens with `app_url`.
+/// app.
 #[derive(Debug, Clone, Copy)]
 pub struct Pairing {
     pub script: &'static str,
     pub port: u16,
-    pub app_url: &'static str,
     pub code: fn(&str) -> Option<String>,
     pub link: fn(&str, &str) -> String,
 }
@@ -453,7 +452,6 @@ mod tests {
         let Open::Pair(p) = t3.open() else {
             panic!("T3 pairs")
         };
-        assert_eq!(p.app_url, "t3code://");
         assert_eq!((p.code)("Token: ABCD1234\n").as_deref(), Some("ABCD1234"));
         assert!((p.link)("https://p-1.instabox.sh", "ABCD1234").starts_with("t3code://pair?"));
     }
@@ -565,7 +563,6 @@ mod tests {
             let scheme = format!("{}://", a.url_scheme());
             match a.open() {
                 Open::Pair(p) => {
-                    assert!(p.app_url.starts_with(&scheme), "{a:?}");
                     assert!(
                         (p.link)("https://x.test", "c").starts_with(&scheme),
                         "{a:?}"
