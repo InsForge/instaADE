@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import App from "./App";
-import { openInAde, pause } from "./api";
+import { connectSandbox, getState, openInAde, pause } from "./api";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -57,4 +57,14 @@ test("preview shows every ADE: all four in the switcher, Orca and Paradev on a s
   await userEvent.click(screen.getByRole("button", { name: /Switch ADE/ }));
   const names = screen.getAllByRole("menuitemradio").map((item) => item.querySelector(".strong")?.textContent);
   expect(names).toEqual(["InstaBox", "T3 Code", "cmux", "Orca", "Paradev"]);
+});
+
+test("preview Install Paradev hands the setup over and leaves the sandbox's mark as it was", async () => {
+  const before = (await getState()).sandboxes.find((s) => s.name === "api-server")!;
+  expect(before.ades).toEqual(["t3", "cmux"]);
+  await expect(connectSandbox(before.id, "paradev")).resolves.toBe(
+    "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.",
+  );
+  const after = (await getState()).sandboxes.find((s) => s.id === before.id)!;
+  expect(after.ades).toEqual(["t3", "cmux"]);
 });
