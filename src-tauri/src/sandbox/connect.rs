@@ -383,7 +383,7 @@ fn remote_is_newer(desktop: &str, remote: Option<&str>) -> bool {
 
 /// A fresh pairing link: one run of the ADE's pair script, then the published port. The
 /// sandbox must be running.
-async fn pair_link(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
+pub async fn pair_link(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
     let Open::Pair(p) = ade.open() else {
         return Err(SandboxError::Setup {
             ade,

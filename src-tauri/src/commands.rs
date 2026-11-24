@@ -82,10 +82,10 @@ pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
     core.inner().clone().refresh_ades().await
 }
 
-/// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken and synced),
-/// cmux (its link, with an SSH token), Orca (its SSH host, then the app; the answer says what
-/// to do next in Orca) or Paradev (the sandbox is woken, then its host opens). A sandbox
-/// without the ADE gets it first.
+/// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken, synced and
+/// paired again), cmux (its link, with an SSH token), Orca (its SSH host, then the app; the
+/// answer says what to do next in Orca) or Paradev (the sandbox is woken, then its host
+/// opens). A sandbox without the ADE gets it first.
 #[tauri::command]
 pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Notice> {
     core.inner().clone().open_in_ade(&id, ade).await
