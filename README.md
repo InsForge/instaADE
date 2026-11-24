@@ -5,7 +5,7 @@
 
   <h1>InstaBox</h1>
 
-  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.</p>
+  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.<br>Works with T3 Code, cmux, Orca and Paradev.</p>
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
@@ -15,14 +15,15 @@
 </div>
 
 <p align="center">
-  <img src="docs/images/list.png" alt="Sandbox list" width="250">
-  <img src="docs/images/menu.png" alt="Sandbox actions" width="250">
-  <img src="docs/images/details.png" alt="Sandbox details" width="250">
+  <img src="docs/images/list.png" alt="Sandbox list in cmux mode" width="200">
+  <img src="docs/images/switcher.png" alt="ADE switcher with T3 Code, cmux, Orca and Paradev" width="200">
+  <img src="docs/images/menu.png" alt="Sandbox actions in Paradev mode" width="200">
+  <img src="docs/images/details.png" alt="Sandbox details with T3 Code and cmux connected, and Orca and Paradev to add" width="200">
 </p>
 
 ## Getting Started
 
-You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need a supported one: the [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) desktop app, [cmux](https://github.com/manaflow-ai/cmux/releases/latest) or [Paradev](https://github.com/paradevai/paradev/releases/latest) on macOS, or [Orca](https://github.com/stablyai/orca/releases/latest).
+You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need its desktop app: [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) or [Orca](https://github.com/stablyai/orca/releases/latest) on macOS or Windows, [cmux](https://github.com/manaflow-ai/cmux/releases/latest) or [Paradev](https://github.com/paradevai/paradev/releases/latest) on macOS.
 
 1. Download the latest release from [Releases](https://github.com/InsForge/instabox-bridge/releases/latest):
    - macOS: the `.dmg`, `aarch64` for Apple silicon, `x64` for Intel.
@@ -30,23 +31,32 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 2. Install it:
    - macOS: drag InstaBox to Applications and open it. It is signed and notarized, so it opens normally.
    - Windows: run the installer. It is not signed yet, so Windows SmartScreen asks once: click **More info**, then **Run anyway**.
-3. Click the InstaBox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow).
+3. Click the InstaBox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
 4. Sign in with GitHub or Google.
-5. To open sandboxes in an ADE, pick it in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaBox before, it starts in T3 Code.
+5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca or Paradev in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaBox before, it starts in T3 Code.
 6. Click **New sandbox**, pick a size, then click **Create sandbox**.
-7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaBox names from the SSH menu. In Paradev, click **Set up a host over SSH** and paste the SSH address InstaBox copied.
+7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaBox names from the SSH menu. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaBox copied, then click **Install Paradev** again.
 
 ## Features
 
 - Create a sandbox or connect one you already have
-- Pick an ADE at the top: each sandbox gets **Open in** it, or **Install** it when the sandbox does not have it yet
-- Set up your ADE on the sandbox and pair it with the app on your computer
+- Pick T3 Code, cmux, Orca or Paradev at the top: each sandbox gets **Open in** it, or **Install** it when the sandbox does not have it yet
+- The popover takes on the look of the ADE you pick
+- Set up the ADE on the sandbox the way it needs (see [Supported ADEs](#supported-ades))
+- Use several ADEs on one sandbox: its details list each one with **Open**, and offer the other ADEs on your computer
 - Pause, resume, resize and set auto sleep
 - Copy the SSH command or open it in a terminal
 - Sign in to Claude Code or Codex on the sandbox
 - Starts at login (turn it off in Settings)
 
 ## Supported ADEs
+
+| ADE | Desktop app on | How InstaBox opens a sandbox in it |
+| --- | --- | --- |
+| [T3 Code](#t3-code) | macOS, Windows | Installs T3 on the sandbox and pairs it with the app |
+| [cmux](#cmux-macos) | macOS | Opens a `cmux://ssh` link, and cmux connects over SSH |
+| [Orca](#orca) | macOS, Windows | Adds the sandbox as an SSH host that Orca imports |
+| [Paradev](#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
 
 ### T3 Code
 
@@ -100,6 +110,11 @@ A sandbox can have several ADEs. Its metadata marks them with two keys:
 - `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating it as connected. Else it is the first id of the list.
 
 InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key, such as one made in plain InstaBox, has no ADE, so each ADE offers Install on it. Only an action that must pick an ADE when none was named uses T3 for it.
+
+## Troubleshooting
+
+- **No InstaBox icon in the macOS menu bar.** When the menu bar is crowded, the icon can hide behind the notch. Hold Command and drag the icon to the right to bring it back. You can also open InstaBox again from Applications, which shows the popover.
+- **The popover is in the way.** Drag it by its top bar.
 
 ## Roadmap
 
