@@ -1,5 +1,5 @@
 import fixture from "./fixtures/state.json";
-import type { AdeId, AppState, SandboxView } from "./types";
+import type { AdeId, AdeView, AppState, SandboxView } from "./types";
 
 // In-memory sample data only. This module never calls the native or cloud APIs.
 let state: AppState = {
@@ -9,6 +9,11 @@ let state: AppState = {
   error: null,
   update: null,
   startAtLogin: false,
+  // Every ADE a Mac can have. The shared fixture has no Paradev.
+  ades: [
+    ...fixture.ades,
+    { id: "paradev", name: "Paradev", shortName: "Paradev", version: "2.0.11", downloadUrl: "https://github.com/paradevai/paradev/releases/latest" },
+  ] as AdeView[],
   sandboxes: [
     ...fixture.sandboxes.slice(0, 3).map((s, i) => ({
       ...s,
@@ -16,7 +21,7 @@ let state: AppState = {
     })),
     ...[
       { id: "preview-api", name: "api-server", state: "running", connected: true, ades: ["t3", "cmux"] },
-      { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false, ades: [] },
+      { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false, ades: ["orca", "paradev"] },
       { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux"] },
       { id: "preview-staging", name: "staging", state: "paused", connected: true, ades: ["t3"] },
     ].map((machine) => ({
@@ -57,7 +62,12 @@ export async function invokePreview(command: string, args: Record<string, unknow
     case "connect_sandbox": {
       const sandbox = state.sandboxes.find((s) => s.id === args.id);
       const ade = args.ade;
-      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca" && ade !== "paradev")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      // Paradev sets the host up itself, so the app hands the setup over and marks nothing yet.
+      if (ade === "paradev") {
+        result = "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";
+        break;
+      }
       patchSandbox({ ades: [...new Set<AdeId>([...sandbox.ades, ade])],
         ...(ade === "t3" ? { connected: true, t3Version: state.t3 } : {}) });
       if (ade === "orca") result = `In Orca, connect instabox-${sandbox.name} from the SSH menu, then open /data/home.`;

@@ -47,3 +47,14 @@ test("preview update and connect actions preserve other connected ADEs", async (
   expect(design.getByRole("img", { name: "cmux" })).toBeTruthy();
   expect(design.getByRole("img", { name: "T3 Code" })).toBeTruthy();
 });
+
+test("preview shows every ADE: all four in the switcher, Orca and Paradev on a sample sandbox", async () => {
+  render(<App />);
+  await screen.findByText("mobile-app");
+  const mobile = within(screen.getByText("mobile-app").closest("li")!);
+  expect(mobile.getByRole("img", { name: "Orca" })).toBeTruthy();
+  expect(mobile.getByRole("img", { name: "Paradev" })).toBeTruthy();
+  await userEvent.click(screen.getByRole("button", { name: /Switch ADE/ }));
+  const names = screen.getAllByRole("menuitemradio").map((item) => item.querySelector(".strong")?.textContent);
+  expect(names).toEqual(["InstaBox", "T3 Code", "cmux", "Orca", "Paradev"]);
+});
