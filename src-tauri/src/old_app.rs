@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 /// The old app's name.
-pub const OLD_NAME: &str = "Instabox";
+const OLD_NAME: &str = "Instabox";
 /// The old app's bundle.
 const OLD_BUNDLE: &str = "Instabox.app";
 /// The identifier the old app shares with this one.

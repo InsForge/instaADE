@@ -76,7 +76,7 @@ An ADE whose app gets an SSH token (in a link, a host or the clipboard) must che
 InstaADE was called Instabox until v0.1.6. The bundle identifier `sh.instabox.bridge`, the executable `instabox-bridge`, the sandbox mark and the keychain entries keep that name, so an update keeps the sign-in and the sandboxes. On macOS, installing InstaADE from its `.dmg` leaves `Instabox.app` next to it.
 
 - At launch, a release build with that identifier looks for `Instabox.app` in `/Applications` and `~/Applications`. It counts only a folder, not a link, whose `Info.plist` has the identifier and that the app does not run from. The popover then offers **Move to Trash** and **Not now**. Not now lasts until the next launch.
-- **Move to Trash** checks each copy again and moves nothing while one runs. When a copy moved and the app starts at login, it then turns the login item off and on, so the item names InstaADE and not the copy in the Trash.
+- **Move to Trash** checks each copy again and moves nothing while one runs. When the app starts at login, it turns the login item off before the move, while the old copy can still be recognized, and on again after it, so the item names InstaADE and not the copy in the Trash.
 - The LaunchAgent that v0.1.5 and earlier wrote keeps its label, `Instabox` (`login::agent_label`), so it still moves to SMAppService on macOS 13 and later, and stays the login item before macOS 13.
 - Only one copy runs at a time, since both have the same identifier. While Instabox runs, opening InstaADE shows Instabox's popover. Quit Instabox first.
 
