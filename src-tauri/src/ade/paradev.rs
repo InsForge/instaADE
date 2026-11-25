@@ -2,7 +2,7 @@
 //! hosts. The app sets a host up once over SSH: it installs its CLI and a `superset-host` user
 //! service on the sandbox, which then connects out to Paradev's relay. After that a link opens a
 //! new workspace on the host by its host id. Paradev has no link or CLI that adds a host from
-//! an SSH address without the user, so InstaBox copies the address and opens the app's host
+//! an SSH address without the user, so InstaADE copies the address and opens the app's host
 //! settings, and the user finishes there.
 //! On this computer: find the real Paradev app (its identifier and its signature, not only its
 //! name) and read its version from its bundle.
@@ -141,7 +141,7 @@ echo "machineid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-i
 /// Opens Paradev's host settings, where the user clicks Set up a host over SSH.
 pub const SETUP_LINK: &str = "superset://settings/hosts";
 
-/// What the user does next, once InstaBox copied the address and opened the host settings.
+/// What the user does next, once InstaADE copied the address and opened the host settings.
 pub const NOTICE: &str =
     "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";
 

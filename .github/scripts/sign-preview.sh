@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Signs one Instabox Preview build. It checks that a zipped app from Preview build is
-# Instabox Preview for one architecture, signs it with the Developer ID certificate,
+# Signs one InstaADE Preview build. It checks that a zipped app from Preview build is
+# InstaADE Preview for one architecture, signs it with the Developer ID certificate,
 # notarizes and staples it, and wraps it in a signed .dmg. It never runs the app.
 #
 # Usage: sign-preview.sh <preview.zip> <arm64|x86_64> <out.dmg>
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 ID="sh.instabox.bridge.preview"
-NAME="Instabox Preview"
+NAME="InstaADE Preview"
 
 zip=$1
 arch=$2

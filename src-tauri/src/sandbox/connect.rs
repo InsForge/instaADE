@@ -303,7 +303,7 @@ async fn prepare(
 
 /// Checks a host ADE on the running sandbox, with one exec. When its host runs, the sandbox
 /// gets the ADE in its mark and the link that opens it. Else nothing changes, and the user sets
-/// the host up in the app (`link` is None). InstaBox installs nothing for it either way.
+/// the host up in the app (`link` is None). InstaADE installs nothing for it either way.
 async fn check_host(
     client: &Client,
     ade: Ade,

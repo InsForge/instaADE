@@ -18,6 +18,17 @@ pub const DEFAULT_MARKER: &str = "start-at-login-default";
 /// popover. SMAppService cannot pass arguments: see [`at_login`].
 pub const AT_LOGIN: &str = "--at-login";
 
+/// The label of the autostart plugin's LaunchAgent on macOS, which is also its file name. It
+/// is the app's name from before InstaADE, so the LaunchAgent older releases wrote carries
+/// over: before macOS 13 the app keeps it, and from 13 on it moves to SMAppService.
+pub fn agent_label(identifier: &str) -> &'static str {
+    if identifier.ends_with(".preview") {
+        "Instabox Preview"
+    } else {
+        "Instabox"
+    }
+}
+
 // Four-character codes from the Apple event headers: AppleEvents.h and AERegistry.h.
 const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt"); // kCoreEventClass
 const OPEN_APPLICATION: u32 = u32::from_be_bytes(*b"oapp"); // kAEOpenApplication
@@ -295,7 +306,7 @@ mod macos {
 
     use super::{
         AT_LOGIN, ERROR_ALREADY_REGISTERED, ERROR_LAUNCH_DENIED_BY_USER, LaunchEvent, Legacy,
-        Migration, PROP_DATA, ServiceError, TurnOn, has_flag, may_unload, migration,
+        Migration, PROP_DATA, ServiceError, TurnOn, agent_label, has_flag, may_unload, migration,
         removes_legacy, turn_on,
     };
 
@@ -332,7 +343,7 @@ mod macos {
     /// The app as its own login item, with the LaunchAgent an older build may have left.
     pub struct Item {
         service: Retained<SMAppService>,
-        /// The app's name: the LaunchAgent's label and file name.
+        /// The LaunchAgent's label and file name (see `agent_label`).
         label: String,
         /// The app's bundle identifier.
         identifier: String,
@@ -346,7 +357,7 @@ mod macos {
             }
             Some(Self {
                 service: unsafe { SMAppService::mainAppService() },
-                label: app.package_info().name.clone(),
+                label: agent_label(&app.config().identifier).to_string(),
                 identifier: app.config().identifier.clone(),
             })
         }
@@ -475,7 +486,7 @@ mod macos {
     ];
 
     /// Whether `plist` is the LaunchAgent the autostart plugin wrote for this app. Any other
-    /// file is never touched. `label`: the app's name. `exe`: this process's executable.
+    /// file is never touched. `label`: its label. `exe`: this process's executable.
     /// `identifier`: this app's bundle identifier.
     ///
     /// The plist must have exactly the plugin's shape, with `ProgramArguments` of
@@ -683,6 +694,16 @@ mod macos {
             let exe = installed(dir.path());
             let copy = bundle(&dir.path().join("copy"), "Instabox 2", Some(ID));
             assert!(ours(&agent("Instabox", &copy), &exe));
+        }
+
+        #[test]
+        fn the_agent_of_the_app_before_its_rename_is_ours() {
+            // Instabox.app v0.1.5 or earlier wrote it, and this app runs as InstaADE.app.
+            let dir = tempfile::tempdir().unwrap();
+            let apps = dir.path().join("Applications");
+            let exe = bundle(&apps, "InstaADE", Some(ID));
+            let old = bundle(&apps, "Instabox", Some(ID));
+            assert!(ours(&agent("Instabox", &old), &exe));
         }
 
         #[test]
@@ -971,6 +992,16 @@ mod tests {
             None
         );
         assert_eq!(quoted_run_command(exe, exe), Some(format!("\"{exe}\"")));
+    }
+
+    #[test]
+    fn the_launch_agent_keeps_the_label_older_releases_gave_it() {
+        // v0.1.5 and earlier wrote ~/Library/LaunchAgents/<productName>.plist.
+        assert_eq!(agent_label("sh.instabox.bridge"), "Instabox");
+        assert_eq!(
+            agent_label("sh.instabox.bridge.preview"),
+            "Instabox Preview"
+        );
     }
 
     #[test]

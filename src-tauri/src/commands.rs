@@ -14,6 +14,7 @@ use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
 use crate::login;
+use crate::old_app;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -183,6 +184,49 @@ pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()>
     }
     core.set_start_at_login(on);
     core.settle(Ok(()))
+}
+
+/// Move to Trash on the notice about the old app. When the app starts at login, its login item
+/// may still name the old copy. So it is turned off while that copy is there to be recognized
+/// (a LaunchAgent counts as ours by its bundle), and on again after the move, for this app,
+/// whatever the move came to.
+#[tauri::command]
+pub fn trash_old_app(app: AppHandle, core: Shared<'_>) -> Res<()> {
+    let Some(old) = core.state().old_app else {
+        return core.settle(Ok(()));
+    };
+    let on = login::is_enabled(&app);
+    if on {
+        // When this fails, turning it on again below still says how it ended.
+        let _ = login::disable(&app);
+    }
+    let moved = old_app::trash_offered(&old, &app.config().identifier);
+    let again = if on { login_again(&app) } else { Ok(()) };
+    core.set_start_at_login(login::is_enabled(&app));
+    if moved.is_ok() {
+        core.set_old_app(None);
+    }
+    core.settle(moved.map_err(ErrorView::other).and(again))
+}
+
+/// Turns start at login on again after Move to Trash, so the login item names this app.
+fn login_again(app: &AppHandle) -> Res<()> {
+    let name = &app.package_info().name;
+    match login::enable(app) {
+        login::TurnOn::On => Ok(()),
+        login::TurnOn::Approval => Err(ErrorView::other(format!(
+            "To start {name} at login again, allow it in System Settings, under Login Items."
+        ))),
+        login::TurnOn::Failed(e) => Err(ErrorView::other(format!(
+            "{name} could not start at login again: {e}. Turn it on in Settings."
+        ))),
+    }
+}
+
+/// Not now on the notice about the old app: it is not offered again until the next launch.
+#[tauri::command]
+pub fn dismiss_old_app(core: Shared<'_>) {
+    core.set_old_app(None);
 }
 
 #[tauri::command]

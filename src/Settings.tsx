@@ -16,7 +16,7 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
       <div className="stack">
         {update && (
           <div className="update">
-            <span className="small soft">A new version of InstaBox is ready.</span>
+            <span className="small soft">A new version of InstaADE is ready.</span>
             <button className="btn primary" onClick={() => openExternal(update.url)}>
               Download
             </button>
