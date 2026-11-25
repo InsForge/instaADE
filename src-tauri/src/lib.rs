@@ -125,17 +125,21 @@ pub fn run() {
                 }
                 login::Startup::TurnOn => {
                     // Marked only once the item is on, so a failed attempt is tried again next
-                    // launch. A default that cannot be marked is undone, so it never turns the
-                    // item back on after the person turned it off.
+                    // launch. A person who declined the app's login item before (macOS 13 and
+                    // later) keeps that choice: marked too, and System Settings stays closed.
+                    // A default that cannot be marked is undone, so it never turns the item
+                    // back on after the person turned it off.
                     if let Some(m) = marker.as_deref() {
                         match login::enable(&handle) {
-                            Ok(()) => {
+                            login::TurnOn::On | login::TurnOn::Approval => {
                                 if let Err(e) = login::mark(m) {
                                     eprintln!("start at login: could not save the default: {e}");
                                     let _ = login::disable(&handle);
                                 }
                             }
-                            Err(e) => eprintln!("start at login: could not turn it on: {e}"),
+                            login::TurnOn::Failed(e) => {
+                                eprintln!("start at login: could not turn it on: {e}")
+                            }
                         }
                     }
                 }

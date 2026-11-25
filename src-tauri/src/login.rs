@@ -194,6 +194,63 @@ pub fn may_unload(flag: bool, xpc_service_name: Option<&str>, label: &str) -> bo
     !flag && xpc_service_name != Some(label)
 }
 
+// SMAppService error codes, from the enum at SMErrors.h:58-70 in the macOS SDK, which starts
+// at kSMErrorInternalFailure = 2. LaunchDeniedByUser: "The user declined to allow the job to
+// launch".
+const ERROR_LAUNCH_DENIED_BY_USER: isize = 11; // kSMErrorLaunchDeniedByUser, SMErrors.h:68
+const ERROR_ALREADY_REGISTERED: isize = 12; // kSMErrorAlreadyRegistered, SMErrors.h:69
+
+/// An error from SMAppService: its code and message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceError {
+    pub code: isize,
+    pub message: String,
+}
+
+/// What turning start at login on came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOn {
+    /// It is on.
+    On,
+    /// The person declined the app's login item before. Only they can allow it again, in
+    /// Login Items in System Settings.
+    Approval,
+    /// It failed with this message.
+    Failed(String),
+}
+
+/// Turns the SMAppService item on. `needs_approval`: the status is RequiresApproval.
+/// `register`: registers the app. Registering is not tried while macOS waits for the
+/// person's approval, and kSMErrorLaunchDeniedByUser means the same thing.
+pub fn turn_on(
+    needs_approval: impl Fn() -> bool,
+    register: impl FnOnce() -> Result<(), ServiceError>,
+) -> TurnOn {
+    if needs_approval() {
+        return TurnOn::Approval;
+    }
+    match register() {
+        Ok(()) => {}
+        Err(e) if e.code == ERROR_ALREADY_REGISTERED => {}
+        Err(e) if e.code == ERROR_LAUNCH_DENIED_BY_USER => return TurnOn::Approval,
+        Err(e) => return TurnOn::Failed(e.message),
+    }
+    // Registered, but macOS may still wait for the person.
+    if needs_approval() {
+        TurnOn::Approval
+    } else {
+        TurnOn::On
+    }
+}
+
+/// Whether the migration removes the LaunchAgent after trying to register the app. Not when
+/// registering failed: the LaunchAgent still starts the app, and the next launch tries again.
+/// When the person declined the app's login item, they turned start at login off, as for
+/// [`Legacy::Off`].
+pub fn removes_legacy(outcome: &TurnOn) -> bool {
+    !matches!(outcome, TurnOn::Failed(_))
+}
+
 /// Whether the arguments hold [`AT_LOGIN`].
 fn has_flag() -> bool {
     std::env::args().any(|a| a == AT_LOGIN)
@@ -218,13 +275,16 @@ pub fn is_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
-/// Turns start at login on.
-pub fn enable<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+/// Turns start at login on. Only the SMAppService item can come to [`TurnOn::Approval`].
+pub fn enable<R: Runtime>(app: &AppHandle<R>) -> TurnOn {
     #[cfg(target_os = "macos")]
     if let Some(item) = macos::Item::new(app) {
         return item.enable();
     }
-    app.autolaunch().enable().map_err(|e| e.to_string())
+    match app.autolaunch().enable() {
+        Ok(()) => TurnOn::On,
+        Err(e) => TurnOn::Failed(e.to_string()),
+    }
 }
 
 /// Turns start at login off.
@@ -243,17 +303,6 @@ pub fn rewrite<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         return Ok(());
     }
     app.autolaunch().enable().map_err(|e| e.to_string())
-}
-
-/// Whether the app is its own login item but macOS waits for the person to allow it in
-/// System Settings. Always false where the autostart plugin's item is used.
-pub fn needs_approval<R: Runtime>(app: &AppHandle<R>) -> bool {
-    #[cfg(target_os = "macos")]
-    if let Some(item) = macos::Item::new(app) {
-        return item.needs_approval();
-    }
-    let _ = app;
-    false
 }
 
 /// Opens Login Items in System Settings, on macOS 13 and later.
@@ -325,12 +374,19 @@ mod macos {
     use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSString, NSURL};
     use objc2_service_management::{
         SMAppService, SMAppServiceStatus, kSMErrorAlreadyRegistered, kSMErrorJobNotFound,
+        kSMErrorLaunchDeniedByUser,
     };
     use tauri::{AppHandle, Runtime};
 
     use super::{
-        LaunchEvent, Legacy, Migration, PROP_DATA, has_flag, is_our_agent, may_unload, migration,
+        ERROR_ALREADY_REGISTERED, ERROR_LAUNCH_DENIED_BY_USER, LaunchEvent, Legacy, Migration,
+        PROP_DATA, ServiceError, TurnOn, has_flag, is_our_agent, may_unload, migration,
+        removes_legacy, turn_on,
     };
+
+    // The codes `turn_on` checks are the framework's.
+    const _: () = assert!(ERROR_LAUNCH_DENIED_BY_USER == kSMErrorLaunchDeniedByUser as isize);
+    const _: () = assert!(ERROR_ALREADY_REGISTERED == kSMErrorAlreadyRegistered as isize);
 
     /// The Apple event macOS launched the app with, while it is current.
     pub fn launch_event() -> Option<LaunchEvent> {
@@ -389,15 +445,21 @@ mod macos {
             self.status() == SMAppServiceStatus::Enabled || self.legacy() == Legacy::On
         }
 
-        pub fn needs_approval(&self) -> bool {
+        fn needs_approval(&self) -> bool {
             self.status() == SMAppServiceStatus::RequiresApproval
         }
 
-        pub fn enable(&self) -> Result<(), String> {
-            self.register()?;
-            // One login item only: a LaunchAgent left too would start the app twice.
-            self.remove_legacy();
-            Ok(())
+        fn turn_on(&self) -> TurnOn {
+            turn_on(|| self.needs_approval(), || self.register())
+        }
+
+        pub fn enable(&self) -> TurnOn {
+            let outcome = self.turn_on();
+            if outcome == TurnOn::On {
+                // One login item only: a LaunchAgent left too would start the app twice.
+                self.remove_legacy();
+            }
+            outcome
         }
 
         pub fn disable(&self) -> Result<(), String> {
@@ -418,27 +480,28 @@ mod macos {
             let registered = self.status() == SMAppServiceStatus::Enabled;
             match migration(release, self.legacy(), registered) {
                 Migration::Nothing => {}
-                Migration::Register => match self.register() {
-                    Ok(()) => self.remove_legacy(),
-                    // The LaunchAgent stays, so the app still starts at login; the next
-                    // launch tries again.
-                    Err(e) => eprintln!("start at login: could not move the LaunchAgent: {e}"),
-                },
+                Migration::Register => {
+                    // No System Settings here: the person did not ask for anything.
+                    let outcome = self.turn_on();
+                    if removes_legacy(&outcome) {
+                        self.remove_legacy();
+                    } else if let TurnOn::Failed(e) = outcome {
+                        eprintln!("start at login: could not move the LaunchAgent: {e}");
+                    }
+                }
                 Migration::Remove => self.remove_legacy(),
             }
         }
 
-        /// Registers the app. Already registered counts as done.
-        fn register(&self) -> Result<(), String> {
+        /// Registers the app, unless it is already on.
+        fn register(&self) -> Result<(), ServiceError> {
             if self.status() == SMAppServiceStatus::Enabled {
                 return Ok(());
             }
-            match unsafe { self.service.registerAndReturnError() } {
-                Err(e) if e.code() != kSMErrorAlreadyRegistered as isize => {
-                    Err(e.localizedDescription().to_string())
-                }
-                _ => Ok(()),
-            }
+            unsafe { self.service.registerAndReturnError() }.map_err(|e| ServiceError {
+                code: e.code(),
+                message: e.localizedDescription().to_string(),
+            })
         }
 
         /// `~/Library/LaunchAgents/<label>.plist`, the file the autostart plugin writes.
@@ -604,6 +667,60 @@ mod tests {
             prop: Some(LAUNCHED_AS_LOGIN_ITEM),
         };
         assert!(!at_login(false, Some(other_class)));
+    }
+
+    fn service_error(code: isize) -> ServiceError {
+        ServiceError {
+            code,
+            message: format!("error {code}"),
+        }
+    }
+
+    #[test]
+    fn an_item_waiting_for_approval_goes_to_system_settings_without_registering() {
+        let outcome = turn_on(|| true, || panic!("registered while waiting for approval"));
+        assert_eq!(outcome, TurnOn::Approval);
+    }
+
+    #[test]
+    fn a_launch_denied_by_the_user_goes_to_system_settings() {
+        let outcome = turn_on(|| false, || Err(service_error(ERROR_LAUNCH_DENIED_BY_USER)));
+        assert_eq!(outcome, TurnOn::Approval);
+    }
+
+    #[test]
+    fn a_registered_item_is_on() {
+        assert_eq!(turn_on(|| false, || Ok(())), TurnOn::On);
+        // Already registered counts as done.
+        let already = turn_on(|| false, || Err(service_error(ERROR_ALREADY_REGISTERED)));
+        assert_eq!(already, TurnOn::On);
+    }
+
+    #[test]
+    fn a_registered_item_that_still_waits_for_approval_goes_to_system_settings() {
+        // The status is read before and after registering.
+        let reads = std::cell::Cell::new(0);
+        let needs_approval = || {
+            reads.set(reads.get() + 1);
+            reads.get() > 1
+        };
+        assert_eq!(turn_on(needs_approval, || Ok(())), TurnOn::Approval);
+    }
+
+    #[test]
+    fn another_register_error_fails_with_its_message() {
+        // kSMErrorInvalidSignature.
+        let outcome = turn_on(|| false, || Err(service_error(3)));
+        assert_eq!(outcome, TurnOn::Failed("error 3".into()));
+    }
+
+    #[test]
+    fn the_launch_agent_goes_unless_registering_failed() {
+        assert!(removes_legacy(&TurnOn::On));
+        // The person declined the app's login item: off, as for a LaunchAgent turned off.
+        assert!(removes_legacy(&TurnOn::Approval));
+        // It still starts the app at login; the next launch tries again.
+        assert!(!removes_legacy(&TurnOn::Failed("error 3".into())));
     }
 
     #[test]

@@ -161,27 +161,25 @@ pub async fn add_mcp(core: Shared<'_>, client: String) -> Res<()> {
 
 #[tauri::command]
 pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()> {
-    let r = if on {
-        login::enable(&app)
-    } else {
-        login::disable(&app)
-    };
-    if let Err(e) = r {
-        return core.settle(Err(ErrorView::other(e)));
-    }
-    #[cfg(windows)]
     if on {
+        match login::enable(&app) {
+            login::TurnOn::On => {}
+            // macOS 13 and later: the person declined the app's login item before. Only they
+            // can allow it again, in System Settings.
+            login::TurnOn::Approval => {
+                login::open_login_items();
+                core.set_start_at_login(false);
+                return core.settle(Err(ErrorView::other(format!(
+                    "Allow {} in System Settings, under Login Items.",
+                    app.package_info().name
+                ))));
+            }
+            login::TurnOn::Failed(e) => return core.settle(Err(ErrorView::other(e))),
+        }
+        #[cfg(windows)]
         login::quote_windows_run_entry(&app.package_info().name);
-    }
-    // macOS 13 and later: registered, but the person turned the app off in System Settings
-    // before. Only they can allow it again there.
-    if on && login::needs_approval(&app) {
-        login::open_login_items();
-        core.set_start_at_login(false);
-        return core.settle(Err(ErrorView::other(format!(
-            "Allow {} in System Settings, under Login Items.",
-            app.package_info().name
-        ))));
+    } else if let Err(e) = login::disable(&app) {
+        return core.settle(Err(ErrorView::other(e)));
     }
     core.set_start_at_login(on);
     core.settle(Ok(()))
