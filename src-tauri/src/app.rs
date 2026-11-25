@@ -4685,6 +4685,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_still_pairs_without_dpop_when_the_refresh_fails() {
+        // T3 Code 0.1.10, at the sandbox's version and behind it: a bearer pairing.
+        for found in ["t3 v0.1.10\n", "t3 v0.1.12\n"] {
+            let (core, r, opened, execs, _server) =
+                open_after_refresh("0.1.10", found, 1, "T3 server did not start").await;
+            assert_eq!(r, Ok(None), "{found}");
+            assert_eq!(opened.len(), 1, "{found}");
+            assert!(paired(&execs), "{found}");
+            assert_eq!(core.state().error, None, "{found}");
+        }
+    }
+
+    #[tokio::test]
     async fn open_still_pairs_a_busy_t3_without_dpop() {
         // T3 Code 0.1.10 pairs with a bearer token, which the old setup takes.
         let (core, r, opened, execs, _server) =

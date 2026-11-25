@@ -505,6 +505,15 @@ mod tests {
         exec_mock(&server, REFRESH, "", BUSY, 3, 1).await;
         let (out, pairing) = before_pairing(&server, "0.1.10").await;
         assert_eq!((out.unwrap().decision, pairing), (Decision::Defer, Ok(())));
+        // A failed refresh where only one side uses DPoP: the sync fails, the pairing does not.
+        for (found, desktop) in [("t3 v0.1.10\n", "0.1.10"), ("t3 v0.1.12\n", "0.1.10")] {
+            let server = MockServer::start().await;
+            exec_mock(&server, VERSION, found, "", 0, 1).await;
+            exec_mock(&server, REFRESH, "", "T3 server did not start", 1, 1).await;
+            let (out, pairing) = before_pairing(&server, desktop).await;
+            assert!(out.is_err(), "{found}");
+            assert_eq!(pairing, Ok(()), "{found}");
+        }
         // A refresh that finished.
         let server = MockServer::start().await;
         exec_mock(&server, VERSION, "t3 v0.1.12\n", "", 0, 1).await;

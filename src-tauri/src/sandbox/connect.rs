@@ -246,10 +246,11 @@ async fn install_and_pair(
             SETUP_EXIT_BUSY => return Err(SandboxError::AdeBusy(ade)),
             _ => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         }
-    } else if refresh(client, ade, id, &found).await? == Refresh::Deferred && pairing_waits {
-        // A newer version stays, but gets this build's setup first. A busy one that would
-        // refuse the pairing without it is neither paired nor marked: the user tries again
-        // once it is idle. Update would refuse a sandbox that is ahead.
+    } else if pairing_waits && refresh(client, ade, id, &found).await? == Refresh::Deferred {
+        // A newer version stays. When its old setup would refuse this pairing, it gets this
+        // build's setup first, and a busy one is neither paired nor marked: the user tries
+        // again once it is idle (Update would refuse a sandbox that is ahead). Otherwise
+        // nothing runs here, as before: the next sync (Open, resume) refreshes it.
         return Err(SandboxError::AdeBusy(ade));
     }
     progress(Step::Pairing);
@@ -894,9 +895,14 @@ mod tests {
     }
 
     /// A running sandbox whose version script prints `found` (no current setup line), with
-    /// mocks for the setup at `desktop` and for the refresh, each answering `answer`.
+    /// mocks for the setup at `desktop` and for the refresh, each exiting `answer`: 3 is busy,
+    /// another code a failure.
     async fn running_with_old_setup(server: &MockServer, found: &str, desktop: &str, answer: i32) {
         running_with_remote(server, found, ok_setup(), 0).await;
+        let stderr = match answer {
+            3 => "T3 is busy, update deferred",
+            _ => "T3 server did not start",
+        };
         for marker in [
             REFRESH.to_string(),
             format!(r#""cmd":"set -eu\nv={desktop}\n"#),
@@ -904,7 +910,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/v1/machines/m1/exec"))
                 .and(body_string_contains(marker))
-                .respond_with(exec_answer(answer, "T3 is busy, update deferred", false))
+                .respond_with(exec_answer(answer, stderr, false))
                 .with_priority(1)
                 .mount(server)
                 .await;
@@ -941,10 +947,55 @@ mod tests {
                 .await
                 .unwrap();
             assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
-            // Behind or equal: the update waits. Ahead (refresh deferred): nothing to offer.
+            // Behind or equal: the update waits. Ahead: nothing to offer.
             assert_eq!(out.update_pending, update_pending, "{found}");
             assert!(sent_pair_or_mark(&server).await);
         }
+    }
+
+    #[tokio::test]
+    async fn a_newer_t3_whose_old_setup_takes_the_pairing_is_paired_without_a_refresh() {
+        // T3 Code 0.1.10 with T3 0.1.12 on the sandbox: a bearer pairing. As before this setup
+        // existed, nothing runs before the pairing, so a busy or failing refresh cannot stop it.
+        for answer in [3, 1] {
+            let server = MockServer::start().await;
+            running_with_old_setup(&server, "t3 v0.1.12\n", "0.1.10", answer).await;
+            let out = connect_existing(&client(&server), Ade::T3, "m1", "0.1.10", |_| {})
+                .await
+                .unwrap();
+            assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
+            assert_eq!(
+                (out.version.as_deref(), out.update_pending),
+                (Some("0.1.12"), false)
+            );
+            let reqs = server.received_requests().await.unwrap();
+            assert!(
+                !reqs
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains(REFRESH)),
+                "no refresh"
+            );
+            let c = calls(&server).await;
+            assert!(c.iter().any(|x| x == "PATCH /v1/machines/m1"), "{c:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_setup_still_stops_the_connect_without_dpop() {
+        // The setup a sandbox that is not ahead always got: its failure stops the connect.
+        let server = MockServer::start().await;
+        running_with_old_setup(&server, "t3 v0.1.10\n", "0.1.10", 1).await;
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "0.1.10", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e,
+            SandboxError::Setup {
+                ade: Ade::T3,
+                stderr_tail: "T3 server did not start".into()
+            }
+        );
+        assert!(!sent_pair_or_mark(&server).await);
     }
 
     #[tokio::test]
@@ -1054,13 +1105,15 @@ mod tests {
 
     #[tokio::test]
     async fn pair_again_pairs_as_before_when_the_server_takes_it() {
-        // T3 Code 0.1.10 with an old setup, busy: a bearer pairing, so no sync at all.
-        let server = MockServer::start().await;
-        running_with_old_setup(&server, "t3 v0.1.10\n", "0.1.10", 3).await;
-        let (r, synced, execs) = pair_again_with(&server, "0.1.10").await;
-        assert!(r.unwrap().starts_with("t3code://pair?pairingUrl="));
-        assert_eq!(synced, None);
-        assert!(!execs.iter().any(|e| e.contains(REFRESH)));
+        // T3 Code 0.1.10 with an old setup, busy or failing: a bearer pairing, so no sync.
+        for answer in [3, 1] {
+            let server = MockServer::start().await;
+            running_with_old_setup(&server, "t3 v0.1.10\n", "0.1.10", answer).await;
+            let (r, synced, execs) = pair_again_with(&server, "0.1.10").await;
+            assert!(r.unwrap().starts_with("t3code://pair?pairingUrl="));
+            assert_eq!(synced, None);
+            assert!(!execs.iter().any(|e| e.contains(REFRESH)));
+        }
         // This build's setup with DPoP: only the version script and the pairing, no restart.
         let server = MockServer::start().await;
         let current = format!("t3 v0.1.12\n{}\n", crate::ade::t3::setup_line());
