@@ -116,28 +116,66 @@ pub async fn sync_before_pairing(
     machine_id: &str,
     desktop_version: &str,
 ) -> (Result<SyncOutcome, SandboxError>, Result<(), SandboxError>) {
-    let (Some(version_script), Some(probe)) = (ade.version_script(), ade.probe()) else {
-        let outcome = SyncOutcome {
-            decision: Decision::UpToDate,
-            remote_version: None,
-        };
-        return (Ok(outcome), Ok(()));
+    let (Some(version_script), Some(_)) = (ade.version_script(), ade.probe()) else {
+        return (Ok(nothing_installed()), Ok(()));
     };
     let found = match run(client, machine_id, version_script, QUERY_TIMEOUT_SECS).await {
         Ok(out) => out.stdout,
         Err(e) => return (Err(e), Ok(())),
     };
+    sync_found(client, ade, machine_id, desktop_version, &found).await
+}
+
+/// Before a pairing that sets nothing up (Pair again): the sync of `sync_before_pairing`, but
+/// only when the sandbox's setup is older than this build's and the pairing needs it. None:
+/// the pairing goes ahead as it is, with no sync, also when the version script failed.
+pub async fn sync_if_pairing_needs_it(
+    client: &Client,
+    ade: Ade,
+    machine_id: &str,
+    desktop_version: &str,
+) -> Option<(Result<SyncOutcome, SandboxError>, Result<(), SandboxError>)> {
+    let script = ade.version_script()?;
+    let found = run(client, machine_id, script, QUERY_TIMEOUT_SECS)
+        .await
+        .ok()?
+        .stdout;
     let remote = ade.parse_version(&found);
+    if ade.setup_current(&found) || !ade.pairing_needs_setup(desktop_version, remote.as_deref()) {
+        return None;
+    }
+    Some(sync_found(client, ade, machine_id, desktop_version, &found).await)
+}
+
+fn nothing_installed() -> SyncOutcome {
+    SyncOutcome {
+        decision: Decision::UpToDate,
+        remote_version: None,
+    }
+}
+
+/// `sync_before_pairing` once the version script printed `found`.
+async fn sync_found(
+    client: &Client,
+    ade: Ade,
+    machine_id: &str,
+    desktop_version: &str,
+    found: &str,
+) -> (Result<SyncOutcome, SandboxError>, Result<(), SandboxError>) {
+    let Some(probe) = ade.probe() else {
+        return (Ok(nothing_installed()), Ok(()));
+    };
+    let remote = ade.parse_version(found);
     let r = bring_in_step(
         client,
         ade,
         &probe.path(),
         machine_id,
         desktop_version,
-        &found,
+        found,
     )
     .await;
-    let still_old = !ade.setup_current(&found) && !matches!(r, Ok((_, true)));
+    let still_old = !ade.setup_current(found) && !matches!(r, Ok((_, true)));
     let pairing = if still_old && ade.pairing_needs_setup(desktop_version, remote.as_deref()) {
         Err(match &r {
             Err(e) => e.clone(),

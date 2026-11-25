@@ -1943,15 +1943,21 @@ impl Core {
         Ok(Some(h.notice.to_string()))
     }
 
-    /// Makes a new pairing link for a connected sandbox and opens it.
+    /// Makes a new pairing link for a connected sandbox and opens it. Like Open, it makes none
+    /// when the sandbox's old setup would refuse the pairing and could not be brought up to date.
     pub async fn pair_again(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
         let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
             let ade = self.ade_for(id, ade)?;
-            let link = connect::pair_again(&client, ade, id)
-                .await
-                .map_err(ErrorView::from)?;
+            // Like Open: a sandbox whose old setup would refuse this pairing is synced first,
+            // and gets no link when that could not bring its setup up to date.
+            let desktop = self.read_in(account, |i| i.sync_version(ade)).flatten();
+            let link = connect::pair_again(&client, ade, id, desktop.as_deref(), |v, out| {
+                self.record_sync(id, v, out, account)
+            })
+            .await
+            .map_err(ErrorView::from)?;
             linked.store(true, std::sync::atomic::Ordering::SeqCst);
             self.open_for(account, &link)
         };
@@ -4652,6 +4658,30 @@ mod tests {
         assert_eq!(e.kind, crate::errors::ErrorKind::Setup);
         assert!(e.message.contains("T3 server did not start"), "{e:?}");
         assert!(opened.is_empty() && !paired(&execs));
+    }
+
+    #[tokio::test]
+    async fn pair_again_follows_the_same_rule_as_open() {
+        let pairs = |s: &[wiremock::Request]| {
+            s.iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#""cmd":"t3 pair"#))
+                .count()
+        };
+        // Both sides use DPoP and the old setup cannot be refreshed: no link, the busy error.
+        let (core, _, _, _, server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 3, "T3 is busy, update deferred").await;
+        let e = core.pair_again("m1", None).await.unwrap_err();
+        assert_eq!(
+            (e.kind, e.message.as_str()),
+            (crate::errors::ErrorKind::AdeBusy, BUSY)
+        );
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+        assert_eq!(pairs(&server.received_requests().await.unwrap()), 0);
+        // T3 Code 0.1.10 pairs with a bearer token: Pair again pairs as before.
+        let (core, _, _, _, server) =
+            open_after_refresh("0.1.10", "t3 v0.1.10\n", 3, "T3 is busy, update deferred").await;
+        assert_eq!(core.pair_again("m1", None).await, Ok(()));
+        assert_eq!(pairs(&server.received_requests().await.unwrap()), 2);
     }
 
     #[tokio::test]

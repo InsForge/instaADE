@@ -8,7 +8,7 @@ use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
     Client, CreateMachineRequest, ExecRequest, ExecResult, MachineSpec, UpdateMachineRequest,
 };
-use crate::sandbox::sync::{Refresh, refresh};
+use crate::sandbox::sync::{Refresh, SyncOutcome, refresh, sync_if_pairing_needs_it};
 use crate::sandbox::view::mark;
 use crate::sandbox::{
     CREATE_WAIT, SandboxError, ensure_running, new_key, retry_transient, wait_op,
@@ -427,9 +427,24 @@ pub async fn pair_link(client: &Client, ade: Ade, id: &str) -> Result<String, Sa
 }
 
 /// Pairs the ADE's desktop app again with a connected sandbox: wakes it, makes a new
-/// pairing link. No setup and no metadata change.
-pub async fn pair_again(client: &Client, ade: Ade, id: &str) -> Result<String, SandboxError> {
+/// pairing link. No setup and no metadata change, unless the sandbox's setup is older than
+/// this build's and the pairing with the desktop app at `desktop` needs it: then it syncs
+/// first like Open (`sync_if_pairing_needs_it`), hands `synced` the version and the result,
+/// and makes no link when that sync could not bring the setup up to date.
+pub async fn pair_again(
+    client: &Client,
+    ade: Ade,
+    id: &str,
+    desktop: Option<&str>,
+    synced: impl FnOnce(&str, Option<&SyncOutcome>),
+) -> Result<String, SandboxError> {
     ensure_running(client, id).await?;
+    if let Some(v) = desktop
+        && let Some((out, pairing)) = sync_if_pairing_needs_it(client, ade, id, v).await
+    {
+        synced(v, out.as_ref().ok());
+        pairing?;
+    }
     pair_link(client, ade, id).await
 }
 
@@ -437,6 +452,7 @@ pub async fn pair_again(client: &Client, ade: Ade, id: &str) -> Result<String, S
 mod tests {
     use super::*;
     use crate::api::Credentials;
+    use crate::sandbox::sync::Decision;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use url::Url;
@@ -978,11 +994,95 @@ mod tests {
         );
     }
 
+    /// Pair again with T3 Code `desktop`: its result, the sync it handed on, and the exec bodies.
+    async fn pair_again_with(
+        server: &MockServer,
+        desktop: &str,
+    ) -> (
+        Result<String, SandboxError>,
+        Option<(String, Option<Decision>)>,
+        Vec<String>,
+    ) {
+        let synced = Mutex::new(None);
+        let r = pair_again(&client(server), Ade::T3, "m1", Some(desktop), |v, out| {
+            *synced.lock().unwrap() = Some((v.to_string(), out.map(|o| o.decision)))
+        })
+        .await;
+        let execs = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        (r, synced.into_inner().unwrap(), execs)
+    }
+
+    fn paired(execs: &[String]) -> bool {
+        execs.iter().any(|e| e.contains(r#""cmd":"t3 pair"#))
+    }
+
+    #[tokio::test]
+    async fn pair_again_does_not_pair_a_busy_t3_whose_old_setup_refuses_dpop() {
+        let server = MockServer::start().await;
+        running_with_old_setup(&server, "t3 v0.1.12\n", "0.1.12", 3).await;
+        let (r, synced, execs) = pair_again_with(&server, "0.1.12").await;
+        assert_eq!(r, Err(SandboxError::AdeBusy(Ade::T3)));
+        assert_eq!(synced, Some(("0.1.12".into(), Some(Decision::Defer))));
+        assert!(
+            execs.iter().any(|e| e.contains(REFRESH)),
+            "tried the refresh"
+        );
+        assert!(!paired(&execs) && !sent_pair_or_mark(&server).await);
+    }
+
+    #[tokio::test]
+    async fn pair_again_refreshes_an_old_setup_with_dpop_then_pairs() {
+        let server = MockServer::start().await;
+        running_with_old_setup(&server, "t3 v0.1.12\n", "0.1.12", 0).await;
+        let (r, synced, execs) = pair_again_with(&server, "0.1.12").await;
+        assert!(r.unwrap().starts_with("t3code://pair?pairingUrl="));
+        assert_eq!(synced, Some(("0.1.12".into(), Some(Decision::UpToDate))));
+        let refresh = execs.iter().position(|e| e.contains(REFRESH)).unwrap();
+        let pair = execs
+            .iter()
+            .position(|e| e.contains(r#""cmd":"t3 pair"#))
+            .unwrap();
+        assert!(refresh < pair);
+    }
+
+    #[tokio::test]
+    async fn pair_again_pairs_as_before_when_the_server_takes_it() {
+        // T3 Code 0.1.10 with an old setup, busy: a bearer pairing, so no sync at all.
+        let server = MockServer::start().await;
+        running_with_old_setup(&server, "t3 v0.1.10\n", "0.1.10", 3).await;
+        let (r, synced, execs) = pair_again_with(&server, "0.1.10").await;
+        assert!(r.unwrap().starts_with("t3code://pair?pairingUrl="));
+        assert_eq!(synced, None);
+        assert!(!execs.iter().any(|e| e.contains(REFRESH)));
+        // This build's setup with DPoP: only the version script and the pairing, no restart.
+        let server = MockServer::start().await;
+        let current = format!("t3 v0.1.12\n{}\n", crate::ade::t3::setup_line());
+        running_with_remote(&server, &current, ok_setup(), 0).await;
+        refresh_mock(&server, ok_setup(), 0).await;
+        let (r, synced, execs) = pair_again_with(&server, "0.1.12").await;
+        assert!(r.unwrap().starts_with("t3code://pair?pairingUrl="));
+        assert_eq!(synced, None);
+        assert_eq!(execs.len(), 2, "{execs:?}");
+        drop(server);
+    }
+
     #[tokio::test]
     async fn pair_again_makes_no_setup_and_no_patch() {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v9.9.9\n", ok_setup(), 0).await;
-        let link = pair_again(&client(&server), Ade::T3, "m1").await.unwrap();
+        // No desktop version known: nothing to check, so no version script either.
+        let link = pair_again(&client(&server), Ade::T3, "m1", None, |_, _| {
+            panic!("synced")
+        })
+        .await
+        .unwrap();
         assert!(link.starts_with("t3code://pair?pairingUrl="));
         let c = calls(&server).await;
         assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");

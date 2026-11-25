@@ -17,7 +17,7 @@ InstaADE never moves T3 on a sandbox back to an older version. When the sandbox 
 
 The setup writes `~/.local/share/t3-instabox/setup` with the id of the setup the running server was started with. A sync (Open, resume, a new T3 Code version) whose sandbox T3 is behind the app runs the whole setup at the app's version. One whose sandbox T3 is at or ahead of the app's version, but has an older id, keeps that version and brings only the probe, the preload and the unit up to date. Either way T3 restarts only while it is idle. When it is busy, nothing T3 uses changes and the next sync tries again.
 
-An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both the desktop app and the T3 on the sandbox are 0.1.11-nightly.20261118.4903 or later. When **Open** or **Install** cannot bring an older setup up to date first, because T3 is busy or the refresh failed, they do not pair in that case. They show "T3 is busy on this sandbox. Try again when the agent is idle." or the error instead. When either side is older, the pairing uses a bearer token, which the older setup takes, and they pair as before.
+An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both the desktop app and the T3 on the sandbox are 0.1.11-nightly.20261118.4903 or later. When the setup is older and both sides use DPoP, **Pair again** first syncs like **Open**. When **Open**, **Pair again** or **Install** cannot bring an older setup up to date first, because T3 is busy or the refresh failed, they do not pair. They show "T3 is busy on this sandbox. Try again when the agent is idle." or the error instead. When either side is older, the pairing uses a bearer token, which the older setup takes, and they pair as before.
 
 ## cmux (macOS)
 
