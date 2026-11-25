@@ -8,12 +8,12 @@
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::ade::Ade;
 use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
+use crate::login;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -161,18 +161,27 @@ pub async fn add_mcp(core: Shared<'_>, client: String) -> Res<()> {
 
 #[tauri::command]
 pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()> {
-    let launch = app.autolaunch();
     let r = if on {
-        launch.enable()
+        login::enable(&app)
     } else {
-        launch.disable()
+        login::disable(&app)
     };
     if let Err(e) = r {
-        return core.settle(Err(ErrorView::other(e.to_string())));
+        return core.settle(Err(ErrorView::other(e)));
     }
     #[cfg(windows)]
     if on {
-        crate::login::quote_windows_run_entry(&app.package_info().name);
+        login::quote_windows_run_entry(&app.package_info().name);
+    }
+    // macOS 13 and later: registered, but the person turned the app off in System Settings
+    // before. Only they can allow it again there.
+    if on && login::needs_approval(&app) {
+        login::open_login_items();
+        core.set_start_at_login(false);
+        return core.settle(Err(ErrorView::other(format!(
+            "Allow {} in System Settings, under Login Items.",
+            app.package_info().name
+        ))));
     }
     core.set_start_at_login(on);
     core.settle(Ok(()))
