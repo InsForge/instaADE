@@ -102,88 +102,6 @@ pub fn migration(release: bool, legacy: Legacy, registered: bool) -> Migration {
     }
 }
 
-/// The keys auto-launch 0.6 writes into the autostart plugin's LaunchAgent. Every release
-/// since v0.1.0 wrote this shape.
-const AGENT_KEYS: [&str; 4] = [
-    "Label",
-    "AssociatedBundleIdentifiers",
-    "ProgramArguments",
-    "RunAtLoad",
-];
-
-/// Whether `plist` is the LaunchAgent the autostart plugin wrote for this app. Any other file
-/// is never touched. `label`: the app's name. `exe`: this process's executable.
-/// `identifier`: this app's bundle identifier.
-///
-/// The plist must have exactly the plugin's shape, with `ProgramArguments` of
-/// `[<program>, "--at-login"]`, and `<program>` must be `<X>.app/Contents/MacOS/<exe name>`.
-/// Then it is ours only with positive identity: `<program>` is this executable, or the bundle
-/// at `<X>.app` exists and its Info.plist has this app's identifier (a copy at another path).
-/// When the identity cannot be read, as for a bundle that is gone, the file stays.
-pub fn is_our_agent(plist: &plist::Value, label: &str, exe: &Path, identifier: &str) -> bool {
-    let Some(program) = agent_program(plist, label).map(Path::new) else {
-        return false;
-    };
-    let Some(bundle) = exe.file_name().and_then(|name| bundle_of(program, name)) else {
-        return false;
-    };
-    // The plugin writes the canonical path of the executable.
-    if program == exe || exe.canonicalize().is_ok_and(|e| e == program) {
-        return true;
-    }
-    bundle_identifier(bundle).as_deref() == Some(identifier)
-}
-
-/// The program of `plist` when it has exactly the shape the autostart plugin writes for an
-/// app named `label`.
-fn agent_program<'a>(plist: &'a plist::Value, label: &str) -> Option<&'a str> {
-    let dict = plist.as_dictionary()?;
-    if dict.len() != AGENT_KEYS.len() || !AGENT_KEYS.iter().all(|k| dict.contains_key(k)) {
-        return None;
-    }
-    let shape = dict.get("Label")?.as_string()? == label
-        && dict
-            .get("AssociatedBundleIdentifiers")?
-            .as_array()?
-            .is_empty()
-        && dict.get("RunAtLoad")?.as_boolean()?;
-    if !shape {
-        return None;
-    }
-    match dict.get("ProgramArguments")?.as_array()?.as_slice() {
-        [program, flag] if flag.as_string() == Some(AT_LOGIN) => program.as_string(),
-        _ => None,
-    }
-}
-
-/// `<X>.app` when `program` is the absolute path `<X>.app/Contents/MacOS/<exe_name>`.
-fn bundle_of<'a>(program: &'a Path, exe_name: &std::ffi::OsStr) -> Option<&'a Path> {
-    use std::path::Component;
-    let plain = program
-        .components()
-        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
-    if !program.is_absolute() || !plain || program.file_name()? != exe_name {
-        return None;
-    }
-    let macos = program.parent()?;
-    let contents = macos.parent()?;
-    let bundle = contents.parent()?;
-    let shape = macos.file_name()? == "MacOS"
-        && contents.file_name()? == "Contents"
-        && bundle.extension()? == "app";
-    shape.then_some(bundle)
-}
-
-/// The `CFBundleIdentifier` in the bundle's `Contents/Info.plist`.
-fn bundle_identifier(bundle: &Path) -> Option<String> {
-    let info = plist::Value::from_file(bundle.join("Contents").join("Info.plist")).ok()?;
-    let id = info
-        .as_dictionary()?
-        .get("CFBundleIdentifier")?
-        .as_string()?;
-    Some(id.to_string())
-}
-
 /// Whether unloading the LaunchAgent's job is safe. Unloading a job stops its process, so not
 /// when launchd started this very process from it: then it passed `--at-login` (`flag`), and
 /// launchd sets `XPC_SERVICE_NAME` to the job's label. The job then ends at logout.
@@ -361,10 +279,10 @@ pub fn quote_windows_run_entry(app_name: &str) {
     }
 }
 
-/// SMAppService and the launch's Apple event.
+/// SMAppService, the launch's Apple event, and the LaunchAgent older builds wrote.
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use objc2::rc::Retained;
     use objc2::{available, msg_send};
@@ -376,8 +294,8 @@ mod macos {
     use tauri::{AppHandle, Runtime};
 
     use super::{
-        ERROR_ALREADY_REGISTERED, ERROR_LAUNCH_DENIED_BY_USER, LaunchEvent, Legacy, Migration,
-        PROP_DATA, ServiceError, TurnOn, has_flag, is_our_agent, may_unload, migration,
+        AT_LOGIN, ERROR_ALREADY_REGISTERED, ERROR_LAUNCH_DENIED_BY_USER, LaunchEvent, Legacy,
+        Migration, PROP_DATA, ServiceError, TurnOn, has_flag, may_unload, migration,
         removes_legacy, turn_on,
     };
 
@@ -547,15 +465,100 @@ mod macos {
         }
     }
 
+    /// The keys auto-launch 0.6 writes into the autostart plugin's LaunchAgent. Every release
+    /// since v0.1.0 wrote this shape.
+    const AGENT_KEYS: [&str; 4] = [
+        "Label",
+        "AssociatedBundleIdentifiers",
+        "ProgramArguments",
+        "RunAtLoad",
+    ];
+
+    /// Whether `plist` is the LaunchAgent the autostart plugin wrote for this app. Any other
+    /// file is never touched. `label`: the app's name. `exe`: this process's executable.
+    /// `identifier`: this app's bundle identifier.
+    ///
+    /// The plist must have exactly the plugin's shape, with `ProgramArguments` of
+    /// `[<program>, "--at-login"]`, and `<program>` must be
+    /// `<X>.app/Contents/MacOS/<exe name>`. Then it is ours only with positive identity:
+    /// `<program>` is this executable, or the bundle at `<X>.app` exists and its Info.plist
+    /// has this app's identifier (a copy at another path). When the identity cannot be read,
+    /// as for a bundle that is gone, the file stays.
+    fn is_our_agent(plist: &plist::Value, label: &str, exe: &Path, identifier: &str) -> bool {
+        let Some(program) = agent_program(plist, label).map(Path::new) else {
+            return false;
+        };
+        let Some(bundle) = exe.file_name().and_then(|name| bundle_of(program, name)) else {
+            return false;
+        };
+        // The plugin writes the canonical path of the executable.
+        if program == exe || exe.canonicalize().is_ok_and(|e| e == program) {
+            return true;
+        }
+        bundle_identifier(bundle).as_deref() == Some(identifier)
+    }
+
+    /// The program of `plist` when it has exactly the shape the autostart plugin writes for an
+    /// app named `label`.
+    fn agent_program<'a>(plist: &'a plist::Value, label: &str) -> Option<&'a str> {
+        let dict = plist.as_dictionary()?;
+        if dict.len() != AGENT_KEYS.len() || !AGENT_KEYS.iter().all(|k| dict.contains_key(k)) {
+            return None;
+        }
+        let shape = dict.get("Label")?.as_string()? == label
+            && dict
+                .get("AssociatedBundleIdentifiers")?
+                .as_array()?
+                .is_empty()
+            && dict.get("RunAtLoad")?.as_boolean()?;
+        if !shape {
+            return None;
+        }
+        match dict.get("ProgramArguments")?.as_array()?.as_slice() {
+            [program, flag] if flag.as_string() == Some(AT_LOGIN) => program.as_string(),
+            _ => None,
+        }
+    }
+
+    /// `<X>.app` when `program` is the absolute path `<X>.app/Contents/MacOS/<exe_name>`.
+    fn bundle_of<'a>(program: &'a Path, exe_name: &std::ffi::OsStr) -> Option<&'a Path> {
+        use std::path::Component;
+        let plain = program
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        if !program.is_absolute() || !plain || program.file_name()? != exe_name {
+            return None;
+        }
+        let macos = program.parent()?;
+        let contents = macos.parent()?;
+        let bundle = contents.parent()?;
+        let shape = macos.file_name()? == "MacOS"
+            && contents.file_name()? == "Contents"
+            && bundle.extension()? == "app";
+        shape.then_some(bundle)
+    }
+
+    /// The `CFBundleIdentifier` in the bundle's `Contents/Info.plist`.
+    fn bundle_identifier(bundle: &Path) -> Option<String> {
+        let info = plist::Value::from_file(bundle.join("Contents").join("Info.plist")).ok()?;
+        let id = info
+            .as_dictionary()?
+            .get("CFBundleIdentifier")?
+            .as_string()?;
+        Some(id.to_string())
+    }
+
     #[cfg(test)]
     mod tests {
+        use std::path::Path;
+
         use objc2::rc::Retained;
         use objc2::runtime::AnyObject;
         use objc2::{ClassType, msg_send};
         use objc2_foundation::NSAppleEventDescriptor;
 
-        use super::super::{LAUNCHED_AS_LOGIN_ITEM, PROP_DATA, at_login};
-        use super::describe;
+        use super::super::{AT_LOGIN, LAUNCHED_AS_LOGIN_ITEM, PROP_DATA, at_login};
+        use super::{AGENT_KEYS, describe, is_our_agent};
 
         /// An open-application Apple event, built the way loginwindow or Finder sends one.
         fn open_app(prop: Option<u32>) -> Retained<NSAppleEventDescriptor> {
@@ -588,6 +591,192 @@ mod macos {
             let by_hand = describe(&open_app(None));
             assert_eq!(by_hand.prop, None);
             assert!(!at_login(false, Some(by_hand)));
+        }
+
+        const EXE: &str = "instabox-bridge";
+        const ID: &str = "sh.instabox.bridge";
+
+        /// Makes `<dir>/<name>.app` with its executable, and an Info.plist with `id` when given.
+        /// Returns the executable's path.
+        fn bundle(dir: &Path, name: &str, id: Option<&str>) -> std::path::PathBuf {
+            let contents = dir.join(format!("{name}.app")).join("Contents");
+            let macos = contents.join("MacOS");
+            std::fs::create_dir_all(&macos).unwrap();
+            let exe = macos.join(EXE);
+            std::fs::write(&exe, "").unwrap();
+            if let Some(id) = id {
+                let mut info = plist::Dictionary::new();
+                info.insert("CFBundleIdentifier".into(), id.into());
+                plist::Value::Dictionary(info)
+                    .to_file_xml(contents.join("Info.plist"))
+                    .unwrap();
+            }
+            exe
+        }
+
+        /// The LaunchAgent auto-launch 0.6 writes for the autostart plugin, byte for byte.
+        fn agent(label: &str, program: &Path) -> plist::Value {
+            let xml = format!(
+                "{}\n{}\n\
+                <plist version=\"1.0\">\n  \
+                <dict>\n  \
+                    <key>Label</key>\n  \
+                    <string>{label}</string>\n  \
+                    <key>AssociatedBundleIdentifiers</key>\n  \
+                    <array></array>\n  \
+                    <key>ProgramArguments</key>\n  \
+                    <array><string>{}</string><string>--at-login</string></array>\n  \
+                    <key>RunAtLoad</key>\n  \
+                    <true/>\n  \
+                </dict>\n\
+                </plist>",
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#,
+                program.display(),
+            );
+            plist::Value::from_reader_xml(xml.as_bytes()).unwrap()
+        }
+
+        fn edit(mut plist: plist::Value, f: impl FnOnce(&mut plist::Dictionary)) -> plist::Value {
+            f(plist.as_dictionary_mut().unwrap());
+            plist
+        }
+
+        fn ours(plist: &plist::Value, exe: &Path) -> bool {
+            is_our_agent(plist, "Instabox", exe, ID)
+        }
+
+        /// This app's executable, in a bundle with this app's identifier.
+        fn installed(dir: &Path) -> std::path::PathBuf {
+            bundle(&dir.join("Applications"), "Instabox", Some(ID))
+        }
+
+        #[test]
+        fn the_agent_of_this_executable_is_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            // No Info.plist needed: it runs this very executable.
+            let exe = bundle(dir.path(), "Instabox", None);
+            // The plugin writes the canonical path (/private/var for /var on macOS).
+            assert!(ours(&agent("Instabox", &exe.canonicalize().unwrap()), &exe));
+            assert!(ours(&agent("Instabox", &exe), &exe));
+            // Instabox Preview has its own file and label.
+            assert!(!is_our_agent(
+                &agent("Instabox", &exe),
+                "Instabox Preview",
+                &exe,
+                "sh.instabox.bridge.preview"
+            ));
+        }
+
+        #[test]
+        fn the_agent_of_a_bundle_that_is_gone_is_not_ours() {
+            // Moved or deleted: nothing says whose it was, so the file stays.
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            let gone = dir.path().join("old/Instabox.app/Contents/MacOS").join(EXE);
+            assert!(!ours(&agent("Instabox", &gone), &exe));
+        }
+
+        #[test]
+        fn the_agent_of_our_bundle_at_another_path_is_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            let copy = bundle(&dir.path().join("copy"), "Instabox 2", Some(ID));
+            assert!(ours(&agent("Instabox", &copy), &exe));
+        }
+
+        #[test]
+        fn another_bundle_with_an_executable_of_the_same_name_is_not_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            let other = bundle(&dir.path().join("a"), "Instabox", Some("com.example.other"));
+            assert!(!ours(&agent("Instabox", &other), &exe));
+            let preview = bundle(
+                &dir.path().join("b"),
+                "Instabox",
+                Some("sh.instabox.bridge.preview"),
+            );
+            assert!(!ours(&agent("Instabox", &preview), &exe));
+            // A bundle whose identity cannot be read: no Info.plist, or one that is not a plist.
+            let unknown = bundle(&dir.path().join("c"), "Instabox", None);
+            assert!(!ours(&agent("Instabox", &unknown), &exe));
+            let broken = bundle(&dir.path().join("d"), "Instabox", None);
+            let info = broken
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("Info.plist");
+            std::fs::write(info, ID).unwrap();
+            assert!(!ours(&agent("Instabox", &broken), &exe));
+        }
+
+        #[test]
+        fn a_program_outside_an_app_bundle_is_not_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            for program in [
+                std::path::PathBuf::from("/usr/local/bin").join(EXE),
+                dir.path().join("Instabox/Contents/MacOS").join(EXE),
+                dir.path().join("Instabox.app/Contents").join(EXE),
+                dir.path().join("Instabox.app/Contents/Resources").join(EXE),
+                std::path::PathBuf::from("Instabox.app/Contents/MacOS").join(EXE),
+                dir.path()
+                    .join("x/../Instabox.app/Contents/MacOS")
+                    .join(EXE),
+                // Another executable name, even in our bundle.
+                exe.with_file_name("other"),
+            ] {
+                assert!(!ours(&agent("Instabox", &program), &exe), "{program:?}");
+            }
+        }
+
+        #[test]
+        fn a_plist_of_another_shape_is_not_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            let good = agent("Instabox", &exe);
+            assert!(ours(&good, &exe));
+            let extra = edit(good.clone(), |d| {
+                d.insert("KeepAlive".into(), true.into());
+            });
+            assert!(!ours(&extra, &exe));
+            for key in AGENT_KEYS {
+                let missing = edit(good.clone(), |d| {
+                    d.remove(key);
+                });
+                assert!(!ours(&missing, &exe), "without {key}");
+            }
+            assert!(!is_our_agent(&good, "Other", &exe, ID));
+            let not_at_load = edit(good.clone(), |d| {
+                d.insert("RunAtLoad".into(), false.into());
+            });
+            assert!(!ours(&not_at_load, &exe));
+            let associated = edit(good.clone(), |d| {
+                let ids = vec![plist::Value::from(ID)];
+                d.insert("AssociatedBundleIdentifiers".into(), ids.into());
+            });
+            assert!(!ours(&associated, &exe));
+            assert!(!ours(&plist::Value::String("Instabox".into()), &exe));
+        }
+
+        #[test]
+        fn a_wrong_argument_list_is_not_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = installed(dir.path());
+            assert!(ours(&agent("Instabox", &exe), &exe));
+            let program = plist::Value::from(exe.display().to_string());
+            for args in [
+                vec![program.clone(), "--hidden".into()],
+                vec![program.clone()],
+                vec![program.clone(), AT_LOGIN.into(), "--hidden".into()],
+                vec![AT_LOGIN.into(), program.clone()],
+            ] {
+                let plist = edit(agent("Instabox", &exe), |d| {
+                    d.insert("ProgramArguments".into(), args.clone().into());
+                });
+                assert!(!ours(&plist, &exe), "{args:?}");
+            }
         }
     }
 }
@@ -746,192 +935,6 @@ mod tests {
     fn without_a_launch_agent_nothing_moves() {
         assert_eq!(migration(true, Legacy::None, false), Migration::Nothing);
         assert_eq!(migration(true, Legacy::None, true), Migration::Nothing);
-    }
-
-    const EXE: &str = "instabox-bridge";
-    const ID: &str = "sh.instabox.bridge";
-
-    /// Makes `<dir>/<name>.app` with its executable, and an Info.plist with `id` when given.
-    /// Returns the executable's path.
-    fn bundle(dir: &Path, name: &str, id: Option<&str>) -> std::path::PathBuf {
-        let contents = dir.join(format!("{name}.app")).join("Contents");
-        let macos = contents.join("MacOS");
-        std::fs::create_dir_all(&macos).unwrap();
-        let exe = macos.join(EXE);
-        std::fs::write(&exe, "").unwrap();
-        if let Some(id) = id {
-            let mut info = plist::Dictionary::new();
-            info.insert("CFBundleIdentifier".into(), id.into());
-            plist::Value::Dictionary(info)
-                .to_file_xml(contents.join("Info.plist"))
-                .unwrap();
-        }
-        exe
-    }
-
-    /// The LaunchAgent auto-launch 0.6 writes for the autostart plugin, byte for byte.
-    fn agent(label: &str, program: &Path) -> plist::Value {
-        let xml = format!(
-            "{}\n{}\n\
-            <plist version=\"1.0\">\n  \
-            <dict>\n  \
-                <key>Label</key>\n  \
-                <string>{label}</string>\n  \
-                <key>AssociatedBundleIdentifiers</key>\n  \
-                <array></array>\n  \
-                <key>ProgramArguments</key>\n  \
-                <array><string>{}</string><string>--at-login</string></array>\n  \
-                <key>RunAtLoad</key>\n  \
-                <true/>\n  \
-            </dict>\n\
-            </plist>",
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#,
-            program.display(),
-        );
-        plist::Value::from_reader_xml(xml.as_bytes()).unwrap()
-    }
-
-    fn edit(mut plist: plist::Value, f: impl FnOnce(&mut plist::Dictionary)) -> plist::Value {
-        f(plist.as_dictionary_mut().unwrap());
-        plist
-    }
-
-    fn ours(plist: &plist::Value, exe: &Path) -> bool {
-        is_our_agent(plist, "Instabox", exe, ID)
-    }
-
-    /// This app's executable, in a bundle with this app's identifier.
-    fn installed(dir: &Path) -> std::path::PathBuf {
-        bundle(&dir.join("Applications"), "Instabox", Some(ID))
-    }
-
-    #[test]
-    fn the_agent_of_this_executable_is_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        // No Info.plist needed: it runs this very executable.
-        let exe = bundle(dir.path(), "Instabox", None);
-        // The plugin writes the canonical path (/private/var for /var on macOS).
-        assert!(ours(&agent("Instabox", &exe.canonicalize().unwrap()), &exe));
-        assert!(ours(&agent("Instabox", &exe), &exe));
-        // Instabox Preview has its own file and label.
-        assert!(!is_our_agent(
-            &agent("Instabox", &exe),
-            "Instabox Preview",
-            &exe,
-            "sh.instabox.bridge.preview"
-        ));
-    }
-
-    #[test]
-    fn the_agent_of_a_bundle_that_is_gone_is_not_ours() {
-        // Moved or deleted: nothing says whose it was, so the file stays.
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        let gone = dir.path().join("old/Instabox.app/Contents/MacOS").join(EXE);
-        assert!(!ours(&agent("Instabox", &gone), &exe));
-    }
-
-    #[test]
-    fn the_agent_of_our_bundle_at_another_path_is_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        let copy = bundle(&dir.path().join("copy"), "Instabox 2", Some(ID));
-        assert!(ours(&agent("Instabox", &copy), &exe));
-    }
-
-    #[test]
-    fn another_bundle_with_an_executable_of_the_same_name_is_not_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        let other = bundle(&dir.path().join("a"), "Instabox", Some("com.example.other"));
-        assert!(!ours(&agent("Instabox", &other), &exe));
-        let preview = bundle(
-            &dir.path().join("b"),
-            "Instabox",
-            Some("sh.instabox.bridge.preview"),
-        );
-        assert!(!ours(&agent("Instabox", &preview), &exe));
-        // A bundle whose identity cannot be read: no Info.plist, or one that is not a plist.
-        let unknown = bundle(&dir.path().join("c"), "Instabox", None);
-        assert!(!ours(&agent("Instabox", &unknown), &exe));
-        let broken = bundle(&dir.path().join("d"), "Instabox", None);
-        let info = broken
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("Info.plist");
-        std::fs::write(info, ID).unwrap();
-        assert!(!ours(&agent("Instabox", &broken), &exe));
-    }
-
-    #[test]
-    fn a_program_outside_an_app_bundle_is_not_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        for program in [
-            std::path::PathBuf::from("/usr/local/bin").join(EXE),
-            dir.path().join("Instabox/Contents/MacOS").join(EXE),
-            dir.path().join("Instabox.app/Contents").join(EXE),
-            dir.path().join("Instabox.app/Contents/Resources").join(EXE),
-            std::path::PathBuf::from("Instabox.app/Contents/MacOS").join(EXE),
-            dir.path()
-                .join("x/../Instabox.app/Contents/MacOS")
-                .join(EXE),
-            // Another executable name, even in our bundle.
-            exe.with_file_name("other"),
-        ] {
-            assert!(!ours(&agent("Instabox", &program), &exe), "{program:?}");
-        }
-    }
-
-    #[test]
-    fn a_plist_of_another_shape_is_not_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        let good = agent("Instabox", &exe);
-        assert!(ours(&good, &exe));
-        let extra = edit(good.clone(), |d| {
-            d.insert("KeepAlive".into(), true.into());
-        });
-        assert!(!ours(&extra, &exe));
-        for key in AGENT_KEYS {
-            let missing = edit(good.clone(), |d| {
-                d.remove(key);
-            });
-            assert!(!ours(&missing, &exe), "without {key}");
-        }
-        assert!(!is_our_agent(&good, "Other", &exe, ID));
-        let not_at_load = edit(good.clone(), |d| {
-            d.insert("RunAtLoad".into(), false.into());
-        });
-        assert!(!ours(&not_at_load, &exe));
-        let associated = edit(good.clone(), |d| {
-            let ids = vec![plist::Value::from(ID)];
-            d.insert("AssociatedBundleIdentifiers".into(), ids.into());
-        });
-        assert!(!ours(&associated, &exe));
-        assert!(!ours(&plist::Value::String("Instabox".into()), &exe));
-    }
-
-    #[test]
-    fn a_wrong_argument_list_is_not_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = installed(dir.path());
-        assert!(ours(&agent("Instabox", &exe), &exe));
-        let program = plist::Value::from(exe.display().to_string());
-        for args in [
-            vec![program.clone(), "--hidden".into()],
-            vec![program.clone()],
-            vec![program.clone(), AT_LOGIN.into(), "--hidden".into()],
-            vec![AT_LOGIN.into(), program.clone()],
-        ] {
-            let plist = edit(agent("Instabox", &exe), |d| {
-                d.insert("ProgramArguments".into(), args.clone().into());
-            });
-            assert!(!ours(&plist, &exe), "{args:?}");
-        }
     }
 
     #[test]
