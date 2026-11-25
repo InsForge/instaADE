@@ -944,7 +944,9 @@ test("updates: Check for updates shows checking, then up to date", async () => {
   const { state } = show({ update: updates() }, [{}]);
   await openSettings();
   const section = updatesSection();
-  expect(section.getByText("Version 0.1.7")).toBeTruthy();
+  const versionRow = section.getByText("Version").closest(".group-row") as HTMLElement;
+  expect(within(versionRow).getByText("0.1.7")).toBeTruthy();
+  expect(section.getByText("Checks every few hours")).toBeTruthy();
   await userEvent.click(section.getByRole("button", { name: "Check for updates" }));
   expect(invoke).toHaveBeenCalledWith("check_for_updates");
 
@@ -953,7 +955,7 @@ test("updates: Check for updates shows checking, then up to date", async () => {
   expect((updatesSection().getByRole("button", { name: "Check for updates" }) as HTMLButtonElement).disabled).toBe(true);
 
   act(() => emit({ ...state, update: updates({ step: "upToDate" }) }));
-  expect(updatesSection().getByText("InstaBox is up to date")).toBeTruthy();
+  expect(updatesSection().getByText("Up to date")).toBeTruthy();
   expect((updatesSection().getByRole("button", { name: "Check for updates" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
@@ -974,7 +976,7 @@ test("updates: a failed check shows why inline", async () => {
 test("updates: Update downloads with progress, then installs", async () => {
   const { state } = show({ update: offered }, [{}]);
   await openSettings();
-  expect(updatesSection().getByText("InstaBox 0.2.0 is available")).toBeTruthy();
+  expect(updatesSection().getByText("0.2.0 is available")).toBeTruthy();
   // The update is the one action: no check while it is on offer.
   expect(updatesSection().queryByRole("button", { name: "Check for updates" })).toBeNull();
   await userEvent.click(updatesSection().getByRole("button", { name: "Update" }));
@@ -982,14 +984,14 @@ test("updates: Update downloads with progress, then installs", async () => {
 
   // The back end reports the download. The size may come later.
   act(() => emit({ ...state, update: { ...offered, step: "downloading" } }));
-  expect(updatesSection().getByText("Downloading InstaBox 0.2.0")).toBeTruthy();
+  expect(updatesSection().getByText("Downloading 0.2.0")).toBeTruthy();
   expect(updatesSection().getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBeNull();
   expect(updatesSection().queryByRole("button")).toBeNull();
   act(() => emit({ ...state, update: { ...offered, step: "downloading", percent: 42 } }));
-  expect(updatesSection().getByText("Downloading InstaBox 0.2.0 (42%)")).toBeTruthy();
+  expect(updatesSection().getByText("Downloading 0.2.0 (42%)")).toBeTruthy();
   expect(updatesSection().getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBe("42");
   act(() => emit({ ...state, update: { ...offered, step: "installing" } }));
-  expect(updatesSection().getByText("Installing InstaBox 0.2.0, then restarting")).toBeTruthy();
+  expect(updatesSection().getByText("Installing 0.2.0, then restarting")).toBeTruthy();
   expect(calls("install_update").length).toBe(1);
 });
 
@@ -1010,7 +1012,8 @@ test("updates: a dev or preview build shows its version and never checks", async
   show({ update: updates({ enabled: false }) }, [{}]);
   await openSettings();
   const section = updatesSection();
-  expect(section.getByText("Version 0.1.7")).toBeTruthy();
+  const versionRow = section.getByText("Version").closest(".group-row") as HTMLElement;
+  expect(within(versionRow).getByText("0.1.7")).toBeTruthy();
   expect(section.getByText("Updates are only for released builds")).toBeTruthy();
   const check = section.getByRole("button", { name: "Check for updates" }) as HTMLButtonElement;
   expect(check.disabled).toBe(true);

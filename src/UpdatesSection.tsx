@@ -14,13 +14,22 @@ const OFFERED: UpdateStep[] = ["available", "downloading", "installing", "failed
 /** A newer version is on offer: the Settings button gets a dot. */
 export const updateOffered = (update: UpdateView | null) => !!update && OFFERED.includes(update.step);
 
-/** What a check found, or how the update goes, under the version. */
+function CheckButton({ disabled }: { disabled?: boolean }) {
+  return (
+    <button className="btn sm" disabled={disabled} onClick={check}>
+      Check for updates
+    </button>
+  );
+}
+
+/** The row under the version: what a check found or how the update goes, and its action. */
 function Status({ update }: { update: UpdateView }) {
   const { enabled, step, version, percent, error } = update;
   if (!enabled) {
     return (
       <div className="group-row update-status">
-        <span className="small muted">Updates are only for released builds</span>
+        <span className="muted">Updates are only for released builds</span>
+        <CheckButton disabled />
       </div>
     );
   }
@@ -28,19 +37,21 @@ function Status({ update }: { update: UpdateView }) {
     case "checking":
       return (
         <div className="group-row update-status" role="status">
-          <span className="small muted">Checking for updates…</span>
+          <span className="muted">Checking for updates…</span>
+          <CheckButton disabled />
         </div>
       );
     case "upToDate":
       return (
         <div className="group-row update-status" role="status">
-          <span className="small muted">InstaBox is up to date</span>
+          <span className="muted">Up to date</span>
+          <CheckButton />
         </div>
       );
     case "available":
       return (
         <div className="group-row update-status" role="status">
-          <span className="small">InstaBox {version} is available</span>
+          <span>{version} is available</span>
           <button className="btn sm primary" onClick={install}>
             Update
           </button>
@@ -52,10 +63,10 @@ function Status({ update }: { update: UpdateView }) {
       const done = installing ? 100 : (percent ?? 0);
       return (
         <div className="group-row update-status update-progress" role="status">
-          <span className="small">
+          <span>
             {installing
-              ? `Installing InstaBox ${version}, then restarting`
-              : `Downloading InstaBox ${version}${percent === null ? "" : ` (${percent}%)`}`}
+              ? `Installing ${version}, then restarting`
+              : `Downloading ${version}${percent === null ? "" : ` (${percent}%)`}`}
           </span>
           <div
             className="bar"
@@ -73,37 +84,38 @@ function Status({ update }: { update: UpdateView }) {
     case "checkFailed":
       return (
         <div className="group-row update-status" role="alert">
-          <span className="small red">{error?.message ?? "Could not check for updates"}</span>
+          <span className="red">{error?.message ?? "Could not check for updates"}</span>
+          <CheckButton />
         </div>
       );
     case "failed":
       return (
         <div className="group-row update-status" role="alert">
-          <span className="small red">{error?.message ?? `Could not update to ${version}`}</span>
+          <span className="red">{error?.message ?? `Could not update to ${version}`}</span>
           <button className="btn sm" onClick={install}>
             Retry
           </button>
         </div>
       );
     default:
-      return null;
+      return (
+        <div className="group-row update-status">
+          <span className="muted">Checks every few hours</span>
+          <CheckButton />
+        </div>
+      );
   }
 }
 
-/** Settings > Updates: this build's version, Check for updates, and the update on offer. */
+/** Settings > Updates: this build's version, then what a check found and its action. */
 export default function UpdatesSection({ update }: { update: UpdateView }) {
-  const offered = updateOffered(update);
   return (
     <section className="section">
       <h2 className="section-label">Updates</h2>
       <div className="group">
-        <div className="group-row plain">
-          <span>Version {update.current}</span>
-          {!offered && (
-            <button className="btn sm" disabled={!update.enabled || update.step === "checking"} onClick={check}>
-              Check for updates
-            </button>
-          )}
+        <div className="group-row">
+          <span>Version</span>
+          <span className="small muted">{update.current}</span>
         </div>
         <Status update={update} />
       </div>
