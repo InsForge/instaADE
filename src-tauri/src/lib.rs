@@ -19,7 +19,7 @@ pub mod tray;
 use std::sync::{Arc, OnceLock};
 
 use tauri::{Emitter, Manager, WindowEvent};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::app::{AppState, Core, Opener, api_base};
@@ -27,9 +27,6 @@ use crate::connected::FileConnectedStore;
 use crate::mcp::KeyringKeyStore;
 use crate::ssh::KeyringSshStore;
 use crate::ssh_config::SyncedStore;
-
-/// The argument the login item passes, so a start at login does not open the popover.
-const AT_LOGIN: &str = "--at-login";
 
 /// The keychain service before startup sets one: Instabox's identifier.
 const DEFAULT_KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
@@ -53,13 +50,17 @@ pub fn run() {
             tray::show_popover(app, None);
         }))
         .plugin(tauri_plugin_opener::init())
+        // The login item on Windows and before macOS 13. `login` uses SMAppService instead on
+        // macOS 13 and later.
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            Some(vec![AT_LOGIN]),
+            Some(vec![login::AT_LOGIN]),
         ))
         .manage(tray::TrayMemo::default())
         .manage(tray::HiddenAt::default())
         .setup(|app| {
+            // First, while the Apple event that launched the app is still current.
+            let at_login = login::launched_at_login();
             // Before anything reads the keychain.
             let _ = KEYCHAIN_SERVICE.set(app.config().identifier.clone());
             let handle = app.handle().clone();
@@ -103,7 +104,10 @@ pub fn run() {
                 emit,
                 dirs::home_dir().unwrap_or_default(),
             ));
-            let launch = handle.autolaunch();
+            let release = !cfg!(debug_assertions);
+            // On macOS 13 and later, a LaunchAgent an older build wrote becomes the app's own
+            // login item.
+            login::migrate(&handle, release);
             // Without a config dir there is nowhere to save the marker, so no default.
             let marker = handle
                 .path()
@@ -111,41 +115,45 @@ pub fn run() {
                 .ok()
                 .map(|d| d.join(login::DEFAULT_MARKER));
             let marked = marker.as_ref().is_none_or(|m| m.exists());
-            let enabled = launch.is_enabled().unwrap_or(false);
-            match login::startup(!cfg!(debug_assertions), marked, enabled) {
+            let enabled = login::is_enabled(&handle);
+            match login::startup(release, marked, enabled) {
                 login::Startup::Keep => {}
                 login::Startup::Rewrite => {
-                    if let Err(e) = launch.enable() {
+                    if let Err(e) = login::rewrite(&handle) {
                         eprintln!("start at login: could not update the login item: {e}");
                     }
                 }
                 login::Startup::TurnOn => {
                     // Marked only once the item is on, so a failed attempt is tried again next
-                    // launch. A default that cannot be marked is undone, so it never turns the
-                    // item back on after the person turned it off.
+                    // launch. A person who declined the app's login item before (macOS 13 and
+                    // later) keeps that choice: marked too, and System Settings stays closed.
+                    // A default that cannot be marked is undone, so it never turns the item
+                    // back on after the person turned it off.
                     if let Some(m) = marker.as_deref() {
-                        match launch.enable() {
-                            Ok(()) => {
+                        match login::enable(&handle) {
+                            login::TurnOn::On | login::TurnOn::Approval => {
                                 if let Err(e) = login::mark(m) {
                                     eprintln!("start at login: could not save the default: {e}");
-                                    let _ = launch.disable();
+                                    let _ = login::disable(&handle);
                                 }
                             }
-                            Err(e) => eprintln!("start at login: could not turn it on: {e}"),
+                            login::TurnOn::Failed(e) => {
+                                eprintln!("start at login: could not turn it on: {e}")
+                            }
                         }
                     }
                 }
             }
-            let at_login = launch.is_enabled().unwrap_or(false);
+            let starts_at_login = login::is_enabled(&handle);
             #[cfg(windows)]
-            if at_login {
+            if starts_at_login {
                 login::quote_windows_run_entry(&handle.package_info().name);
             }
-            core.set_start_at_login(at_login);
+            core.set_start_at_login(starts_at_login);
             app.manage(core.clone());
             tray::build(&handle, core.clone())?;
             // Opened by hand: show where the app lives. Started at login: stay in the menu bar.
-            if !std::env::args().any(|a| a == AT_LOGIN) {
+            if !at_login {
                 let h = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     // Give the menu bar time to lay out the icon.

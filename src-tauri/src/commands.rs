@@ -8,12 +8,12 @@
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::ade::Ade;
 use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
+use crate::login;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -161,18 +161,25 @@ pub async fn add_mcp(core: Shared<'_>, client: String) -> Res<()> {
 
 #[tauri::command]
 pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()> {
-    let launch = app.autolaunch();
-    let r = if on {
-        launch.enable()
-    } else {
-        launch.disable()
-    };
-    if let Err(e) = r {
-        return core.settle(Err(ErrorView::other(e.to_string())));
-    }
-    #[cfg(windows)]
     if on {
-        crate::login::quote_windows_run_entry(&app.package_info().name);
+        match login::enable(&app) {
+            login::TurnOn::On => {}
+            // macOS 13 and later: the person declined the app's login item before. Only they
+            // can allow it again, in System Settings.
+            login::TurnOn::Approval => {
+                login::open_login_items();
+                core.set_start_at_login(false);
+                return core.settle(Err(ErrorView::other(format!(
+                    "Allow {} in System Settings, under Login Items.",
+                    app.package_info().name
+                ))));
+            }
+            login::TurnOn::Failed(e) => return core.settle(Err(ErrorView::other(e))),
+        }
+        #[cfg(windows)]
+        login::quote_windows_run_entry(&app.package_info().name);
+    } else if let Err(e) = login::disable(&app) {
+        return core.settle(Err(ErrorView::other(e)));
     }
     core.set_start_at_login(on);
     core.settle(Ok(()))
