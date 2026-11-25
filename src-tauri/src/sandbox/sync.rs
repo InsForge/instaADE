@@ -240,7 +240,7 @@ mod tests {
     const VERSION: &str = "t3 --version";
     const PROBE: &str = "\"cmd\":\"/usr/local/lib/instabox/activity.d/t3\"";
     const SETUP: &str = "v=0.1.11";
-    const REFRESH: &str = r#""cmd":"set -eu\nsudo install -d"#;
+    const REFRESH: &str = r#""cmd":"set -eu\nprobe="#;
 
     /// What the version script prints for T3 `v` started with this build's setup.
     fn current(v: &str) -> String {

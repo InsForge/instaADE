@@ -126,19 +126,19 @@ fi
 "##;
 
 /// The probe, the preload, the launcher, the unit and the service. With `$v` set (the setup)
-/// it also links T3 `$v`; without it (the refresh) T3 keeps its version. It restarts a running
-/// T3 only when something it runs with changes, and only while the probe says idle: else it
-/// exits 3 and changes nothing. The `setup` file records the setup the server was started with.
-const SERVICE_TEMPLATE: &str = r##"sudo install -d -m 0755 /usr/local/lib/instabox/activity.d
-ptmp=$(mktemp)
-cat > "$ptmp" <<'__PROBE_EOF__'
-__PROBE__
-__PROBE_EOF__
-sudo install -m 0755 "$ptmp" /usr/local/lib/instabox/activity.d/t3
-rm -f "$ptmp"
+/// it also links T3 `$v`; without it (the refresh) T3 keeps its version. It stages every file
+/// in a temporary directory first. When one differs from what is in place, or T3 must be
+/// linked, a running T3 must be idle by the staged probe: else it exits 3 before it writes
+/// anything (the setup's download only adds an unused `/opt/t3/<v>`). Then it writes them
+/// all, and restarts T3 when something changed. The `setup` file records the setup the server
+/// was started with.
+const SERVICE_TEMPLATE: &str = r##"probe=/usr/local/lib/instabox/activity.d/t3
 dir="$HOME/.local/share/t3-instabox"
 new=$(mktemp -d)
 trap 'rm -rf "$new"' EXIT
+cat > "$new/t3-probe" <<'__PROBE_EOF__'
+__PROBE__
+__PROBE_EOF__
 cat > "$new/forwarded-host.cjs" <<'__PRELOAD_EOF__'
 __PRELOAD__
 __PRELOAD_EOF__
@@ -167,18 +167,23 @@ U
 relink=0
 if [ -n "${v:-}" ] && [ "$(readlink /usr/local/bin/t3)" != "/opt/t3/$v/t3" ]; then relink=1; fi
 changed=0
+cmp -s "$new/t3-probe" "$probe" || changed=1
 cmp -s "$new/forwarded-host.cjs" "$dir/forwarded-host.cjs" || changed=1
 cmp -s "$new/t3-instabox.service" /etc/systemd/system/t3-instabox.service || changed=1
 [ "$(cat "$dir/setup" 2>/dev/null)" = __SETUP_ID__ ] || changed=1
+# Up to here only "$new" is written (and by the setup an unused /opt/t3/$v): a busy T3 keeps
+# everything it has. The check runs the staged probe, so a sandbox without one is covered.
 if [ "$relink" = 1 ] || [ "$changed" = 1 ]; then
   if systemctl is-active -q t3-instabox; then
-    answer=$(/usr/local/lib/instabox/activity.d/t3 2>/dev/null || true)
+    answer=$(python3 "$new/t3-probe" 2>/dev/null || true)
     case "$answer" in
       *'"busy": false'*|*'"busy":false'*) ;;
       *) echo "T3 is busy, update deferred" >&2; exit 3 ;;
     esac
   fi
 fi
+sudo install -d -m 0755 /usr/local/lib/instabox/activity.d
+sudo install -m 0755 "$new/t3-probe" "$probe"
 if [ "$relink" = 1 ]; then sudo ln -sfn "/opt/t3/$v/t3" /usr/local/bin/t3; fi
 first=0
 [ -e /etc/systemd/system/t3-instabox.service ] || first=1
@@ -387,9 +392,7 @@ mod tests {
     #[test]
     fn setup_script_checks_probe_before_link_change() {
         let s = setup_script("0.1.10");
-        let probe = s
-            .find("answer=$(/usr/local/lib/instabox/activity.d/t3")
-            .unwrap();
+        let probe = s.find("answer=$(python3 \"$new/t3-probe\"").unwrap();
         let exit3 = s.find("exit 3").unwrap();
         let link = s.find("ln -sfn").unwrap();
         assert!(probe < exit3 && exit3 < link);
@@ -448,12 +451,34 @@ mod tests {
         )));
     }
 
+    /// The script without the bodies of its here-documents (the probe, the preload, the unit).
+    fn shell_lines(script: &str) -> String {
+        let mut out = String::new();
+        let mut end: Option<String> = None;
+        for line in script.lines() {
+            if let Some(e) = &end {
+                if line == e {
+                    end = None;
+                }
+                continue;
+            }
+            if let Some((_, marker)) = line.rsplit_once("<<") {
+                end = Some(marker.trim_matches('\'').to_string());
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        assert!(end.is_none(), "an unended here-document");
+        out
+    }
+
     #[test]
     fn a_change_waits_for_an_idle_t3_before_anything_is_written() {
         let s = setup_script("0.1.12");
         let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        // What the running server was started with: the preload, the unit and the stamp.
+        // What is in place: the probe, the preload, the unit and the stamp of the server.
         let checks = [
+            "cmp -s \"$new/t3-probe\" \"$probe\" || changed=1",
             "cmp -s \"$new/forwarded-host.cjs\" \"$dir/forwarded-host.cjs\" || changed=1",
             "cmp -s \"$new/t3-instabox.service\" /etc/systemd/system/t3-instabox.service || changed=1",
             "[ \"$(cat \"$dir/setup\" 2>/dev/null)\" = __SETUP_ID__ ] || changed=1",
@@ -471,7 +496,10 @@ mod tests {
         }
         let exit3 = at("exit 3");
         for write in [
+            "sudo install -d -m 0755 /usr/local/lib/instabox/activity.d",
+            "sudo install -m 0755 \"$new/t3-probe\" \"$probe\"",
             "sudo ln -sfn",
+            "cat > \"$dir/start\"",
             "mv -f \"$dir/forwarded-host.cjs.new\"",
             "sudo install -m 0644 \"$new/t3-instabox.service\" /etc/systemd/system/t3-instabox.service",
             "sudo systemctl daemon-reload",
@@ -481,6 +509,29 @@ mod tests {
                 gate < exit3 && exit3 < at(write),
                 "{write} after the busy check"
             );
+        }
+        // Before the check, `sudo` only unpacks the setup's new release, and files go only to
+        // the staging directory.
+        let refresh = refresh_script();
+        for (script, sudo) in [(&s, 2), (&refresh, 0)] {
+            let before = shell_lines(
+                &script[..script
+                    .find("if [ \"$relink\" = 1 ] || [ \"$changed\" = 1 ]")
+                    .unwrap()],
+            );
+            let lines: Vec<&str> = before.lines().filter(|l| l.contains("sudo ")).collect();
+            assert_eq!(lines.len(), sudo, "{lines:?}");
+            assert!(
+                lines.iter().all(|l| l.contains("\"/opt/t3/$v\"")),
+                "{lines:?}"
+            );
+            for l in before
+                .lines()
+                .filter(|l| l.contains(" > ") || l.starts_with("cat >"))
+            {
+                assert!(l.contains("\"$new/") || l.contains("\"$tmp/"), "{l}");
+            }
+            assert!(!before.contains("mv ") && !before.contains("ln -s"));
         }
         // The stamp is written only once the server answers, and is what VERSION_SCRIPT reads.
         let stamp = at(&format!("echo {id} > \"$dir/setup\"\n    exit 0"));
@@ -534,8 +585,12 @@ mod tests {
     fn setup_script_installs_the_probe_where_it_is_run() {
         let s = setup_script("0.1.10");
         let path = PROBE.path();
-        assert!(s.contains(&format!("sudo install -m 0755 \"$ptmp\" {path}\n")));
-        assert!(s.contains(&format!("answer=$({path} 2>/dev/null")));
+        assert!(s.starts_with("set -eu\nv=0.1.10\n"));
+        assert!(s.contains(&format!("\nprobe={path}\n")));
+        assert!(s.contains("sudo install -m 0755 \"$new/t3-probe\" \"$probe\"\n"));
+        // The busy check asks the probe this build installs, from where it is staged.
+        assert!(s.contains("cat > \"$new/t3-probe\" <<'"));
+        assert!(s.contains("answer=$(python3 \"$new/t3-probe\" 2>/dev/null"));
         assert!(s.contains(&format!(":{PORT}/")) && s.contains(&format!("--port {PORT} ")));
     }
 

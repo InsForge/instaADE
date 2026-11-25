@@ -4480,7 +4480,7 @@ mod tests {
         assert!(
             !execs
                 .iter()
-                .any(|e| e.contains(r#""cmd":"set -eu\nsudo install -d"#)),
+                .any(|e| e.contains(r#""cmd":"set -eu\nprobe="#)),
             "no refresh of a current setup"
         );
         assert!(

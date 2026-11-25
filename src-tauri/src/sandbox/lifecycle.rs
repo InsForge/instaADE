@@ -512,7 +512,7 @@ mod tests {
         )
         .await;
         exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
-        exec_mock(&server, r#""cmd":"set -eu\nsudo install -d"#, "", "", 0, 1).await;
+        exec_mock(&server, r#""cmd":"set -eu\nprobe="#, "", "", 0, 1).await;
         exec_mock(&server, SETUP, "", "", 0, 0).await;
         let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
             .await

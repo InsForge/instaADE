@@ -8,7 +8,7 @@ use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
     Client, CreateMachineRequest, ExecRequest, ExecResult, MachineSpec, UpdateMachineRequest,
 };
-use crate::sandbox::sync::refresh;
+use crate::sandbox::sync::{Refresh, refresh};
 use crate::sandbox::view::mark;
 use crate::sandbox::{
     CREATE_WAIT, SandboxError, ensure_running, new_key, retry_transient, wait_op,
@@ -243,10 +243,11 @@ async fn install_and_pair(
             SETUP_EXIT_BUSY => return Err(SandboxError::AdeBusy(ade)),
             _ => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         }
-    } else {
-        // A newer version stays, but gets this build's setup. When the ADE is busy, the next
-        // sync (Open, resume) tries again; Update would refuse a sandbox that is ahead.
-        refresh(client, ade, id, &found).await?;
+    } else if refresh(client, ade, id, &found).await? == Refresh::Deferred {
+        // A newer version stays, but gets this build's setup first. Without it the running T3
+        // may refuse the pairing (DPoP), and Update would refuse a sandbox that is ahead, so a
+        // busy one is neither paired nor marked: the user tries again once it is idle.
+        return Err(SandboxError::AdeBusy(ade));
     }
     progress(Step::Pairing);
     let link = pair_link(client, ade, id).await?;
@@ -710,7 +711,7 @@ mod tests {
     }
 
     /// The start of the refresh exec's body: the setup without its version part.
-    const REFRESH: &str = r#""cmd":"set -eu\nsudo install -d"#;
+    const REFRESH: &str = r#""cmd":"set -eu\nprobe="#;
 
     async fn refresh_mock(server: &MockServer, answer: ResponseTemplate, times: u64) {
         Mock::given(method("POST"))
@@ -770,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_busy_refresh_of_a_newer_t3_still_pairs_and_offers_no_update() {
+    async fn a_busy_refresh_of_a_newer_t3_stops_the_connect_as_busy() {
         let server = MockServer::start().await;
         running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
         refresh_mock(
@@ -779,17 +780,29 @@ mod tests {
             1,
         )
         .await;
-        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
+        let steps = Mutex::new(Vec::new());
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |s| {
+            steps.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap_err();
+        // Its old setup may refuse the pairing: no code, no port, no mark. Try again when idle.
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
+        let bodies: Vec<String> = server
+            .received_requests()
             .await
-            .unwrap();
-        assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
-        // Update would refuse to move a newer T3 back: the next sync refreshes it.
-        assert_eq!(
-            (out.version.as_deref(), out.update_pending),
-            (Some("99.0.0"), false)
-        );
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert!(!bodies.iter().any(|b| b.contains(r#""cmd":"t3 pair"#)));
         let c = calls(&server).await;
-        assert!(c.iter().any(|x| x == "PATCH /v1/machines/m1"), "{c:?}");
+        assert!(
+            !c.iter()
+                .any(|x| x.starts_with("PATCH") || x.ends_with("/ports")),
+            "{c:?}"
+        );
+        assert!(!steps.lock().unwrap().contains(&Step::Done));
         drop(server);
     }
 
