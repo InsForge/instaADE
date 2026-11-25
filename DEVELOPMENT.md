@@ -95,7 +95,7 @@ The signing secrets live in two environments: `release`, which only `v*` tags ma
 
 ### In-app updates
 
-The app reads `https://github.com/InsForge/instabox-bridge/releases/latest/download/latest.json` 15 seconds after launch, every 4 hours, and when the user clicks **Check for updates** in Settings. A check never downloads. A newer version puts a dot on the Settings button and **Update** in Settings, under Updates. Only **Update** downloads, checks the signature, installs and restarts.
+The app reads `https://github.com/InsForge/instaADE/releases/latest/download/latest.json` 15 seconds after launch, every 4 hours, and when the user clicks **Check for updates** in Settings. A check never downloads, and only one runs at a time. A check fails after 30 seconds and a download after 15 minutes, and Settings then offers to try again. A newer version puts a dot on the Settings button and **Update** in Settings, under Updates. Only **Update** downloads, checks the signature, installs and restarts.
 
 - **Updater key**: the release build signs the updater files with the secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the `release` environment. Without them it fails. The public key is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Keep the private key safe: installed apps accept only updates signed with it.
 - **Updater files** on each release, each with a `.sig`: `Instabox_<version>_aarch64.app.tar.gz` and `Instabox_<version>_x64.app.tar.gz` hold the same signed, notarized and stapled app as the `.dmg` files. On Windows the updater runs `Instabox_<version>_x64-setup.exe` without questions (passive mode), then starts the app again.

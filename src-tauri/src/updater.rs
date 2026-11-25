@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use semver::Version;
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime, Wry};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::errors::ErrorView;
@@ -19,6 +19,10 @@ use crate::errors::ErrorView;
 pub const FIRST_CHECK: Duration = Duration::from_secs(15);
 /// The next checks, this often.
 pub const CHECK_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
+/// A check that takes longer fails.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// A download that takes longer fails. Generous, so a slow connection still gets the update.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +106,15 @@ fn percent(bytes: u64, total: Option<u64>) -> Option<u8> {
     Some((bytes.min(total) * 100 / total) as u8)
 }
 
+/// Who waits for a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asker {
+    /// The timed check, which shows only a newer version.
+    Timer,
+    /// Check for updates, which shows that it runs and what it found, or why it failed.
+    User,
+}
+
 /// Where updates are in this run.
 #[derive(Debug, Default)]
 struct Status {
@@ -110,6 +123,8 @@ struct Status {
     version: Option<Version>,
     percent: Option<u8>,
     error: Option<String>,
+    /// The check in flight, if any, and who waits for it. Only one runs at a time.
+    check: Option<Asker>,
 }
 
 impl Status {
@@ -128,30 +143,52 @@ impl Status {
         matches!(self.step, UpdateStep::Downloading | UpdateStep::Installing)
     }
 
-    /// Check for updates starts. False while an update installs.
-    fn checking(&mut self) -> bool {
+    /// A check is asked for. True when it should read the manifest: no check is in flight and
+    /// no update installs. Otherwise it does nothing, except that Check for updates during a
+    /// timed check waits for that check instead, so the click still shows what it finds.
+    fn begin_check(&mut self, by: Asker) -> bool {
         if self.busy() {
             return false;
         }
-        self.step = UpdateStep::Checking;
-        self.error = None;
-        true
+        let starts = match (self.check, by) {
+            (None, _) => true,
+            (Some(Asker::Timer), Asker::User) => false,
+            (Some(_), _) => return false,
+        };
+        self.check = Some(by);
+        if by == Asker::User {
+            self.step = UpdateStep::Checking;
+            self.error = None;
+        }
+        starts
     }
 
-    /// A check found `offered`; None: the manifest offers nothing for this computer. `manual`:
-    /// Check for updates, which says when the app is up to date. Changes nothing while an
-    /// update installs. A failed update of the same version keeps its error and Retry, and a
-    /// timed check that finds nothing leaves a running Check for updates alone.
-    fn found(&mut self, current: &Version, offered: Option<Version>, manual: bool) {
+    /// The check in flight ended. A failure shows only to Check for updates. Changes nothing
+    /// while an update installs.
+    fn end_check(&mut self, current: &Version, result: Result<Option<Version>, String>) {
+        let by = self.check.take();
         if self.busy() {
             return;
         }
+        match result {
+            Ok(offered) => self.found(current, offered, by == Some(Asker::User)),
+            Err(e) if by == Some(Asker::User) => {
+                self.step = UpdateStep::CheckFailed;
+                self.error = Some(e);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// A check found `offered`; None: the manifest offers nothing for this computer. `manual`:
+    /// Check for updates, which says when the app is up to date. A failed update of the same
+    /// version keeps its error and Retry.
+    fn found(&mut self, current: &Version, offered: Option<Version>, manual: bool) {
         let (step, version) = match offered.filter(|v| is_newer(current, v)) {
             Some(v) if self.step == UpdateStep::Failed && self.version.as_ref() == Some(&v) => {
                 return;
             }
             Some(v) => (UpdateStep::Available, Some(v)),
-            None if !manual && self.step == UpdateStep::Checking => return,
             None if manual || self.step == UpdateStep::UpToDate => (UpdateStep::UpToDate, None),
             None => (UpdateStep::Idle, None),
         };
@@ -160,13 +197,6 @@ impl Status {
             version,
             ..Status::default()
         };
-    }
-
-    fn check_failed(&mut self, error: String) {
-        if self.step == UpdateStep::Checking {
-            self.step = UpdateStep::CheckFailed;
-            self.error = Some(error);
-        }
     }
 
     /// The Update or Retry click: the version to install, when one is offered and none is
@@ -268,33 +298,35 @@ impl Updater {
     /// A timed check: reads the update manifest and offers a newer version. Never downloads.
     /// A failed check shows nothing.
     pub async fn check(&self) {
-        if !self.enabled || self.lock().busy() {
-            return;
-        }
-        if let Ok(offered) = self.source.check().await {
-            self.change(|s| s.found(&self.current, offered, false));
-        }
+        let _ = self.check_for(Asker::Timer).await;
     }
 
     /// Check for updates: the same check, now, showing that it runs and what it found, or
-    /// why it failed. Never downloads. Does nothing while an update installs.
+    /// why it failed. Never downloads.
     pub async fn check_now(&self) -> Result<(), ErrorView> {
         if !self.enabled {
             return Err(ErrorView::other("Updates are only for released builds"));
         }
-        if !self.change(Status::checking) {
+        self.check_for(Asker::User).await
+    }
+
+    /// One check at a time: one asked for while another is in flight, or while an update
+    /// installs, does nothing (see `Status::begin_check`), so no older answer overwrites a
+    /// newer one.
+    async fn check_for(&self, by: Asker) -> Result<(), ErrorView> {
+        if !self.enabled || !self.change(|s| s.begin_check(by)) {
             return Ok(());
         }
-        match self.source.check().await {
-            Ok(offered) => {
-                self.change(|s| s.found(&self.current, offered, true));
-                Ok(())
-            }
-            Err(e) => {
-                let message = format!("Could not check for updates: {e}");
-                self.change(|s| s.check_failed(message.clone()));
-                Err(ErrorView::other(message))
-            }
+        let result = self
+            .source
+            .check()
+            .await
+            .map_err(|e| format!("Could not check for updates: {e}"));
+        let failed = result.as_ref().err().cloned();
+        self.change(|s| s.end_check(&self.current, result));
+        match failed {
+            Some(message) if by == Asker::User => Err(ErrorView::other(message)),
+            _ => Ok(()),
         }
     }
 
@@ -326,21 +358,33 @@ impl Updater {
 
 /// The updater plugin: reads the manifest at `plugins.updater.endpoints` and checks each
 /// download against `plugins.updater.pubkey`.
-pub struct PluginSource {
-    app: AppHandle,
+pub struct PluginSource<R: Runtime = Wry> {
+    app: AppHandle<R>,
     /// The app's own cleanup on quit. A Windows install quits the app without its exit event.
     on_quit: Arc<dyn Fn() + Send + Sync>,
     /// The update the last check found.
     found: Mutex<Option<tauri_plugin_updater::Update>>,
+    check_timeout: Duration,
+    download_timeout: Duration,
 }
 
-impl PluginSource {
-    pub fn new(app: AppHandle, on_quit: Arc<dyn Fn() + Send + Sync>) -> PluginSource {
+impl<R: Runtime> PluginSource<R> {
+    pub fn new(app: AppHandle<R>, on_quit: Arc<dyn Fn() + Send + Sync>) -> PluginSource<R> {
         PluginSource {
             app,
             on_quit,
             found: Mutex::new(None),
+            check_timeout: CHECK_TIMEOUT,
+            download_timeout: DOWNLOAD_TIMEOUT,
         }
+    }
+
+    /// Test only: other limits for a check and a download.
+    #[cfg(test)]
+    fn with_timeouts(mut self, check: Duration, download: Duration) -> PluginSource<R> {
+        self.check_timeout = check;
+        self.download_timeout = download;
+        self
     }
 
     fn updater(&self) -> Result<tauri_plugin_updater::Updater, String> {
@@ -348,6 +392,9 @@ impl PluginSource {
         self.app
             .updater_builder()
             .version_comparator(|current, release| is_newer(&current, &release.version))
+            // Without it a check never times out. It covers the check only: each update the
+            // check returns has a timeout of its own, for its download.
+            .timeout(self.check_timeout)
             // Replaces the plugin's own hook, which only cleans up Tauri.
             .on_before_exit(move || {
                 on_quit();
@@ -367,7 +414,7 @@ impl PluginSource {
 }
 
 #[async_trait]
-impl Source for PluginSource {
+impl<R: Runtime> Source for PluginSource<R> {
     async fn check(&self) -> Result<Option<Version>, String> {
         let update = self.updater()?.check().await.map_err(|e| e.to_string())?;
         let version = update
@@ -378,7 +425,7 @@ impl Source for PluginSource {
     }
 
     async fn install(&self, version: &Version, progress: OnProgress) -> Result<(), String> {
-        let update = match self.found(version) {
+        let mut update = match self.found(version) {
             Some(u) => u,
             None => {
                 self.check().await?;
@@ -386,6 +433,8 @@ impl Source for PluginSource {
                     .ok_or_else(|| "it is no longer offered".to_string())?
             }
         };
+        // The plugin leaves it unset, and then a download never times out.
+        update.timeout = Some(self.download_timeout);
         let mut bytes = 0u64;
         let on_chunk = progress.clone();
         // The download checks the signature before it returns.
@@ -411,26 +460,45 @@ impl Source for PluginSource {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tokio::sync::Semaphore;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
     }
 
     /// A manifest that offers `offered` (a check fails while `check_fails` is set), and an
-    /// install that fails while `fail` is set.
+    /// install that fails while `fail` is set. While `gate` is set, each check waits for one of
+    /// its permits before it answers.
     #[derive(Default)]
     struct Fake {
         offered: Mutex<Option<Version>>,
         check_fails: Mutex<Option<String>>,
         fail: Mutex<Option<String>>,
+        gate: Mutex<Option<Arc<Semaphore>>>,
         checks: AtomicUsize,
         installs: AtomicUsize,
+    }
+
+    impl Fake {
+        /// From now on, checks wait until `release`.
+        fn hold(&self) -> Arc<Semaphore> {
+            let gate = Arc::new(Semaphore::new(0));
+            *self.gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
     }
 
     #[async_trait]
     impl Source for Fake {
         async fn check(&self) -> Result<Option<Version>, String> {
             self.checks.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             if let Some(e) = self.check_fails.lock().unwrap().clone() {
                 return Err(e);
             }
@@ -484,10 +552,13 @@ mod tests {
         }
     }
 
-    /// A launch of InstaBox 0.1.7 whose manifest offers `offered`.
-    fn launch(enabled: bool, offered: Option<&str>) -> Run {
-        let source = Arc::new(Fake::default());
-        *source.offered.lock().unwrap() = offered.map(v);
+    type Shown = Arc<Mutex<Vec<UpdateView>>>;
+
+    /// InstaBox 0.1.7 on `source`: the updater, what it showed and how often it restarted.
+    fn updater_on(
+        enabled: bool,
+        source: Arc<dyn Source>,
+    ) -> (Arc<Updater>, Shown, Arc<AtomicUsize>) {
         let shown = Arc::new(Mutex::new(Vec::new()));
         let restarts = Arc::new(AtomicUsize::new(0));
         let updater = {
@@ -495,18 +566,33 @@ mod tests {
             Arc::new(Updater::new(
                 v("0.1.7"),
                 enabled,
-                source.clone(),
+                source,
                 Arc::new(move |u| shown.lock().unwrap().push(u)),
                 Arc::new(move || {
                     restarts.fetch_add(1, Ordering::SeqCst);
                 }),
             ))
         };
+        (updater, shown, restarts)
+    }
+
+    /// A launch of InstaBox 0.1.7 whose manifest offers `offered`.
+    fn launch(enabled: bool, offered: Option<&str>) -> Run {
+        let source = Arc::new(Fake::default());
+        *source.offered.lock().unwrap() = offered.map(v);
+        let (updater, shown, restarts) = updater_on(enabled, source.clone());
         Run {
             updater,
             source,
             shown,
             restarts,
+        }
+    }
+
+    /// Lets other tasks run until `done`.
+    async fn until(done: impl Fn() -> bool) {
+        while !done() {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -567,7 +653,7 @@ mod tests {
         assert_eq!(
             app["plugins"]["updater"]["endpoints"],
             serde_json::json!([
-                "https://github.com/InsForge/instabox-bridge/releases/latest/download/latest.json"
+                "https://github.com/InsForge/instaADE/releases/latest/download/latest.json"
             ])
         );
         assert!(
@@ -589,7 +675,7 @@ mod tests {
     #[test]
     fn the_plugin_reads_the_manifest_release_yml_writes() {
         // The shape the manifest job in .github/workflows/release.yml writes.
-        let base = "https://github.com/InsForge/instabox-bridge/releases/download/v0.1.8";
+        let base = "https://github.com/InsForge/instaADE/releases/download/v0.1.8";
         let manifest = serde_json::json!({
             "version": "0.1.8",
             "notes": "## What's Changed\n* Update from the app",
@@ -804,34 +890,197 @@ mod tests {
         let current = v("0.1.7");
         let mut s = Status::default();
         s.found(&current, Some(v("0.1.8")), false);
+        // A timed check starts, then the user clicks Update.
+        assert!(s.begin_check(Asker::Timer));
         assert_eq!(s.start(), Some(v("0.1.8")));
         s.progress(Progress::Downloaded {
             bytes: 10,
             total: Some(100),
         });
         let downloading = s.view(&current, true);
-        s.found(&current, Some(v("0.1.9")), false);
-        s.found(&current, None, true);
-        assert!(!s.checking(), "Check for updates");
+        // The check's answer comes too late to count.
+        s.end_check(&current, Ok(Some(v("0.1.9"))));
+        assert!(!s.begin_check(Asker::Timer));
+        assert!(!s.begin_check(Asker::User), "Check for updates");
         assert_eq!(s.start(), None, "a second click");
         assert_eq!(s.view(&current, true), downloading);
     }
 
-    #[test]
-    fn a_timed_check_leaves_a_running_check_for_updates_alone() {
-        let current = v("0.1.7");
-        let mut s = Status::default();
-        assert!(s.checking());
-        s.found(&current, None, false);
-        assert_eq!(s.step, UpdateStep::Checking);
-        // What it finds still counts.
-        s.found(&current, Some(v("0.1.8")), false);
-        assert_eq!(s.step, UpdateStep::Available);
-        // A failure of the click's own check, after that, changes nothing.
-        s.check_failed("offline".into());
+    #[tokio::test]
+    async fn a_check_asked_for_while_one_runs_does_nothing() {
+        let r = launch(true, None);
+        let gate = r.source.hold();
+        let click = tokio::spawn({
+            let u = r.updater.clone();
+            async move { u.check_now().await }
+        });
+        until(|| r.checks() == 1).await;
+        // A second click and a timed check start no other check.
+        r.updater.check_now().await.unwrap();
+        r.updater.check().await;
+        assert_eq!(r.checks(), 1);
+        assert_eq!(r.last(), Some(view(UpdateStep::Checking, None, None)));
+        // Then an answer that came late could not overwrite a newer one.
+        *r.source.offered.lock().unwrap() = Some(v("0.1.8"));
+        gate.add_permits(1);
+        click.await.unwrap().unwrap();
         assert_eq!(
-            s.view(&current, true),
-            view(UpdateStep::Available, Some("0.1.8"), None)
+            r.last(),
+            Some(view(UpdateStep::Available, Some("0.1.8"), None))
         );
+        assert_eq!(r.checks(), 1);
+        // Once it ended, the next check runs.
+        gate.add_permits(1);
+        r.updater.check_now().await.unwrap();
+        assert_eq!(r.checks(), 2);
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_during_a_timed_check_shows_what_that_check_finds() {
+        let r = launch(true, None);
+        let gate = r.source.hold();
+        let timed = tokio::spawn({
+            let u = r.updater.clone();
+            async move { u.check().await }
+        });
+        until(|| r.checks() == 1).await;
+        // The click reads nothing itself, but shows that a check runs.
+        r.updater.check_now().await.unwrap();
+        assert_eq!(r.checks(), 1);
+        assert_eq!(r.last(), Some(view(UpdateStep::Checking, None, None)));
+        // The timed check's answer is the click's: up to date, or why it failed.
+        gate.add_permits(1);
+        timed.await.unwrap();
+        assert_eq!(r.last(), Some(view(UpdateStep::UpToDate, None, None)));
+
+        *r.source.check_fails.lock().unwrap() = Some("offline".into());
+        let timed = tokio::spawn({
+            let u = r.updater.clone();
+            async move { u.check().await }
+        });
+        until(|| r.checks() == 2).await;
+        r.updater.check_now().await.unwrap();
+        gate.add_permits(1);
+        timed.await.unwrap();
+        assert_eq!(
+            r.last(),
+            Some(failed(
+                UpdateStep::CheckFailed,
+                None,
+                "Could not check for updates: offline"
+            ))
+        );
+        assert_eq!(r.checks(), 2);
+    }
+
+    #[test]
+    fn a_check_has_a_short_limit_and_a_download_a_long_one() {
+        assert_eq!(CHECK_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(15 * 60));
+    }
+
+    /// A manifest that offers `version` for every computer, with its file at `package`.
+    fn manifest(version: &str, package: &str) -> serde_json::Value {
+        let file = serde_json::json!({ "url": package, "signature": "c2ln" });
+        serde_json::json!({
+            "version": version,
+            "pub_date": "2026-11-25T21:24:33Z",
+            "platforms": {
+                "darwin-aarch64": file, "darwin-x86_64": file, "windows-x86_64": file,
+                "linux-x86_64": file, "linux-aarch64": file
+            }
+        })
+    }
+
+    /// An app whose updater plugin reads `server`'s /latest.json, with InstaBox's key.
+    fn plugin_app(server: &MockServer) -> tauri::App<tauri::test::MockRuntime> {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({
+                "pubkey": conf["plugins"]["updater"]["pubkey"],
+                "endpoints": [format!("{}/latest.json", server.uri())],
+                // The test server speaks plain HTTP.
+                "dangerousInsecureTransportProtocol": true
+            }),
+        );
+        tauri::test::mock_builder()
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .build(context)
+            .unwrap()
+    }
+
+    async fn serve(server: &MockServer, at: &str, answer: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(answer)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_check_fails_at_its_limit_and_can_run_again() {
+        let server = MockServer::start().await;
+        let package = format!("{}/package", server.uri());
+        let late = ResponseTemplate::new(200)
+            .set_body_json(manifest("9.0.0", &package))
+            .set_delay(Duration::from_secs(20));
+        serve(&server, "/latest.json", late).await;
+        let app = plugin_app(&server);
+        let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
+            .with_timeouts(Duration::from_millis(300), DOWNLOAD_TIMEOUT);
+        let (updater, shown, _) = updater_on(true, Arc::new(source));
+
+        let started = Instant::now();
+        let e = updater.check_now().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            e.message.starts_with("Could not check for updates: "),
+            "{e:?}"
+        );
+        let last = shown.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.step, UpdateStep::CheckFailed);
+        assert_eq!(last.error, Some(e));
+
+        // Check for updates again, once the server answers.
+        server.reset().await;
+        let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
+        serve(&server, "/latest.json", ok).await;
+        updater.check_now().await.unwrap();
+        let last = shown.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.step, UpdateStep::Available);
+        assert_eq!(last.version.as_deref(), Some("9.0.0"));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_download_fails_at_its_own_limit_with_retry() {
+        let server = MockServer::start().await;
+        let package = format!("{}/package", server.uri());
+        let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
+        serve(&server, "/latest.json", ok).await;
+        let late = ResponseTemplate::new(200)
+            .set_body_bytes(vec![0u8; 1024])
+            .set_delay(Duration::from_secs(20));
+        serve(&server, "/package", late).await;
+        let app = plugin_app(&server);
+        // The download's limit is far below the check's: only its own can end it in time.
+        let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
+            .with_timeouts(Duration::from_secs(10), Duration::from_millis(300));
+        let (updater, shown, restarts) = updater_on(true, Arc::new(source));
+        updater.check().await;
+
+        let started = Instant::now();
+        let e = updater.install().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            e.message.starts_with("Could not update to 9.0.0: "),
+            "{e:?}"
+        );
+        let last = shown.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.step, UpdateStep::Failed, "with Retry");
+        assert_eq!(last.error, Some(e));
+        assert_eq!(restarts.load(Ordering::SeqCst), 0);
     }
 }

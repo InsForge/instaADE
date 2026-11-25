@@ -51,6 +51,8 @@ libc = "0.2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+# A mock app, so the updater plugin runs in tests.
+tauri = { version = "2", features = ["test"] }
 
 [profile.release]
 codegen-units = 1
