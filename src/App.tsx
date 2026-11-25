@@ -16,6 +16,7 @@ import type { PendingCreate } from "./SandboxList";
 import SandboxMenu from "./SandboxMenu";
 import Settings from "./Settings";
 import Setup from "./Setup";
+import UpdateRow from "./UpdateRow";
 import type { AdeId, AppState, ErrorView } from "./types";
 
 type View = { name: "list" } | { name: "new" } | { name: "settings" } | { name: "details"; id: string };
@@ -161,6 +162,7 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
   const onRetry = retryId && retryAde && sameError(pe, error) ? () => connect(retryId, retryAde) : undefined;
   const showError = !!error && error.kind !== "signedOut" && !progressOwnsError;
   const showNotice = !!notice && !needSetup;
+  const update = state.update;
 
   const isList = !needSetup && current.name === "list";
   // Sign-in has no header: it draws its own brand block. The list's header scrolls with it.
@@ -189,7 +191,7 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     );
   }
 
-  const banners = (showError || showNotice) && (
+  const banners = (showError || showNotice || update) && (
     <div className="banners">
       {showError && <ErrorNotice error={error!} state={state} mode={mode} onConnect={connect} onRetry={onRetry} />}
       {showNotice && (
@@ -197,6 +199,7 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
           <span className="banner-text">{notice}</span>
         </div>
       )}
+      {update && <UpdateRow update={update} />}
     </div>
   );
 

@@ -14,6 +14,7 @@ use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
 use crate::login;
+use crate::updater::Updater;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -188,4 +189,19 @@ pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()>
 #[tauri::command]
 pub fn open_url(core: Shared<'_>, url: String) -> Res<()> {
     core.open_url(&url)
+}
+
+/// Update: downloads the update the popover offers, checks its signature, installs it and
+/// restarts the app. A failure shows in `state.update`, with Retry. Async, like `update_later`,
+/// so it never runs on the main thread (see `Updater`).
+#[tauri::command]
+pub async fn install_update(updater: State<'_, Arc<Updater>>) -> Res<()> {
+    updater.inner().clone().install().await
+}
+
+/// Later: no update is offered until the next launch.
+#[tauri::command]
+pub async fn update_later(updater: State<'_, Arc<Updater>>) -> Res<()> {
+    updater.later();
+    Ok(())
 }

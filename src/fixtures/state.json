@@ -159,6 +159,8 @@
   "startAtLogin": true,
   "update": {
     "version": "0.2.0",
-    "url": "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0"
+    "step": "downloading",
+    "percent": 42,
+    "error": null
   }
 }

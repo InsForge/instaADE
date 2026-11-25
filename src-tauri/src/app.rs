@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::watch;
 use url::Url;
 
@@ -32,13 +32,12 @@ use crate::sandbox::view::{
 use crate::sandbox::{self, SandboxError, connect, lifecycle};
 use crate::ssh::{self, SshTokenStore};
 use crate::ssh_config;
+use crate::updater::UpdateView;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
 /// A sandbox with an InstaBox SSH host (Orca) gets a new token once the stored one has fewer days
 /// left than this, so the host keeps working without a click.
 const HOST_TOKEN_RENEW_DAYS: i64 = 7;
-const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instabox-bridge/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/InsForge/instabox-bridge/releases/latest";
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
 /// Account data and the desktop ADE versions are read this often.
@@ -122,13 +121,6 @@ impl AdeView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateInfo {
-    pub version: String,
-    pub url: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
@@ -151,7 +143,8 @@ pub struct AppState {
     pub progress: Option<ProgressView>,
     pub error: Option<ErrorView>,
     pub start_at_login: bool,
-    pub update: Option<UpdateInfo>,
+    /// The update of InstaBox on offer (see `updater`).
+    pub update: Option<UpdateView>,
 }
 
 /// What the last refresh read from the API and this computer.
@@ -469,27 +462,6 @@ pub fn fail_progress(prev: Option<&ProgressView>, error: &ErrorView) -> Option<P
             error: Some(error.clone()),
             ..p.clone()
         })
-}
-
-/// The release in a GitHub `releases/latest` body, when it is newer than `current`.
-pub fn newer_release(current: &str, body: &str) -> Option<UpdateInfo> {
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-        #[serde(default)]
-        html_url: String,
-    }
-    let r: Release = serde_json::from_str(body).ok()?;
-    let tag = r.tag_name.trim_start_matches('v');
-    let newer = semver::Version::parse(tag).ok()? > semver::Version::parse(current).ok()?;
-    newer.then(|| UpdateInfo {
-        version: tag.to_string(),
-        url: if r.html_url.starts_with("https://github.com/") {
-            r.html_url
-        } else {
-            RELEASES_PAGE.to_string()
-        },
-    })
 }
 
 /// URLs the UI may ask the app to open in the default handler: https, and the links of every
@@ -1133,6 +1105,10 @@ impl Core {
         self.update(|i| i.state.start_at_login = on);
     }
 
+    pub fn set_update(&self, update: Option<UpdateView>) {
+        self.update(|i| i.state.update = update);
+    }
+
     pub fn open_url(&self, url: &str) -> Res<()> {
         let r = if allowed_url(url) {
             (self.open)(url, None).map_err(ErrorView::other)
@@ -1193,7 +1169,6 @@ impl Core {
             self.refresh_and_sync(true).await;
             self.refresh_mcp().await;
         }
-        self.check_update().await;
     }
 
     /// Reads machines, and with `full` also the account, templates, snapshots and the
@@ -1508,26 +1483,6 @@ impl Core {
         .await
         .unwrap_or_default();
         self.update(|i| i.state.mcp = status);
-    }
-
-    pub async fn check_update(&self) {
-        let Ok(http) = reqwest::Client::builder()
-            .user_agent("instabox-bridge")
-            .timeout(Duration::from_secs(10))
-            .build()
-        else {
-            return;
-        };
-        let Ok(resp) = http.get(RELEASES_API).send().await else {
-            return;
-        };
-        if !resp.status().is_success() {
-            return;
-        }
-        let Ok(body) = resp.text().await else { return };
-        if let Some(u) = newer_release(env!("CARGO_PKG_VERSION"), &body) {
-            self.update(|i| i.state.update = Some(u));
-        }
     }
 
     /// Refreshes machines on a timer until the process ends.
@@ -2338,6 +2293,7 @@ mod tests {
     use crate::connected::{FileConnectedStore, MemoryConnectedStore};
     use crate::mcp::MemoryKeyStore;
     use crate::ssh::MemorySshStore;
+    use crate::updater::UpdateStep;
     use chrono::TimeZone;
     use std::collections::BTreeMap;
 
@@ -2493,9 +2449,11 @@ mod tests {
         });
         s.error = Some(ErrorView::from(SandboxError::Cooldown { minutes: 12 }));
         s.start_at_login = true;
-        s.update = Some(UpdateInfo {
+        s.update = Some(UpdateView {
             version: "0.2.0".into(),
-            url: "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0".into(),
+            step: UpdateStep::Downloading,
+            percent: Some(42),
+            error: None,
         });
         s
     }
@@ -3270,33 +3228,6 @@ mod tests {
             "ssh ibssh_x@ssh.example.test"
         );
         assert_eq!(core.state().error, boom, "success does not clear it");
-    }
-
-    #[test]
-    fn newer_release_compares_versions_and_checks_the_link() {
-        let body = |tag: &str, url: &str| format!(r#"{{"tag_name":"{tag}","html_url":"{url}"}}"#);
-        let ok = newer_release(
-            "0.1.0",
-            &body(
-                "v0.2.0",
-                "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0",
-            ),
-        )
-        .unwrap();
-        assert_eq!(ok.version, "0.2.0");
-        assert!(ok.url.ends_with("v0.2.0"));
-        assert_eq!(
-            newer_release("0.2.0", &body("v0.2.0", "https://github.com/x")),
-            None
-        );
-        assert_eq!(
-            newer_release("0.3.0", &body("v0.2.0", "https://github.com/x")),
-            None
-        );
-        assert_eq!(newer_release("0.1.0", "not json"), None);
-        assert_eq!(newer_release("0.1.0", r#"{"message":"Not Found"}"#), None);
-        let odd = newer_release("0.1.0", &body("v0.2.0", "https://evil.example/x")).unwrap();
-        assert_eq!(odd.url, RELEASES_PAGE);
     }
 
     #[test]

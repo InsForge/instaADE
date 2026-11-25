@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { T3_DOWNLOAD_URL } from "./api";
 import fixture from "./fixtures/state.json";
 import { modeKey } from "./mode";
-import type { AdeView, AppState, SandboxView } from "./types";
+import type { AdeView, AppState, SandboxView, UpdateView } from "./types";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a), isTauri: () => true }));
@@ -134,7 +134,7 @@ test("fixture and sample have the same nested keys", () => {
     sandboxes: [box],
     progress: { kind: "create", step: "x", machineId: null, ade: "t3", error: null },
     error: { kind: "other", message: "" },
-    update: { version: "", url: "" },
+    update: { version: "", step: "available", percent: null, error: null },
   };
   // minutes and code are optional on ErrorView.
   const strip = (ks: string[]) => [...new Set(ks.filter((k) => !/\.(minutes|code)$/.test(k)))].sort();
@@ -859,12 +859,11 @@ test("details: Pause, Pair again and a confirmed delete", async () => {
 
 // ---- settings ----
 
-test("settings: update, account, the ADEs on this Mac and start at login", async () => {
+test("settings: account, the ADEs on this Mac and start at login", async () => {
   show(
     {
       ades: [t3Ade, { ...cmuxAde, version: null }, orcaAde, paradevAde],
       orgs: [...sample.orgs, { id: "org-team", name: "team", tier: "pro", personal: false }],
-      update: { version: "0.2.0", url: "https://example.com/v0.2.0" },
     },
     [{}],
   );
@@ -877,10 +876,6 @@ test("settings: update, account, the ADEs on this Mac and start at login", async
     "Orca1.4.269",
     "Paradev2.0.11",
   ]);
-  expect(screen.getByText("A new version of InstaBox is ready.")).toBeTruthy();
-  await userEvent.click(screen.getByRole("button", { name: "Download" }));
-  expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.com/v0.2.0" });
-
   // The account card shows the login; there is no email or avatar to show yet.
   expect(screen.getByText("alex")).toBeTruthy();
   expect(screen.queryByText(/Email/)).toBeNull();
@@ -909,6 +904,68 @@ test("settings: no section for agents on this Mac, whatever their MCP state", as
   expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
   expect(screen.queryByText("Added")).toBeNull();
   expect(calls("add_mcp").length).toBe(0);
+});
+
+// ---- the update of InstaBox ----
+
+const offered: UpdateView = { version: "0.2.0", step: "available", percent: null, error: null };
+
+test("update: no row while no update is offered", async () => {
+  show({}, [{}]);
+  await screen.findByText("dev-1");
+  expect(screen.queryByText(/InstaBox .* is available/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(screen.queryByRole("progressbar", { name: "Update progress" })).toBeNull();
+});
+
+test("update: Update downloads with progress, then installs", async () => {
+  const { state } = show({ update: offered }, [{}]);
+  const row = (await screen.findByText("InstaBox 0.2.0 is available")).closest(".banner") as HTMLElement;
+  await userEvent.click(within(row).getByRole("button", { name: "Update" }));
+  expect(invoke).toHaveBeenCalledWith("install_update");
+
+  // The back end reports the download. The size may come later.
+  act(() => emit({ ...state, update: { ...offered, step: "downloading" } }));
+  expect(screen.getByText("Downloading InstaBox 0.2.0")).toBeTruthy();
+  expect(screen.getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBeNull();
+  // Nothing to click while it downloads.
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Later" })).toBeNull();
+  act(() => emit({ ...state, update: { ...offered, step: "downloading", percent: 42 } }));
+  expect(screen.getByText("Downloading InstaBox 0.2.0 (42%)")).toBeTruthy();
+  expect(screen.getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBe("42");
+  act(() => emit({ ...state, update: { ...offered, step: "installing" } }));
+  expect(screen.getByText("Installing InstaBox 0.2.0, then restarting")).toBeTruthy();
+  expect(calls("install_update").length).toBe(1);
+});
+
+test("update: a failure shows why with Retry, and no second banner", async () => {
+  const error = { kind: "other" as const, message: "Could not update to 0.2.0: signature mismatch" };
+  show({ update: { ...offered, step: "failed", error } }, [{}], { install_update: () => Promise.reject(error) });
+  const row = (await screen.findByText(error.message)).closest(".banner") as HTMLElement;
+  expect(row.getAttribute("role")).toBe("alert");
+  expect(within(row).getByRole("button", { name: "Later" })).toBeTruthy();
+  await userEvent.click(within(row).getByRole("button", { name: "Retry" }));
+  expect(calls("install_update").length).toBe(1);
+  // The rejection shows in state.update only.
+  await act(() => new Promise((r) => setTimeout(r, 0)));
+  expect(screen.getAllByText(error.message).length).toBe(1);
+});
+
+test("update: Later hides the row", async () => {
+  const { state } = show({ update: offered }, [{}]);
+  await userEvent.click(await screen.findByRole("button", { name: "Later" }));
+  expect(invoke).toHaveBeenCalledWith("update_later");
+  // The back end hides it for the rest of this run.
+  act(() => emit({ ...state, update: null }));
+  expect(screen.queryByText("InstaBox 0.2.0 is available")).toBeNull();
+  expect(calls("install_update").length).toBe(0);
+});
+
+test("update: the row shows on the other screens too, sign-in included", async () => {
+  show({ update: offered, signedIn: false });
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  expect(screen.getByText("InstaBox 0.2.0 is available")).toBeTruthy();
 });
 
 // ---- first run ----

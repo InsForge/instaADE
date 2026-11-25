@@ -12,6 +12,7 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `ssh_config.rs`: the SSH hosts InstaBox writes for Orca, and the one line it adds to `~/.ssh/config`.
   - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
+  - `updater.rs`: offers a new version of InstaBox and installs it when the user clicks Update (see [In-app updates](#in-app-updates)).
 - `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 
 The UI never calls the instabox API itself. Every action on a sandbox, the account or this computer is a Rust command, and is tested in Rust. The UI owns what it shows, such as the picked ADE, and is tested with Vitest.
@@ -87,6 +88,18 @@ Repository admins cut releases.
 
 1. Bump the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`, and merge that through a pull request.
 2. Push a `vX.Y.Z` tag on `main`. Only admins may push `v*` tags.
-3. **Release** (`.github/workflows/release.yml`) builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signature, and uploads them to the GitHub release.
+3. **Release** (`.github/workflows/release.yml`) builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signatures, and uploads them to the GitHub release with the updater files.
+4. When all three builds are done, it uploads `latest.json`. From then on, the app offers the release.
 
 The signing secrets live in two environments: `release`, which only `v*` tags may use, and `preview`, which only `main` may use. Never add them at the repository level.
+
+### In-app updates
+
+The app reads `https://github.com/InsForge/instabox-bridge/releases/latest/download/latest.json` 15 seconds after launch and every 4 hours. A check never downloads. Only **Update** downloads, checks the signature, installs and restarts. **Later** hides the offer until the next launch.
+
+- **Updater key**: the release build signs the updater files with the secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the `release` environment. Without them it fails. The public key is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Keep the private key safe: installed apps accept only updates signed with it.
+- **Updater files** on each release, each with a `.sig`: `Instabox_<version>_aarch64.app.tar.gz` and `Instabox_<version>_x64.app.tar.gz` hold the same signed, notarized and stapled app as the `.dmg` files. On Windows the updater runs `Instabox_<version>_x64-setup.exe` without questions (passive mode), then starts the app again.
+- **`latest.json`** names the version, the release notes, the date and, for `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`, the file's URL on this release and the text of its `.sig`. The tag must match the app's version, since each signature names it.
+- `latest` is the newest release that is not a prerelease. The `instabox-preview` prerelease must never become latest.
+- Instabox Preview never updates: its config builds no updater files, so it needs no key, and the app checks only in a release build with InstaBox's identifier. CI builds the Windows installer with `--no-sign`, as it has no key either. Dev builds never check.
+- 0.1.6 and earlier have no updater. Their users update by hand once, to the first release with it.

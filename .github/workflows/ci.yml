@@ -50,7 +50,8 @@ jobs:
         run: |
           cargo clippy -- -D warnings
           cargo test
-      - run: bun tauri build --bundles nsis
+      # The updater key lives only in the release environment, so CI signs no updater files.
+      - run: bun tauri build --bundles nsis --no-sign
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:

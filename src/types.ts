@@ -104,6 +104,17 @@ export interface ProgressView {
   error: ErrorView | null;
 }
 
+/** The update of InstaBox on offer (Rust: `updater::UpdateView`). */
+export interface UpdateView {
+  version: string;
+  /** available: offer Update and Later. downloading, installing: the app restarts when done. failed: offer Retry and Later. */
+  step: "available" | "downloading" | "installing" | "failed";
+  /** downloading: how far, once the size is known. */
+  percent: number | null;
+  /** failed: why. */
+  error: ErrorView | null;
+}
+
 export interface AppState {
   signedIn: boolean;
   login: string | null;
@@ -122,5 +133,5 @@ export interface AppState {
   progress: ProgressView | null;
   error: ErrorView | null;
   startAtLogin: boolean;
-  update: { version: string; url: string } | null;
+  update: UpdateView | null;
 }

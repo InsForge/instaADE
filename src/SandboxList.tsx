@@ -311,9 +311,8 @@ export default function SandboxList(props: Props) {
           >
             <ExternalLink />
           </button>
-          <button className="icon-btn hd" aria-label="Settings" title={state.update ? "Update available" : undefined} onClick={onSettings}>
+          <button className="icon-btn hd" aria-label="Settings" onClick={onSettings}>
             <Gear />
-            {state.update && <span className="badge" aria-hidden="true" />}
           </button>
         </div>
       </div>
