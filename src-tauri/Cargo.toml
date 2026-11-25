@@ -39,11 +39,13 @@ ring = "0.17"
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
 
-# Start at login through SMAppService on macOS 13 and later, and moving the old app to the
-# Trash (NSFileManager, libc). Tauri and the autostart plugin already depend on these.
+# Start at login through SMAppService on macOS 13 and later, and the old app: asking it to
+# quit (NSRunningApplication) and moving it to the Trash (NSFileManager, libc). Tauri and the
+# autostart plugin already depend on these.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSError", "NSFileManager", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSError", "NSFileManager", "NSString", "NSURL"] }
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService", "SMErrors"] }
 libc = "0.2"
 

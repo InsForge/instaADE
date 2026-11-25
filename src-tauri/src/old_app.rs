@@ -3,8 +3,13 @@
 //! release build on macOS looks for that old copy, and the popover offers to move it to the
 //! Trash. Only a folder named `Instabox.app` in `/Applications` or `~/Applications`, with this
 //! app's identifier, that this app does not run from, is ever offered or moved.
+//!
+//! Only one copy runs at a time, since both have the same identifier. So before the
+//! single-instance plugin hands a launch over to a running copy, a launch asks a running old
+//! copy to quit (see [`quit_running`]).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -126,6 +131,93 @@ pub fn trash_offered(view: &OldAppView, identifier: &str) -> Result<usize, Strin
     }
 }
 
+/// How long a launch waits for an old copy to quit. Its quit clears a copied secret first,
+/// which takes at most a second.
+const QUIT_WAIT: Duration = Duration::from_secs(5);
+/// How often the launch checks whether it has quit.
+const QUIT_STEP: Duration = Duration::from_millis(100);
+
+/// What asking the running old copies to quit came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quit {
+    /// None runs.
+    NoneRuns,
+    /// They all quit.
+    Quit,
+    /// One would not take the request, or still runs after the wait.
+    StillRuns,
+}
+
+/// Asks each of the running old copies `copies` to quit (`ask`: false when the request could
+/// not be sent), then waits up to `wait` until none runs (`runs`), checking every `step`. It
+/// never forces a copy to quit.
+pub fn quit_copies(
+    copies: &[PathBuf],
+    ask: impl Fn(&Path) -> bool,
+    runs: impl Fn(&Path) -> bool,
+    wait: Duration,
+    step: Duration,
+) -> Quit {
+    if copies.is_empty() {
+        return Quit::NoneRuns;
+    }
+    // Every request goes out before any wait, and one that cannot be sent ends it: that copy
+    // keeps running, so this launch could not take over anyway.
+    let sent: Vec<bool> = copies.iter().map(|c| ask(c)).collect();
+    if sent.contains(&false) {
+        return Quit::StillRuns;
+    }
+    let start = Instant::now();
+    loop {
+        if !copies.iter().any(|c| runs(c)) {
+            return Quit::Quit;
+        }
+        if start.elapsed() >= wait {
+            return Quit::StillRuns;
+        }
+        std::thread::sleep(step);
+    }
+}
+
+/// Run first in a launch, before the single-instance plugin: while an old copy runs, the
+/// plugin would hand this launch to it, and this app would exit without offering the Trash.
+/// So a release build on macOS asks every running copy named `Instabox.app` with this app's
+/// identifier, other than this bundle, to quit the normal way, and waits for it. When one
+/// still runs, the user is told to quit it, and the launch goes on as before. Another launch
+/// of this app itself is never asked to quit, so it still gets the launch.
+pub fn quit_running(identifier: &str, release: bool) -> Quit {
+    #[cfg(target_os = "macos")]
+    {
+        if !looks(identifier, release) {
+            return Quit::NoneRuns;
+        }
+        let Some(running) = running_bundle() else {
+            return Quit::NoneRuns;
+        };
+        let apps: Vec<_> = macos::running_apps(identifier)
+            .into_iter()
+            .filter(|(bundle, _)| is_old_copy(bundle, identifier, &running))
+            .collect();
+        let copies: Vec<PathBuf> = apps.iter().map(|(b, _)| b.clone()).collect();
+        let quit = quit_copies(
+            &copies,
+            |c| apps.iter().any(|(b, app)| b == c && app.terminate()),
+            |c| runs_from(c, &macos::running_executables()),
+            QUIT_WAIT,
+            QUIT_STEP,
+        );
+        if quit == Quit::StillRuns {
+            macos::tell_to_quit();
+        }
+        quit
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (identifier, release);
+        Quit::NoneRuns
+    }
+}
+
 /// The bundle this process runs from.
 fn running_bundle() -> Option<PathBuf> {
     bundle_of(&std::env::current_exe().ok()?)
@@ -168,7 +260,11 @@ mod macos {
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
 
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSRunningApplication;
     use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    use crate::process::{command, run_bounded};
 
     /// The programs of the processes this user can read.
     pub fn running_executables() -> Vec<PathBuf> {
@@ -206,6 +302,30 @@ mod macos {
         NSFileManager::defaultManager()
             .trashItemAtURL_resultingItemURL_error(&url, None)
             .map_err(|e| e.localizedDescription().to_string())
+    }
+
+    /// The running apps with `identifier`, each with its bundle, this process included.
+    pub fn running_apps(identifier: &str) -> Vec<(PathBuf, Retained<NSRunningApplication>)> {
+        let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            &NSString::from_str(identifier),
+        );
+        apps.iter()
+            .filter_map(|app| {
+                let path = app.bundleURL()?.path()?;
+                Some((PathBuf::from(path.to_string()), app))
+            })
+            .collect()
+    }
+
+    /// Tells the user an old copy still runs and how to go on. The alert closes by itself
+    /// after a minute, so the launch never waits longer.
+    pub fn tell_to_quit() {
+        const SCRIPT: &str = r#"display alert "Instabox is still running" message "InstaADE replaces Instabox, and only one of them can run. Quit Instabox from its menu bar icon, then open InstaADE again." as warning buttons {"OK"} default button "OK" giving up after 60"#;
+        let mut cmd = command("/usr/bin/osascript");
+        cmd.arg("-e").arg(SCRIPT);
+        if run_bounded(cmd, std::time::Duration::from_secs(70)).is_err() {
+            eprintln!("old app: could not show the alert");
+        }
     }
 
     #[cfg(test)]
@@ -500,5 +620,87 @@ mod tests {
     #[test]
     fn a_dev_build_offers_nothing() {
         assert_eq!(look(ID, false), None);
+    }
+
+    const STEP: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn without_a_running_copy_nothing_is_asked() {
+        let q = quit_copies(
+            &[],
+            |c| panic!("asked {c:?}"),
+            |_| true,
+            Duration::ZERO,
+            STEP,
+        );
+        assert_eq!(q, Quit::NoneRuns);
+    }
+
+    #[test]
+    fn a_copy_that_quits_lets_the_launch_go_on() {
+        let copies = [
+            PathBuf::from("/A/Instabox.app"),
+            PathBuf::from("/B/Instabox.app"),
+        ];
+        let asked = RefCell::new(Vec::new());
+        // It runs for a few more checks after the request, as a quit takes a moment.
+        let checks = RefCell::new(0);
+        let q = quit_copies(
+            &copies,
+            |c| {
+                asked.borrow_mut().push(c.to_path_buf());
+                true
+            },
+            |_| {
+                *checks.borrow_mut() += 1;
+                *checks.borrow() < 5
+            },
+            Duration::from_secs(5),
+            STEP,
+        );
+        assert_eq!(q, Quit::Quit);
+        assert_eq!(*asked.borrow(), copies, "each copy asked once");
+    }
+
+    #[test]
+    fn a_copy_that_keeps_running_ends_the_wait() {
+        let copies = [PathBuf::from("/A/Instabox.app")];
+        let start = Instant::now();
+        let q = quit_copies(&copies, |_| true, |_| true, Duration::from_millis(50), STEP);
+        assert_eq!(q, Quit::StillRuns);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the wait is bounded"
+        );
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_sent_ends_it_at_once() {
+        let copies = [
+            PathBuf::from("/A/Instabox.app"),
+            PathBuf::from("/B/Instabox.app"),
+        ];
+        let asked = RefCell::new(0);
+        let q = quit_copies(
+            &copies,
+            |c| {
+                *asked.borrow_mut() += 1;
+                !c.starts_with("/A")
+            },
+            |_| panic!("waited for a copy that was never asked to quit"),
+            Duration::from_secs(5),
+            STEP,
+        );
+        assert_eq!(q, Quit::StillRuns);
+        assert_eq!(*asked.borrow(), 2, "every request went out");
+    }
+
+    #[test]
+    fn a_dev_build_or_the_preview_asks_nothing_to_quit() {
+        assert_eq!(quit_running(ID, false), Quit::NoneRuns);
+        assert_eq!(
+            quit_running("sh.instabox.bridge.preview", true),
+            Quit::NoneRuns
+        );
     }
 }

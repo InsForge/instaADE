@@ -47,6 +47,9 @@ fn service_or_default(set: Option<&'static String>) -> &'static str {
 
 pub fn run() {
     let context = tauri::generate_context!();
+    // Before the single-instance plugin, which hands this launch to a running copy and exits:
+    // a running old copy (Instabox.app) is asked to quit first, so this app takes over.
+    old_app::quit_running(&context.config().identifier, !cfg!(debug_assertions));
     let app = tauri::Builder::default()
         // Single instance first: a second launch opens the running popover.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
