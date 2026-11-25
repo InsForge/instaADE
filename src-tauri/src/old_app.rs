@@ -163,10 +163,10 @@ pub fn quit_copies(
     if copies.is_empty() {
         return Quit::NoneRuns;
     }
-    // Every request goes out before any wait, and one that cannot be sent ends it: that copy
-    // keeps running, so this launch could not take over anyway.
+    // Every request goes out before any wait. One that cannot be sent ends it, as that copy
+    // keeps running, unless the copy quit since the list was read.
     let sent: Vec<bool> = copies.iter().map(|c| ask(c)).collect();
-    if sent.contains(&false) {
+    if copies.iter().zip(&sent).any(|(c, sent)| !sent && runs(c)) {
         return Quit::StillRuns;
     }
     let start = Instant::now();
@@ -683,18 +683,42 @@ mod tests {
             PathBuf::from("/B/Instabox.app"),
         ];
         let asked = RefCell::new(0);
+        let start = Instant::now();
         let q = quit_copies(
             &copies,
             |c| {
                 *asked.borrow_mut() += 1;
                 !c.starts_with("/A")
             },
-            |_| panic!("waited for a copy that was never asked to quit"),
+            |_| true,
             Duration::from_secs(5),
             STEP,
         );
         assert_eq!(q, Quit::StillRuns);
         assert_eq!(*asked.borrow(), 2, "every request went out");
+        assert!(start.elapsed() < Duration::from_secs(2), "no wait");
+    }
+
+    #[test]
+    fn a_copy_that_quit_before_its_request_does_not_count() {
+        // The list of running apps was read a moment before: A quit since, so its request
+        // could not be sent. B takes its request and quits.
+        let copies = [
+            PathBuf::from("/A/Instabox.app"),
+            PathBuf::from("/B/Instabox.app"),
+        ];
+        let checks = RefCell::new(0);
+        let q = quit_copies(
+            &copies,
+            |c| !c.starts_with("/A"),
+            |c| {
+                *checks.borrow_mut() += 1;
+                c.starts_with("/B") && *checks.borrow() < 4
+            },
+            Duration::from_secs(5),
+            STEP,
+        );
+        assert_eq!(q, Quit::Quit);
     }
 
     #[test]

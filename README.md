@@ -31,7 +31,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 2. Install it:
    - macOS: drag InstaADE to Applications and open it. It is signed and notarized, so it opens normally.
    - Windows: run the installer. It is not signed yet, so Windows SmartScreen asks once: click **More info**, then **Run anyway**.
-   - InstaADE was called Instabox before. On macOS, InstaADE quits a running Instabox and offers to move it to the Trash. On Windows, the installer removes Instabox first. Your sign-in, your data and Start at login stay.
+   - InstaADE was called Instabox before. On macOS, InstaADE asks a running Instabox to quit, or asks you to quit it when it does not, and offers to move it to the Trash. On Windows, the installer removes Instabox first. Your sign-in, your data and Start at login stay.
 3. Click the InstaADE icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
 4. Sign in with GitHub or Google.
 5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca or Paradev in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaADE before, it starts in T3 Code.
