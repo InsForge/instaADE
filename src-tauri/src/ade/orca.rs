@@ -1,7 +1,7 @@
 //! Orca, a desktop app for coding agents. It reaches a sandbox over SSH by itself and installs
-//! its own server there under `~/.orca-remote` on the first connect, so InstaBox installs
+//! its own server there under `~/.orca-remote` on the first connect, so InstaADE installs
 //! nothing and no versions must match. Orca has no link or command that adds an SSH host, but
-//! it imports the `Host` blocks of `~/.ssh/config`. So InstaBox writes the sandbox as a host
+//! it imports the `Host` blocks of `~/.ssh/config`. So InstaADE writes the sandbox as a host
 //! there (`ssh_config`), starts Orca, and the user connects the host from Orca's SSH menu.
 //! On this computer: find the real Orca app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Orca.exe` and the
@@ -29,7 +29,7 @@ pub const SSH_HOST: SshHost = SshHost { notice };
 /// The sandbox's home, which the user opens in Orca once the host is connected.
 const SANDBOX_HOME: &str = "/data/home";
 
-/// What the user does in Orca once InstaBox wrote the host `alias` and started Orca.
+/// What the user does in Orca once InstaADE wrote the host `alias` and started Orca.
 pub fn notice(alias: &str) -> String {
     format!("In Orca, connect {alias} from the SSH menu, then open {SANDBOX_HOME}.")
 }

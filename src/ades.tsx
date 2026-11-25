@@ -38,7 +38,7 @@ export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? 
 export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);
 
 /** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link; Orca
- * connects an SSH host InstaBox writes; Paradev runs the sandbox as a host it sets up. */
+ * connects an SSH host InstaADE writes; Paradev runs the sandbox as a host it sets up. */
 export const pairs = (id: AdeId) => id === "t3";
 
 /** True when the ADE's app is on this computer, so it can open sandboxes here. */

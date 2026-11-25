@@ -92,6 +92,11 @@ export interface McpStatus {
   codex: boolean | null;
 }
 
+/** The old app (Instabox.app) left next to this one, offered to move to the Trash. */
+export interface OldAppView {
+  paths: string[];
+}
+
 /** step: connecting | creating | waking | installing | pairing | done */
 export interface ProgressView {
   /** create: a new sandbox. connect: one that exists. */
@@ -120,6 +125,7 @@ export interface AppState {
   snapshots: SnapshotView[];
   mcp: McpStatus;
   progress: ProgressView | null;
+  oldApp: OldAppView | null;
   error: ErrorView | null;
   startAtLogin: boolean;
   update: { version: string; url: string } | null;
