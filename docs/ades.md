@@ -9,10 +9,15 @@ InstaADE installs T3 at the same version as your T3 Code desktop app, then pairs
 - T3 under `/opt/t3`, linked as `/usr/local/bin/t3`
 - A `t3-instabox` service that runs the T3 server on port 3774, which InstaADE publishes for pairing
 - An activity probe in `/usr/local/lib/instabox/activity.d/t3`, so the sandbox sleeps only when T3 is idle
+- A preload, `~/.local/share/t3-instabox/forwarded-host.cjs`, that the service loads into `t3 serve` through `NODE_OPTIONS`. The instabox port proxy sends `Host: 127.0.0.1:3774` and the published address in `X-Forwarded-Host`. T3 checks DPoP proofs (T3 Code 0.1.12 and later) against a URL built from `Host`, so for a request that came through the proxy the preload puts the published address back in `Host`. It acts only when `Host` is `127.0.0.1:3774` and `X-Forwarded-Host` is `3774-<id>.<domain>`, where `<id>` is this sandbox's id from `/etc/instabox/identity` without its `m_` prefix (any id on a sandbox without that file). T3's own child processes do not load it.
 
 Every **Open in T3 Code** pairs again. It wakes the sandbox, updates T3 to the app's version when it is behind and idle, and pairs them with a new code. The sandbox keeps the same address, so T3 Code updates the environment it saved, or adds it again when it lost it. On a sandbox that has T3 but was never paired from this computer, Open first runs the same setup as **Install T3 Code**.
 
 InstaADE never moves T3 on a sandbox back to an older version. When the sandbox runs a newer T3 than the app, InstaADE only pairs.
+
+The setup writes `~/.local/share/t3-instabox/setup` with the id of the setup the running server was started with. A sync (Open, resume, a new T3 Code version) whose sandbox T3 is behind the app runs the whole setup at the app's version. One whose sandbox T3 is at or ahead of the app's version, but has an older id, keeps that version and brings only the probe, the preload and the unit up to date. Either way T3 restarts only while it is idle. When it is busy, nothing T3 uses changes and the next sync tries again.
+
+An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both the desktop app and the T3 on the sandbox are 0.1.11-nightly.20261118.4903 or later. Only then does a pairing wait for the setup. When the setup is older, **Open**, **Pair again** and **Install** first bring it up to date. When T3 is busy or that fails, they do not pair, and show "T3 is busy on this sandbox. Try again when the agent is idle." or the error. When either side is older, the pairing uses a bearer token, which the older setup takes, and they pair as they always did. **Open** still syncs first, but a busy or failed refresh does not stop its pairing. **Pair again**, and **Install** on a sandbox with a newer T3, run no refresh. **Install** on a sandbox whose T3 is not newer runs the whole setup as always, and stops when it fails.
 
 ## cmux (macOS)
 
