@@ -117,9 +117,9 @@ const AGENT_KEYS: [&str; 4] = [
 ///
 /// The plist must have exactly the plugin's shape, with `ProgramArguments` of
 /// `[<program>, "--at-login"]`, and `<program>` must be `<X>.app/Contents/MacOS/<exe name>`.
-/// Then it is ours when `<program>` is this executable, when the bundle at `<X>.app` has this
-/// app's identifier (the app moved), or when there is no bundle at `<X>.app` (the app moved
-/// or was deleted, so the job can run nothing).
+/// Then it is ours only with positive identity: `<program>` is this executable, or the bundle
+/// at `<X>.app` exists and its Info.plist has this app's identifier (a copy at another path).
+/// When the identity cannot be read, as for a bundle that is gone, the file stays.
 pub fn is_our_agent(plist: &plist::Value, label: &str, exe: &Path, identifier: &str) -> bool {
     let Some(program) = agent_program(plist, label).map(Path::new) else {
         return false;
@@ -131,10 +131,7 @@ pub fn is_our_agent(plist: &plist::Value, label: &str, exe: &Path, identifier: &
     if program == exe || exe.canonicalize().is_ok_and(|e| e == program) {
         return true;
     }
-    match std::fs::symlink_metadata(bundle) {
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        Ok(_) => bundle_identifier(bundle).as_deref() == Some(identifier),
-    }
+    bundle_identifier(bundle).as_deref() == Some(identifier)
 }
 
 /// The program of `plist` when it has exactly the shape the autostart plugin writes for an
@@ -804,11 +801,9 @@ mod tests {
         is_our_agent(plist, "Instabox", exe, ID)
     }
 
-    /// The executable of a moved app, and the path its old bundle had, which is now gone.
-    fn moved(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let exe = bundle(&dir.join("new"), "Instabox", Some(ID));
-        let old = dir.join("old/Instabox.app/Contents/MacOS").join(EXE);
-        (exe, old)
+    /// This app's executable, in a bundle with this app's identifier.
+    fn installed(dir: &Path) -> std::path::PathBuf {
+        bundle(&dir.join("Applications"), "Instabox", Some(ID))
     }
 
     #[test]
@@ -829,16 +824,18 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_of_a_moved_app_whose_old_bundle_is_gone_is_ours() {
+    fn the_agent_of_a_bundle_that_is_gone_is_not_ours() {
+        // Moved or deleted: nothing says whose it was, so the file stays.
         let dir = tempfile::tempdir().unwrap();
-        let (exe, old) = moved(dir.path());
-        assert!(ours(&agent("Instabox", &old), &exe));
+        let exe = installed(dir.path());
+        let gone = dir.path().join("old/Instabox.app/Contents/MacOS").join(EXE);
+        assert!(!ours(&agent("Instabox", &gone), &exe));
     }
 
     #[test]
     fn the_agent_of_our_bundle_at_another_path_is_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let (exe, _) = moved(dir.path());
+        let exe = installed(dir.path());
         let copy = bundle(&dir.path().join("copy"), "Instabox 2", Some(ID));
         assert!(ours(&agent("Instabox", &copy), &exe));
     }
@@ -846,7 +843,7 @@ mod tests {
     #[test]
     fn another_bundle_with_an_executable_of_the_same_name_is_not_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let (exe, _) = moved(dir.path());
+        let exe = installed(dir.path());
         let other = bundle(&dir.path().join("a"), "Instabox", Some("com.example.other"));
         assert!(!ours(&agent("Instabox", &other), &exe));
         let preview = bundle(
@@ -855,15 +852,24 @@ mod tests {
             Some("sh.instabox.bridge.preview"),
         );
         assert!(!ours(&agent("Instabox", &preview), &exe));
-        // A bundle whose identity cannot be read.
+        // A bundle whose identity cannot be read: no Info.plist, or one that is not a plist.
         let unknown = bundle(&dir.path().join("c"), "Instabox", None);
         assert!(!ours(&agent("Instabox", &unknown), &exe));
+        let broken = bundle(&dir.path().join("d"), "Instabox", None);
+        let info = broken
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("Info.plist");
+        std::fs::write(info, ID).unwrap();
+        assert!(!ours(&agent("Instabox", &broken), &exe));
     }
 
     #[test]
     fn a_program_outside_an_app_bundle_is_not_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let (exe, _) = moved(dir.path());
+        let exe = installed(dir.path());
         for program in [
             std::path::PathBuf::from("/usr/local/bin").join(EXE),
             dir.path().join("Instabox/Contents/MacOS").join(EXE),
@@ -873,8 +879,8 @@ mod tests {
             dir.path()
                 .join("x/../Instabox.app/Contents/MacOS")
                 .join(EXE),
-            // Another executable name in a bundle that is gone.
-            dir.path().join("gone/Instabox.app/Contents/MacOS/other"),
+            // Another executable name, even in our bundle.
+            exe.with_file_name("other"),
         ] {
             assert!(!ours(&agent("Instabox", &program), &exe), "{program:?}");
         }
@@ -883,8 +889,8 @@ mod tests {
     #[test]
     fn a_plist_of_another_shape_is_not_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let (exe, old) = moved(dir.path());
-        let good = agent("Instabox", &old);
+        let exe = installed(dir.path());
+        let good = agent("Instabox", &exe);
         assert!(ours(&good, &exe));
         let extra = edit(good.clone(), |d| {
             d.insert("KeepAlive".into(), true.into());
@@ -912,15 +918,16 @@ mod tests {
     #[test]
     fn a_wrong_argument_list_is_not_ours() {
         let dir = tempfile::tempdir().unwrap();
-        let (exe, old) = moved(dir.path());
-        let program = plist::Value::from(old.display().to_string());
+        let exe = installed(dir.path());
+        assert!(ours(&agent("Instabox", &exe), &exe));
+        let program = plist::Value::from(exe.display().to_string());
         for args in [
             vec![program.clone(), "--hidden".into()],
             vec![program.clone()],
             vec![program.clone(), AT_LOGIN.into(), "--hidden".into()],
             vec![AT_LOGIN.into(), program.clone()],
         ] {
-            let plist = edit(agent("Instabox", &old), |d| {
+            let plist = edit(agent("Instabox", &exe), |d| {
                 d.insert("ProgramArguments".into(), args.clone().into());
             });
             assert!(!ours(&plist, &exe), "{args:?}");
