@@ -100,6 +100,19 @@ pub const VERSION_SCRIPT: &str = r#"t3 --version 2>/dev/null || true; d="$HOME/.
 pub const STOP_SCRIPT: &str =
     "sudo systemctl stop t3-instabox; sudo systemctl reset-failed t3-instabox 2>/dev/null || true";
 
+/// The first T3 whose desktop app pairs with DPoP and whose server asks for it (it advertises
+/// `accessTokenRenewal`). Both changes came in this nightly, which sorts before 0.1.11.
+pub const DPOP_SINCE: &str = "0.1.11-nightly.20261118.4903";
+
+/// True when the desktop app at `desktop` pairing with the server at `server` uses DPoP: both
+/// are `DPOP_SINCE` or later. Only then must the server run the preload (`FORWARDED_HOST`).
+/// A version that does not parse counts as no.
+pub fn pairs_with_dpop(desktop: &str, server: Option<&str>) -> bool {
+    let since = semver::Version::parse(DPOP_SINCE).expect("DPOP_SINCE is a version");
+    let at_least = |v: &str| semver::Version::parse(v).is_ok_and(|v| v >= since);
+    at_least(desktop) && server.is_some_and(at_least)
+}
+
 pub const PAIRING: Pairing = Pairing {
     script: PAIR_SCRIPT,
     port: PORT,
@@ -556,6 +569,30 @@ mod tests {
             assert_eq!(s.matches(&id).count(), 2);
             assert!(!s.contains("__SETUP_ID__"));
         }
+    }
+
+    #[test]
+    fn pairing_uses_dpop_only_when_both_sides_have_it() {
+        assert!(pairs_with_dpop(DPOP_SINCE, Some(DPOP_SINCE)));
+        assert!(pairs_with_dpop("0.1.12", Some("0.1.12")));
+        assert!(pairs_with_dpop(
+            "0.1.11",
+            Some("0.1.13-nightly.20261125.5258")
+        ));
+        // An older side pairs with a bearer token, which an old setup takes.
+        assert!(!pairs_with_dpop("0.1.10", Some("0.1.12")));
+        assert!(!pairs_with_dpop("0.1.12", Some("0.1.10")));
+        assert!(!pairs_with_dpop(
+            "0.1.11-nightly.20261118.4890",
+            Some("0.1.12")
+        ));
+        assert!(!pairs_with_dpop(
+            "0.1.12",
+            Some("0.1.11-nightly.20261117.4851")
+        ));
+        // Unknown is no: the pairing goes ahead as before.
+        assert!(!pairs_with_dpop("0.1.12", None));
+        assert!(!pairs_with_dpop("junk", Some("0.1.12")));
     }
 
     #[test]

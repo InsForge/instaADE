@@ -1716,7 +1716,8 @@ impl Core {
 
     /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
     /// with it: wake it, sync the ADE, then open a new pairing link (no setup, no mark change),
-    /// so the app gets the sandbox back even when it lost it. A link ADE (cmux) on a sandbox
+    /// so the app gets the sandbox back even when it lost it. No link when the sync left a setup
+    /// that would refuse the pairing (`sync_before_pairing`). A link ADE (cmux) on a sandbox
     /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
     /// host ADE (Orca) on a sandbox marked with it: wake it, write its host and start the app.
     /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
@@ -1761,8 +1762,11 @@ impl Core {
                 .await
                 .map_err(ErrorView::from)?;
             if let Some(v) = &version {
-                let out = sandbox::sync::sync(&client, ade, id, v).await;
+                let (out, pairing) = sandbox::sync::sync_before_pairing(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
+                // A sandbox whose old setup would refuse this pairing is not paired: T3 Code
+                // would only show "credential invalid".
+                pairing.map_err(ErrorView::from)?;
             }
             // The port URL stays the same, so the app updates the environment it saved.
             let link = connect::pair_link(&client, ade, id)
@@ -4530,6 +4534,139 @@ mod tests {
             !reqs.iter().any(|r| r.method.as_str() == "PATCH"),
             "no mark change"
         );
+    }
+
+    /// Open in T3 of a sandbox connected from here, with T3 Code `desktop` on this computer,
+    /// whose version script prints `found` (no current setup line) and whose setup refresh
+    /// exits `code` with `stderr`. The core, what Open returned and opened, and the exec bodies.
+    async fn open_after_refresh(
+        desktop: &str,
+        found: &str,
+        code: i32,
+        stderr: &str,
+    ) -> (
+        Arc<Core>,
+        Res<Notice>,
+        Vec<String>,
+        Vec<String>,
+        wiremock::MockServer,
+    ) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        // The refresh first: its comments name `t3 pair` too.
+        for (priority, cmd, stdout, code, stderr) in [
+            (1, "t3 --version", found, 0, ""),
+            (1, r#""cmd":"set -eu\nprobe="#, "", code, stderr),
+            (2, "t3 pair", "Token: abc123\n", 0, ""),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/exec"))
+                .and(body_string_contains(cmd))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"stdout": stdout, "stderr": stderr, "exitCode": code}),
+                ))
+                .with_priority(priority)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": "https://3774-m1.example.test", "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some(desktop.into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        let r = core.open_in_ade("m1", Some(Ade::T3)).await;
+        let execs = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let opened = opened.lock().unwrap().clone();
+        (core, r, opened, execs, server)
+    }
+
+    fn paired(execs: &[String]) -> bool {
+        execs.iter().any(|e| e.contains(r#""cmd":"t3 pair"#))
+    }
+
+    const BUSY: &str = "T3 is busy on this sandbox. Try again when the agent is idle.";
+
+    #[tokio::test]
+    async fn open_does_not_pair_a_busy_t3_at_the_desktop_version_whose_old_setup_refuses_dpop() {
+        let (core, r, opened, execs, _server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 3, "T3 is busy, update deferred").await;
+        let e = r.unwrap_err();
+        assert_eq!(
+            (e.kind, e.message.as_str()),
+            (crate::errors::ErrorKind::AdeBusy, BUSY)
+        );
+        assert!(opened.is_empty() && !paired(&execs), "{opened:?}");
+        // The sync is still recorded: Update is offered.
+        assert!(core.state().sandboxes[0].update_pending);
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+    }
+
+    #[tokio::test]
+    async fn open_from_the_tray_does_not_pair_a_busy_newer_t3_whose_old_setup_refuses_dpop() {
+        let (core, r, opened, execs, _server) = open_after_refresh(
+            "0.1.12",
+            "t3 v0.1.13-nightly.20261125.5258\n",
+            3,
+            "T3 is busy, update deferred",
+        )
+        .await;
+        assert_eq!(r.unwrap_err().kind, crate::errors::ErrorKind::AdeBusy);
+        assert!(opened.is_empty() && !paired(&execs));
+        // The tray's Open, which names no ADE, shows the same error in the popover.
+        crate::tray::run_action(&core, "open", "m1", |_| panic!("no notice")).await;
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+        assert!(
+            !core.state().sandboxes[0].update_pending,
+            "ahead: no Update"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_does_not_pair_after_a_failed_refresh_of_an_old_setup_with_dpop() {
+        let (_core, r, opened, execs, _server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 1, "T3 server did not start").await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind, crate::errors::ErrorKind::Setup);
+        assert!(e.message.contains("T3 server did not start"), "{e:?}");
+        assert!(opened.is_empty() && !paired(&execs));
+    }
+
+    #[tokio::test]
+    async fn open_still_pairs_a_busy_t3_without_dpop() {
+        // T3 Code 0.1.10 pairs with a bearer token, which the old setup takes.
+        let (core, r, opened, execs, _server) =
+            open_after_refresh("0.1.10", "t3 v0.1.10\n", 3, "T3 is busy, update deferred").await;
+        assert_eq!(r, Ok(None));
+        assert_eq!(
+            opened,
+            ["t3code://pair?pairingUrl=https%3A%2F%2F3774-m1.example.test%2Fpair%23token%3Dabc123"]
+        );
+        assert!(paired(&execs));
+        assert!(core.state().sandboxes[0].update_pending);
+        assert_eq!(core.state().error, None);
     }
 
     // ---- Paradev ----

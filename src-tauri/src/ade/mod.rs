@@ -330,6 +330,17 @@ impl Ade {
         }
     }
 
+    /// True when a pairing of the desktop app at `desktop` with the ADE at `server` on the
+    /// sandbox works only once the sandbox runs this build's setup (T3 with DPoP on both sides).
+    pub fn pairing_needs_setup(self, desktop: &str, server: Option<&str>) -> bool {
+        match self {
+            Ade::T3 => t3::pairs_with_dpop(desktop, server),
+            Ade::Cmux => false,
+            Ade::Orca => false,
+            Ade::Paradev => false,
+        }
+    }
+
     /// Stops the ADE's service before a reinstall. None: no service runs on the sandbox.
     pub fn stop_script(self) -> Option<&'static str> {
         match self {
@@ -466,6 +477,8 @@ mod tests {
         let current = format!("t3 v0.1.12\n{}\n", t3::setup_line());
         assert!(t3.setup_current(&current));
         assert!(!t3.setup_current("t3 v0.1.12\n"));
+        assert!(t3.pairing_needs_setup("0.1.12", Some("0.1.12")));
+        assert!(!t3.pairing_needs_setup("0.1.10", Some("0.1.12")));
         assert_eq!(t3.parse_version(&current).as_deref(), Some("0.1.12"));
         assert_eq!(
             t3.stop_script()
@@ -502,6 +515,7 @@ mod tests {
         assert_eq!(c.parse_version("cmux 0.64.25"), None);
         assert_eq!(c.refresh_script(), None);
         assert!(c.setup_current(""));
+        assert!(!c.pairing_needs_setup("0.1.12", Some("0.1.12")));
         let Open::Link(l) = c.open() else {
             panic!("cmux opens by a link")
         };
@@ -528,6 +542,7 @@ mod tests {
         assert_eq!(o.parse_version("1.4.269"), None);
         assert_eq!(o.refresh_script(), None);
         assert!(o.setup_current(""));
+        assert!(!o.pairing_needs_setup("0.1.12", Some("0.1.12")));
         assert_eq!(o.setup_script("ignored"), "");
         let Open::SshHost(h) = o.open() else {
             panic!("Orca opens through an SSH host")
@@ -559,6 +574,7 @@ mod tests {
         assert_eq!(p.parse_version("2.0.11"), None);
         assert_eq!(p.refresh_script(), None);
         assert!(p.setup_current(""));
+        assert!(!p.pairing_needs_setup("0.1.12", Some("0.1.12")));
         let Open::Host(h) = p.open() else {
             panic!("Paradev runs the sandbox as a host")
         };

@@ -222,6 +222,9 @@ async fn install_and_pair(
     };
     let remote = ade.parse_version(&found);
     let ahead = remote_is_newer(desktop_version, remote.as_deref());
+    // The running ADE would refuse this pairing until it runs this build's setup.
+    let pairing_waits =
+        !ade.setup_current(&found) && ade.pairing_needs_setup(desktop_version, remote.as_deref());
     let mut update_pending = false;
     if !ahead {
         progress(Step::Installing(desktop_version.to_string()));
@@ -238,15 +241,15 @@ async fn install_and_pair(
             _ if setup.timed_out => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
             0 => {}
             // The ADE runs and is busy, so its update waits. Pairing needs no restart: pair
-            // with the running one and offer the update later.
-            SETUP_EXIT_BUSY if remote.is_some() => update_pending = true,
+            // with the running one and offer the update later, unless it would refuse it.
+            SETUP_EXIT_BUSY if remote.is_some() && !pairing_waits => update_pending = true,
             SETUP_EXIT_BUSY => return Err(SandboxError::AdeBusy(ade)),
             _ => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         }
-    } else if refresh(client, ade, id, &found).await? == Refresh::Deferred {
-        // A newer version stays, but gets this build's setup first. Without it the running T3
-        // may refuse the pairing (DPoP), and Update would refuse a sandbox that is ahead, so a
-        // busy one is neither paired nor marked: the user tries again once it is idle.
+    } else if refresh(client, ade, id, &found).await? == Refresh::Deferred && pairing_waits {
+        // A newer version stays, but gets this build's setup first. A busy one that would
+        // refuse the pairing without it is neither paired nor marked: the user tries again
+        // once it is idle. Update would refuse a sandbox that is ahead.
         return Err(SandboxError::AdeBusy(ade));
     }
     progress(Step::Pairing);
@@ -849,7 +852,9 @@ mod tests {
     #[tokio::test]
     async fn a_busy_t3_that_runs_already_is_paired_and_its_update_waits() {
         let server = MockServer::start().await;
-        running_with_remote(&server, "t3 v9.0.0\n", exec_answer(3, "busy", false), 1).await;
+        // Its setup is this build's, so its server takes the pairing.
+        let current = format!("t3 v9.0.0\n{}\n", crate::ade::t3::setup_line());
+        running_with_remote(&server, &current, exec_answer(3, "busy", false), 1).await;
         let steps = Mutex::new(Vec::new());
         let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |s| {
             steps.lock().unwrap().push(s)
@@ -870,6 +875,60 @@ mod tests {
             "marked: {c:?}"
         );
         drop(server);
+    }
+
+    /// A running sandbox whose version script prints `found` (no current setup line), with
+    /// mocks for the setup at `desktop` and for the refresh, each answering `answer`.
+    async fn running_with_old_setup(server: &MockServer, found: &str, desktop: &str, answer: i32) {
+        running_with_remote(server, found, ok_setup(), 0).await;
+        for marker in [
+            REFRESH.to_string(),
+            format!(r#""cmd":"set -eu\nv={desktop}\n"#),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/exec"))
+                .and(body_string_contains(marker))
+                .respond_with(exec_answer(answer, "T3 is busy, update deferred", false))
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
+    }
+
+    async fn sent_pair_or_mark(server: &MockServer) -> bool {
+        let reqs = server.received_requests().await.unwrap();
+        reqs.iter().any(|r| {
+            String::from_utf8_lossy(&r.body).contains(r#""cmd":"t3 pair"#)
+                || r.method.as_str() == "PATCH"
+                || r.url.path().ends_with("/ports")
+        })
+    }
+
+    #[tokio::test]
+    async fn a_busy_t3_at_the_desktop_version_whose_old_setup_refuses_dpop_is_not_paired() {
+        let server = MockServer::start().await;
+        running_with_old_setup(&server, "t3 v0.1.12\n", "0.1.12", 3).await;
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "0.1.12", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(e, SandboxError::AdeBusy(Ade::T3));
+        assert!(!sent_pair_or_mark(&server).await);
+    }
+
+    #[tokio::test]
+    async fn a_busy_t3_with_an_old_setup_is_still_paired_without_dpop() {
+        // T3 Code 0.1.10 pairs with a bearer token, which the old setup takes.
+        for (found, update_pending) in [("t3 v0.1.10\n", true), ("t3 v0.1.12\n", false)] {
+            let server = MockServer::start().await;
+            running_with_old_setup(&server, found, "0.1.10", 3).await;
+            let out = connect_existing(&client(&server), Ade::T3, "m1", "0.1.10", |_| {})
+                .await
+                .unwrap();
+            assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
+            // Behind or equal: the update waits. Ahead (refresh deferred): nothing to offer.
+            assert_eq!(out.update_pending, update_pending, "{found}");
+            assert!(sent_pair_or_mark(&server).await);
+        }
     }
 
     #[tokio::test]

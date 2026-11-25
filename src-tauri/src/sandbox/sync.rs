@@ -100,14 +100,66 @@ pub async fn sync(
     machine_id: &str,
     desktop_version: &str,
 ) -> Result<SyncOutcome, SandboxError> {
+    sync_before_pairing(client, ade, machine_id, desktop_version)
+        .await
+        .0
+}
+
+/// `sync`, and whether a pairing may follow it (Open pairs right after). The pairing must wait
+/// when the sandbox's setup is older than this build's, the sync could not bring it up to date,
+/// and the pairing needs this build's setup (`Ade::pairing_needs_setup`), since the ADE's
+/// server would refuse it. It then fails with `AdeBusy` when the ADE was busy, else with the
+/// sync's error. In every other case the pairing goes ahead, even after a failed sync.
+pub async fn sync_before_pairing(
+    client: &Client,
+    ade: Ade,
+    machine_id: &str,
+    desktop_version: &str,
+) -> (Result<SyncOutcome, SandboxError>, Result<(), SandboxError>) {
     let (Some(version_script), Some(probe)) = (ade.version_script(), ade.probe()) else {
-        return Ok(SyncOutcome {
+        let outcome = SyncOutcome {
             decision: Decision::UpToDate,
             remote_version: None,
-        });
+        };
+        return (Ok(outcome), Ok(()));
     };
-    let out = run(client, machine_id, version_script, QUERY_TIMEOUT_SECS).await?;
-    let remote = ade.parse_version(&out.stdout);
+    let found = match run(client, machine_id, version_script, QUERY_TIMEOUT_SECS).await {
+        Ok(out) => out.stdout,
+        Err(e) => return (Err(e), Ok(())),
+    };
+    let remote = ade.parse_version(&found);
+    let r = bring_in_step(
+        client,
+        ade,
+        &probe.path(),
+        machine_id,
+        desktop_version,
+        &found,
+    )
+    .await;
+    let still_old = !ade.setup_current(&found) && !matches!(r, Ok((_, true)));
+    let pairing = if still_old && ade.pairing_needs_setup(desktop_version, remote.as_deref()) {
+        Err(match &r {
+            Err(e) => e.clone(),
+            Ok(_) => SandboxError::AdeBusy(ade),
+        })
+    } else {
+        Ok(())
+    };
+    (r.map(|(outcome, _)| outcome), pairing)
+}
+
+/// The rest of a sync once the version script printed `found`. Its flag: a setup or refresh of
+/// this sync finished, so the sandbox runs this build's setup now.
+async fn bring_in_step(
+    client: &Client,
+    ade: Ade,
+    probe: &str,
+    machine_id: &str,
+    desktop_version: &str,
+    found: &str,
+) -> Result<(SyncOutcome, bool), SandboxError> {
+    let remote = ade.parse_version(found);
     // Equal or newer: no reason to ask the probe.
     let idle = ProbeAnswer {
         busy: false,
@@ -119,24 +171,25 @@ pub async fn sync(
         remote_version: remote.clone(),
     };
     if matches!(first, Decision::UpToDate | Decision::Older) {
-        let refreshed = refresh(client, ade, machine_id, &out.stdout).await?;
+        let refreshed = refresh(client, ade, machine_id, found).await?;
         // A deferred refresh of a sandbox at the desktop's version waits like an update (the
         // app offers Update, which sets that version up again). One that is ahead stays ahead:
         // Update would refuse to move it back, so only the next sync tries again.
         let at_desktop = remote.as_deref() == Some(desktop_version);
-        return Ok(outcome(match (first, refreshed) {
+        let decision = match (first, refreshed) {
             (Decision::UpToDate, Refresh::Deferred) if at_desktop => Decision::Defer,
             _ => first,
-        }));
+        };
+        return Ok((outcome(decision), refreshed == Refresh::Current));
     }
-    let out = run(client, machine_id, &probe.path(), QUERY_TIMEOUT_SECS).await?;
+    let out = run(client, machine_id, probe, QUERY_TIMEOUT_SECS).await?;
     let decision = decide(
         desktop_version,
         remote.as_deref(),
         &parse_probe(&out.stdout),
     );
     if decision != Decision::Update {
-        return Ok(outcome(decision));
+        return Ok((outcome(decision), false));
     }
     let setup = run(
         client,
@@ -147,8 +200,8 @@ pub async fn sync(
     .await?;
     match setup.exit_code {
         _ if setup.timed_out => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
-        0 => Ok(outcome(Decision::Update)),
-        SETUP_EXIT_BUSY => Ok(outcome(Decision::Defer)),
+        0 => Ok((outcome(Decision::Update), true)),
+        SETUP_EXIT_BUSY => Ok((outcome(Decision::Defer), false)),
         _ => Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
     }
 }
@@ -348,6 +401,86 @@ mod tests {
                 stderr_tail: "line1\nT3 server did not start".into()
             }
         );
+    }
+
+    /// `sync_before_pairing` with T3 Code `desktop` against the mocks mounted on `server`.
+    async fn before_pairing(
+        server: &MockServer,
+        desktop: &str,
+    ) -> (Result<SyncOutcome, SandboxError>, Result<(), SandboxError>) {
+        sync_before_pairing(&client(server), Ade::T3, "m1", desktop).await
+    }
+
+    const BUSY: &str = "T3 is busy, update deferred";
+
+    #[tokio::test]
+    async fn a_pairing_waits_for_a_busy_refresh_of_an_old_setup_with_dpop() {
+        // At the desktop's version, and ahead of it.
+        for (found, decision) in [
+            ("t3 v0.1.12\n", Decision::Defer),
+            ("t3 v0.1.13\n", Decision::Older),
+        ] {
+            let server = MockServer::start().await;
+            exec_mock(&server, VERSION, found, "", 0, 1).await;
+            exec_mock(&server, REFRESH, "", BUSY, 3, 1).await;
+            let (out, pairing) = before_pairing(&server, "0.1.12").await;
+            assert_eq!(out.unwrap().decision, decision, "{found}");
+            assert_eq!(pairing, Err(SandboxError::AdeBusy(Ade::T3)), "{found}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pairing_waits_for_a_busy_update_of_an_old_setup_with_dpop() {
+        let server = MockServer::start().await;
+        exec_mock(&server, VERSION, "t3 v0.1.12\n", "", 0, 1).await;
+        exec_mock(&server, PROBE, "{\"busy\":true}\n", "", 0, 1).await;
+        let (out, pairing) = before_pairing(&server, "0.1.13").await;
+        assert_eq!(out.unwrap().decision, Decision::Defer);
+        assert_eq!(pairing, Err(SandboxError::AdeBusy(Ade::T3)));
+    }
+
+    #[tokio::test]
+    async fn a_pairing_waits_on_a_failed_refresh_of_an_old_setup_with_dpop() {
+        let server = MockServer::start().await;
+        exec_mock(&server, VERSION, "t3 v0.1.12\n", "", 0, 1).await;
+        exec_mock(&server, REFRESH, "", "T3 server did not start", 1, 1).await;
+        let (out, pairing) = before_pairing(&server, "0.1.12").await;
+        let e = SandboxError::Setup {
+            ade: Ade::T3,
+            stderr_tail: "T3 server did not start".into(),
+        };
+        assert_eq!(out.unwrap_err(), e);
+        assert_eq!(pairing, Err(e));
+    }
+
+    #[tokio::test]
+    async fn a_pairing_goes_ahead_when_the_server_takes_it() {
+        // A busy update of a sandbox that runs this build's setup already.
+        let server = MockServer::start().await;
+        exec_mock(&server, VERSION, &current("0.1.12"), "", 0, 1).await;
+        exec_mock(&server, PROBE, "{\"busy\":true}\n", "", 0, 1).await;
+        let (out, pairing) = before_pairing(&server, "0.1.13").await;
+        assert_eq!((out.unwrap().decision, pairing), (Decision::Defer, Ok(())));
+        // A busy refresh where neither side uses DPoP (T3 Code 0.1.10).
+        let server = MockServer::start().await;
+        exec_mock(&server, VERSION, "t3 v0.1.10\n", "", 0, 1).await;
+        exec_mock(&server, REFRESH, "", BUSY, 3, 1).await;
+        let (out, pairing) = before_pairing(&server, "0.1.10").await;
+        assert_eq!((out.unwrap().decision, pairing), (Decision::Defer, Ok(())));
+        // A refresh that finished.
+        let server = MockServer::start().await;
+        exec_mock(&server, VERSION, "t3 v0.1.12\n", "", 0, 1).await;
+        exec_mock(&server, REFRESH, "", "", 0, 1).await;
+        let (out, pairing) = before_pairing(&server, "0.1.12").await;
+        assert_eq!(
+            (out.unwrap().decision, pairing),
+            (Decision::UpToDate, Ok(()))
+        );
+        // A version script that failed: nothing known, so the pairing goes ahead as before.
+        let server = MockServer::start().await;
+        let (out, pairing) = before_pairing(&server, "0.1.12").await;
+        assert!(out.is_err());
+        assert_eq!(pairing, Ok(()));
     }
 
     #[tokio::test]
