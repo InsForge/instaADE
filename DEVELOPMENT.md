@@ -46,13 +46,29 @@ cargo test
 
 ## ADEs and the sandbox mark
 
-The README section **Adding an ADE** lists the files to touch. The mark that says which ADEs a sandbox has must stay compatible with older releases:
+[How InstaBox works with each ADE](docs/ades.md) describes what each ADE does on the sandbox and on this computer. [Adding an ADE](#adding-an-ade) lists the files to touch. A sandbox's metadata marks which ADEs it has, and the mark must stay compatible with older releases:
 
-- `instabox-ades` lists every ADE id on the sandbox, comma separated, such as `t3,cmux`.
-- `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox.
-- A sandbox with no mark has no ADEs. An action that must pick an ADE and was given none uses T3.
+- `instabox-ades` lists every ADE id on the sandbox, comma separated, in the order they were added, such as `t3,cmux`.
+- `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating the sandbox as connected. Else it is the first id of `instabox-ades`.
+- InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it, since v0.1.x writes only that key.
+- A sandbox with no mark, such as one made in plain InstaBox, has no ADEs, so each ADE offers Install on it. An action that must pick an ADE and was given none uses T3.
 - An id this build does not know is kept when writing and never treated as T3.
 - `paradev` joins the mark only once Paradev's host service runs on the sandbox, since the user sets the host up in Paradev.
+
+## Adding an ADE
+
+Pull requests that add an ADE are welcome. Read [How InstaBox works with each ADE](docs/ades.md) first to see how the four current ADEs differ.
+
+- Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
+- ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link. `src-tauri/src/ade/orca.rs` finds Orca and reads its version, from its app bundle on macOS and from `Orca.exe` on Windows. `src-tauri/src/ade/paradev.rs` finds Paradev like cmux, and holds its host check, host id and links.
+- How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux), `SshHost` for an app that imports the sandbox as a host from `~/.ssh/config` (Orca), `Host` for an app that runs the sandbox as one of its hosts, set up in the app (Paradev). `src-tauri/src/ssh_config.rs` writes the Orca hosts.
+- Flow: `src-tauri/src/sandbox/connect.rs` sets the ADE up and adds its id to the sandbox's mark. `src-tauri/src/sandbox/sync.rs` keeps the versions in step for an ADE that pins them. `open_in_ade` in `src-tauri/src/app.rs` opens it.
+- UI: `src/ades.tsx` holds what the app does with each ADE (its badge, names and text), `src/mode.ts` the ADE the user picked, and `src/ade.ts` with `src/hero/` each ADE's look (logo and background). The switcher is `src/AdeSwitcher.tsx`.
+- Docs: add the ADE to the README's Supported ADEs and give it a section in `docs/ades.md`.
+
+A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host.
+
+An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca and Paradev do.
 
 ## Preview builds
 

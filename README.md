@@ -53,63 +53,19 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 
 | ADE | Desktop app on | How InstaBox opens a sandbox in it |
 | --- | --- | --- |
-| [T3 Code](#t3-code) | macOS, Windows | Installs T3 on the sandbox and pairs it with the app |
-| [cmux](#cmux-macos) | macOS | Opens a `cmux://ssh` link, and cmux connects over SSH |
-| [Orca](#orca) | macOS, Windows | Adds the sandbox as an SSH host that Orca imports |
-| [Paradev](#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
+| [T3 Code](docs/ades.md#t3-code) | macOS, Windows | Installs T3 on the sandbox and pairs it with the app |
+| [cmux](docs/ades.md#cmux-macos) | macOS | Opens a `cmux://ssh` link, and cmux connects over SSH |
+| [Orca](docs/ades.md#orca) | macOS, Windows | Adds the sandbox as an SSH host that Orca imports |
+| [Paradev](docs/ades.md#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
 
-### T3 Code
+- **T3 Code**: You need the T3 Code desktop app. **Install T3 Code** installs T3 on the sandbox at your app's version and pairs the two. Every **Open in T3 Code** wakes the sandbox and pairs again, so T3 Code gets the sandbox back even if it lost it.
+- **cmux**: You need the cmux app in Applications. **Install cmux** and **Open in cmux** open the sandbox in cmux, which connects to it over SSH. InstaBox installs nothing on the sandbox for cmux.
+- **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then connect the host InstaBox names from Orca's SSH menu, and open `/data/home`.
+- **Paradev**: You need the Paradev app in Applications, not its Canary build. **Install Paradev** wakes the sandbox, puts its SSH address on the clipboard for one minute, and opens Paradev's host settings. In Paradev, click **Set up a host over SSH** and paste the address, then click **Install Paradev** in InstaBox again to open a workspace on the sandbox.
 
-InstaBox installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
+**Your SSH config**: InstaBox changes it only for Orca. It adds one line at the top of `~/.ssh/config`, `Include ~/.ssh/instabox/config`, and copies the file to `~/.ssh/config.instabox.bak` before its first change. It keeps the Orca hosts in `~/.ssh/instabox/config`. That file holds SSH tokens, and on macOS only you can read it.
 
-- T3 under `/opt/t3`
-- A `t3-instabox` service that runs the T3 server
-- An activity probe, so the sandbox sleeps only when T3 is idle
-
-**Open in T3 Code** wakes the sandbox, updates T3 to the app's version when it is behind and idle, and pairs them again with a new code. The sandbox keeps the same address, so T3 Code updates the environment it saved, or adds it again when it lost it.
-
-### cmux (macOS)
-
-cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaBox installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox. The link holds the token, so InstaBox opens it only in the real cmux app in Applications: its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). InstaBox checks this when it looks for cmux and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made. cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
-
-### Orca
-
-Orca connects over SSH by itself and installs its own server on the sandbox under `~/.orca-remote`, so InstaBox installs nothing and no versions must match. Orca has no link that adds a host, but it imports the hosts in `~/.ssh/config`. So **Open in Orca** wakes the sandbox, writes it as a host to `~/.ssh/instabox/config` and starts Orca. Then connect the host from Orca's SSH menu and open `/data/home`.
-
-```
-# instabox-sandbox <sandbox id>
-Host instabox-dev-1
-  HostName ssh.instabox.sh
-  Port 2222
-  User <SSH token>
-  StrictHostKeyChecking accept-new
-  ForwardAgent no
-```
-
-- The alias is `instabox-` and the sandbox name. When two sandboxes have the same name, the second one also gets the end of its id. A host keeps its alias, because Orca knows the host by it.
-- `~/.ssh/config` gets one line at the top, `Include ~/.ssh/instabox/config`, so these options come before any `Host *`. InstaBox never changes another line there, and keeps a copy of the file in `~/.ssh/config.instabox.bak` before its first change. On Windows these files are in `%USERPROFILE%\.ssh`.
-- `ForwardAgent no` is there because the InstaBox SSH gateway refuses agent forwarding, and Orca fails the whole connection when that request is refused.
-- The hosts file holds SSH tokens. On macOS only you can read it and its folder. When InstaBox gets a new token for the sandbox, it rewrites `User`. Tokens last 30 days, so at startup and every few minutes InstaBox renews the token of each sandbox with a host once it has fewer than 7 days left. That is an API call only and never wakes the sandbox. When the host cannot take the new token, the stored token stays behind, so the next pass tries again. Deleting the sandbox in InstaBox removes its host, a full refresh removes the host of any sandbox no longer in your sandbox list, and signing out removes them all. InstaBox changes only the blocks it marked. Orca keeps a host it imported until you remove it in Orca.
-- On macOS, InstaBox starts only the real Orca app in Applications: its bundle identifier must be `com.stablyai.orca`, and `codesign` must find it signed with the Developer ID of team `6CX3WHS9HZ`. InstaBox checks this when it looks for Orca, again before it wakes, creates or marks a sandbox for Orca, and again after the wake, right before it makes or loads the token. On Windows it starts `Orca.exe` where the installer puts it only when the file's version resource names the product Orca and holds a version, read from the file each time. There is no signature check on Windows yet.
-
-Orca has no idle probe, so the sandbox sleeps by its terminals and CPU.
-
-### Paradev (macOS)
-
-Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaBox installs nothing and hands the setup to Paradev:
-
-1. **Install Paradev** wakes the sandbox, copies its SSH address, `ssh://<SSH token>@<gateway>:<port>`, and opens Paradev's host settings. A minute later InstaBox clears the address from the clipboard, unless you copied something else since. When InstaBox quits before then, it clears the address on the way out by the same rule.
-2. In Paradev, click **Set up a host over SSH** and paste the address.
-3. Click **Install Paradev** again. InstaBox checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get `paradev` in its mark, and a new workspace on it opens in Paradev.
-
-**Open in Paradev** wakes the sandbox, since Paradev does not wake a sleeping one, reads its machine id, and opens `superset://new-workspace?host=<host id>`, with the host id Paradev derives from that machine id. **Reconnect** checks the host again. The address holds an SSH token, so InstaBox copies it, and opens Paradev's links, only for the real Paradev app in Applications: its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaBox checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler. Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
-
-A sandbox can have several ADEs. Its metadata marks them with two keys:
-
-- `instabox-ades` lists every ADE id, comma separated, in the order they were added, such as `t3,cmux`.
-- `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating it as connected. Else it is the first id of the list.
-
-InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it. A sandbox with neither key, such as one made in plain InstaBox, has no ADE, so each ADE offers Install on it. Only an action that must pick an ADE when none was named uses T3 for it.
+For how InstaBox works with each ADE, see [docs/ades.md](docs/ades.md).
 
 ## Troubleshooting
 
@@ -120,20 +76,9 @@ InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when th
 
 - More ADEs
 
-## Adding an ADE
-
-- Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
-- ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link. `src-tauri/src/ade/orca.rs` finds Orca and reads its version, from its app bundle on macOS and from `Orca.exe` on Windows. `src-tauri/src/ade/paradev.rs` finds Paradev like cmux, and holds its host check, host id and links.
-- How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux), `SshHost` for an app that imports the sandbox as a host from `~/.ssh/config` (Orca), `Host` for an app that runs the sandbox as one of its hosts, set up in the app (Paradev). `src-tauri/src/ssh_config.rs` writes the Orca hosts.
-- Flow: `src-tauri/src/sandbox/connect.rs` sets the ADE up and adds its id to the sandbox's mark. `src-tauri/src/sandbox/sync.rs` keeps the versions in step for an ADE that pins them. `open_in_ade` in `src-tauri/src/app.rs` opens it.
-- UI: `src/ades.tsx` holds what the app does with each ADE (its badge, names and text), `src/mode.ts` the ADE the user picked, and `src/ade.ts` with `src/hero/` each ADE's look (logo and background). The switcher is `src/AdeSwitcher.tsx`.
-- A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host.
-
-Pull requests that add an ADE are welcome.
-
 ## Development
 
-For the code layout, the checks to run before a pull request, preview builds and releases, see [DEVELOPMENT.md](DEVELOPMENT.md). Coding agents load the same guide through the `instabox-development` skill.
+For the code layout, adding an ADE, the checks to run before a pull request, preview builds and releases, see [DEVELOPMENT.md](DEVELOPMENT.md). Coding agents load the same guide through the `instabox-development` skill.
 
 ### Prerequisites
 
@@ -198,7 +143,7 @@ To let others try a pull request, build Instabox Preview in CI. It installs next
 
 ## Contributing
 
-**Pull requests**: Welcome. To add an ADE, start with [Adding an ADE](#adding-an-ade).
+**Pull requests**: Welcome, including ones that add an ADE. Start with [Adding an ADE](DEVELOPMENT.md#adding-an-ade).
 
 **Issues**: Open an [issue](https://github.com/InsForge/instabox-bridge/issues) for bugs or ideas.
 
