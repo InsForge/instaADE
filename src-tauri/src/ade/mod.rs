@@ -306,6 +306,30 @@ impl Ade {
         }
     }
 
+    /// Brings the ADE's service on the sandbox to this build's setup without changing its
+    /// version, for a sandbox at the right version whose setup is older (`setup_current`). It
+    /// exits `SETUP_EXIT_BUSY` when the ADE is busy and its restart waits. None: the app runs
+    /// no service there.
+    pub fn refresh_script(self) -> Option<String> {
+        match self {
+            Ade::T3 => Some(t3::refresh_script()),
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
+        }
+    }
+
+    /// True when the output of `version_script` shows the sandbox runs this build's setup.
+    /// Always true for an ADE without `refresh_script`.
+    pub fn setup_current(self, version_output: &str) -> bool {
+        match self {
+            Ade::T3 => t3::setup_current(version_output),
+            Ade::Cmux => true,
+            Ade::Orca => true,
+            Ade::Paradev => true,
+        }
+    }
+
     /// Stops the ADE's service before a reinstall. None: no service runs on the sandbox.
     pub fn stop_script(self) -> Option<&'static str> {
         match self {
@@ -436,10 +460,13 @@ mod tests {
         assert!(t3.pins_local_version());
         assert!(t3.reinstalls());
         assert_eq!(t3.port(), Some(3774));
-        assert_eq!(
-            t3.version_script(),
-            Some("t3 --version 2>/dev/null || true")
-        );
+        assert_eq!(t3.version_script(), Some(t3::VERSION_SCRIPT));
+        assert!(t3::VERSION_SCRIPT.starts_with("t3 --version 2>/dev/null || true;"));
+        assert_eq!(t3.refresh_script(), Some(t3::refresh_script()));
+        let current = format!("t3 v0.1.12\n{}\n", t3::setup_line());
+        assert!(t3.setup_current(&current));
+        assert!(!t3.setup_current("t3 v0.1.12\n"));
+        assert_eq!(t3.parse_version(&current).as_deref(), Some("0.1.12"));
         assert_eq!(
             t3.stop_script()
                 .map(|s| s.contains("systemctl stop t3-instabox")),
@@ -473,6 +500,8 @@ mod tests {
         assert_eq!(c.stop_script(), None);
         assert_eq!(c.probe(), None);
         assert_eq!(c.parse_version("cmux 0.64.25"), None);
+        assert_eq!(c.refresh_script(), None);
+        assert!(c.setup_current(""));
         let Open::Link(l) = c.open() else {
             panic!("cmux opens by a link")
         };
@@ -497,6 +526,8 @@ mod tests {
         assert_eq!(o.stop_script(), None);
         assert_eq!(o.probe(), None);
         assert_eq!(o.parse_version("1.4.269"), None);
+        assert_eq!(o.refresh_script(), None);
+        assert!(o.setup_current(""));
         assert_eq!(o.setup_script("ignored"), "");
         let Open::SshHost(h) = o.open() else {
             panic!("Orca opens through an SSH host")
@@ -526,6 +557,8 @@ mod tests {
         assert_eq!(p.stop_script(), None);
         assert_eq!(p.probe(), None);
         assert_eq!(p.parse_version("2.0.11"), None);
+        assert_eq!(p.refresh_script(), None);
+        assert!(p.setup_current(""));
         let Open::Host(h) = p.open() else {
             panic!("Paradev runs the sandbox as a host")
         };

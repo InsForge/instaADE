@@ -8,6 +8,7 @@ use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
     Client, CreateMachineRequest, ExecRequest, ExecResult, MachineSpec, UpdateMachineRequest,
 };
+use crate::sandbox::sync::refresh;
 use crate::sandbox::view::mark;
 use crate::sandbox::{
     CREATE_WAIT, SandboxError, ensure_running, new_key, retry_transient, wait_op,
@@ -242,6 +243,10 @@ async fn install_and_pair(
             SETUP_EXIT_BUSY => return Err(SandboxError::AdeBusy(ade)),
             _ => return Err(setup_failure(ade, &setup, SETUP_TIMEOUT_SECS)),
         }
+    } else {
+        // A newer version stays, but gets this build's setup. When the ADE is busy, the next
+        // sync (Open, resume) tries again; Update would refuse a sandbox that is ahead.
+        refresh(client, ade, id, &found).await?;
     }
     progress(Step::Pairing);
     let link = pair_link(client, ade, id).await?;
@@ -704,15 +709,107 @@ mod tests {
         .await;
     }
 
+    /// The start of the refresh exec's body: the setup without its version part.
+    const REFRESH: &str = r#""cmd":"set -eu\nsudo install -d"#;
+
+    async fn refresh_mock(server: &MockServer, answer: ResponseTemplate, times: u64) {
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains(REFRESH))
+            .respond_with(answer)
+            // Before the pair mock: the setup's comments name `t3 pair` too.
+            .with_priority(1)
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn newer_remote_t3_skips_setup_and_still_pairs() {
         let server = MockServer::start().await;
-        running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
+        let current = format!("t3 v99.0.0\n{}\n", crate::ade::t3::setup_line());
+        running_with_remote(&server, &current, ok_setup(), 0).await;
+        refresh_mock(&server, ok_setup(), 0).await;
         let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
             .await
             .unwrap();
         assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
-        // Dropping the server checks the expect(0) on the setup exec.
+        // Dropping the server checks the expect(0) on the setup and refresh execs.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn newer_remote_t3_with_an_older_setup_is_refreshed_then_paired() {
+        let server = MockServer::start().await;
+        running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
+        refresh_mock(&server, ok_setup(), 1).await;
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
+            .await
+            .unwrap();
+        assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
+        assert_eq!(
+            (out.version.as_deref(), out.update_pending),
+            (Some("99.0.0"), false),
+            "keeps its newer T3"
+        );
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let refresh = bodies.iter().position(|b| b.contains(REFRESH)).unwrap();
+        let pair = bodies
+            .iter()
+            .position(|b| b.contains(r#""cmd":"t3 pair"#))
+            .unwrap();
+        assert!(refresh < pair, "{bodies:?}");
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_busy_refresh_of_a_newer_t3_still_pairs_and_offers_no_update() {
+        let server = MockServer::start().await;
+        running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
+        refresh_mock(
+            &server,
+            exec_answer(3, "T3 is busy, update deferred", false),
+            1,
+        )
+        .await;
+        let out = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
+            .await
+            .unwrap();
+        assert!(out.link.unwrap().starts_with("t3code://pair?pairingUrl="));
+        // Update would refuse to move a newer T3 back: the next sync refreshes it.
+        assert_eq!(
+            (out.version.as_deref(), out.update_pending),
+            (Some("99.0.0"), false)
+        );
+        let c = calls(&server).await;
+        assert!(c.iter().any(|x| x == "PATCH /v1/machines/m1"), "{c:?}");
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_stops_the_connect() {
+        let server = MockServer::start().await;
+        running_with_remote(&server, "t3 v99.0.0\n", ok_setup(), 0).await;
+        refresh_mock(&server, exec_answer(1, "boom", false), 1).await;
+        let e = connect_existing(&client(&server), Ade::T3, "m1", "9.9.9", |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e,
+            SandboxError::Setup {
+                ade: Ade::T3,
+                stderr_tail: "boom".into()
+            }
+        );
+        let c = calls(&server).await;
+        assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
         drop(server);
     }
 

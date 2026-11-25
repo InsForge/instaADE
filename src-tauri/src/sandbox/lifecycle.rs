@@ -490,7 +490,30 @@ mod tests {
             })),
         )
         .await;
+        let current = format!("0.1.11\n{}\n", crate::ade::t3::setup_line());
+        exec_mock(&server, VERSION, &current, "", 0, 1).await;
+        let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
+            .await
+            .unwrap();
+        assert_eq!(
+            d.unwrap().decision,
+            crate::sandbox::sync::Decision::UpToDate
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_brings_an_older_setup_up_to_date() {
+        let server = MockServer::start().await;
+        mount_machine(
+            &server,
+            "running",
+            false,
+            serde_json::json!({"instabox-bridge": "t3"}),
+        )
+        .await;
         exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
+        exec_mock(&server, r#""cmd":"set -eu\nsudo install -d"#, "", "", 0, 1).await;
+        exec_mock(&server, SETUP, "", "", 0, 0).await;
         let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap();
@@ -516,7 +539,8 @@ mod tests {
         let server = MockServer::start().await;
         let md = serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "cmux,t3"});
         mount_machine(&server, "running", false, md).await;
-        exec_mock(&server, VERSION, "0.1.11\n", "", 0, 1).await;
+        let current = format!("0.1.11\n{}\n", crate::ade::t3::setup_line());
+        exec_mock(&server, VERSION, &current, "", 0, 1).await;
         let d = resume(&client(&server), Ade::T3, "m1", "0.1.11")
             .await
             .unwrap();

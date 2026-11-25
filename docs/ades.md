@@ -9,10 +9,13 @@ InstaBox installs T3 at the same version as your T3 Code desktop app, then pairs
 - T3 under `/opt/t3`, linked as `/usr/local/bin/t3`
 - A `t3-instabox` service that runs the T3 server on port 3774, which InstaBox publishes for pairing
 - An activity probe in `/usr/local/lib/instabox/activity.d/t3`, so the sandbox sleeps only when T3 is idle
+- A preload, `~/.local/share/t3-instabox/forwarded-host.cjs`, that the service loads into `t3 serve` through `NODE_OPTIONS`. The instabox port proxy sends `Host: 127.0.0.1:3774` and the published address in `X-Forwarded-Host`. T3 checks DPoP proofs (T3 Code 0.1.12 and later) against a URL built from `Host`, so for a request that came through the proxy the preload puts the published address back in `Host`. It acts only when `Host` is `127.0.0.1:3774` and `X-Forwarded-Host` is `3774-<id>.<domain>`, where `<id>` is this sandbox's id from `/etc/instabox/identity` (any id on a sandbox without that file). T3's own child processes do not load it.
 
 Every **Open in T3 Code** pairs again. It wakes the sandbox, updates T3 to the app's version when it is behind and idle, and pairs them with a new code. The sandbox keeps the same address, so T3 Code updates the environment it saved, or adds it again when it lost it. On a sandbox that has T3 but was never paired from this computer, Open first runs the same setup as **Install T3 Code**.
 
 InstaBox never moves T3 on a sandbox back to an older version. When the sandbox runs a newer T3 than the app, InstaBox only pairs.
+
+The setup writes `~/.local/share/t3-instabox/setup` with the id of the setup the running server was started with. When a sync (Open, resume, a new T3 Code version) finds an older id, it brings the probe, the preload and the unit up to date at the version the sandbox has. It restarts T3 for that only while T3 is idle, and else tries again at the next sync.
 
 ## cmux (macOS)
 

@@ -4425,8 +4425,9 @@ mod tests {
         // since, so each Open pairs again instead of only bringing T3 Code to the front.
         let (server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        let version = format!("t3 v0.1.11\n{}\n", crate::ade::t3::setup_line());
         for (cmd, stdout) in [
-            ("t3 --version", "t3 v0.1.11\n"),
+            ("t3 --version", version.as_str()),
             ("t3 pair", "Token: abc123\n"),
         ] {
             Mock::given(method("POST"))
@@ -4476,6 +4477,12 @@ mod tests {
         let pairs = execs.iter().filter(|e| e.contains("t3 pair")).count();
         assert_eq!(pairs, 2, "a new code on each open");
         assert!(!execs.iter().any(|e| e.contains("v=0.1.11")), "no setup");
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains(r#""cmd":"set -eu\nsudo install -d"#)),
+            "no refresh of a current setup"
+        );
         assert!(
             !reqs.iter().any(|r| r.method.as_str() == "PATCH"),
             "no mark change"
