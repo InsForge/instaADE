@@ -14,6 +14,7 @@ use crate::agents::Agent;
 use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_provider};
 use crate::errors::ErrorView;
 use crate::login;
+use crate::old_app::{self, OLD_NAME};
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -183,6 +184,53 @@ pub fn set_start_at_login(app: AppHandle, core: Shared<'_>, on: bool) -> Res<()>
     }
     core.set_start_at_login(on);
     core.settle(Ok(()))
+}
+
+/// Move to Trash on the notice about the old app. When the app starts at login and a copy
+/// moved, the login item is made again for this app, since it may still name that copy.
+#[tauri::command]
+pub fn trash_old_app(app: AppHandle, core: Shared<'_>) -> Res<()> {
+    let Some(old) = core.state().old_app else {
+        return core.settle(Ok(()));
+    };
+    // Read while the old copy is there: a LaunchAgent counts as ours by its bundle.
+    let on = login::is_enabled(&app);
+    let moved = match old_app::trash_offered(&old, &app.config().identifier) {
+        Ok(n) => n,
+        Err(e) => return core.settle(Err(ErrorView::other(e))),
+    };
+    core.set_old_app(None);
+    let r = if on && moved > 0 {
+        login_again(&app)
+    } else {
+        Ok(())
+    };
+    core.set_start_at_login(login::is_enabled(&app));
+    core.settle(r)
+}
+
+/// Turns start at login off and on again, so the login item names this app.
+fn login_again(app: &AppHandle) -> Res<()> {
+    let name = &app.package_info().name;
+    let failed = |e: String| {
+        ErrorView::other(format!(
+            "{OLD_NAME} is in the Trash, but {name} could not start at login: {e}. Turn it on in Settings."
+        ))
+    };
+    login::disable(app).map_err(failed)?;
+    match login::enable(app) {
+        login::TurnOn::On => Ok(()),
+        login::TurnOn::Approval => Err(ErrorView::other(format!(
+            "{OLD_NAME} is in the Trash. To start {name} at login, allow it in System Settings, under Login Items."
+        ))),
+        login::TurnOn::Failed(e) => Err(failed(e)),
+    }
+}
+
+/// Not now on the notice about the old app: it is not offered again until the next launch.
+#[tauri::command]
+pub fn dismiss_old_app(core: Shared<'_>) {
+    core.set_old_app(None);
 }
 
 #[tauri::command]

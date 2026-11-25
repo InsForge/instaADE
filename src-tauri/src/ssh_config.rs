@@ -1,11 +1,11 @@
-//! SSH hosts for an ADE that imports them from the user's SSH config (Orca). InstaBox writes
+//! SSH hosts for an ADE that imports them from the user's SSH config (Orca). InstaADE writes
 //! one block per sandbox to `~/.ssh/instabox/config`, and `~/.ssh/config` includes that file
-//! from its first line, before any `Host *`, so the block's options win. InstaBox changes only
+//! from its first line, before any `Host *`, so the block's options win. InstaADE changes only
 //! the blocks it marked and that one `Include` line. Every other line stays as it is, with its
-//! own line end, and new blocks go after the last line InstaBox wrote.
+//! own line end, and new blocks go after the last line InstaADE wrote.
 //!
 //! A block keeps its alias once written: the ADE knows the host by it. A new token of the
-//! sandbox rewrites the block's `User`, and deleting the sandbox in InstaBox removes it. The
+//! sandbox rewrites the block's `User`, and deleting the sandbox in InstaADE removes it. The
 //! app renews the token of every sandbox with a block before it runs out
 //! (`Core::renew_ssh_hosts`).
 
@@ -19,12 +19,14 @@ use anyhow::{Context, Result, bail};
 use crate::api::SshToken;
 use crate::ssh::SshTokenStore;
 
-/// The line InstaBox puts first in `~/.ssh/config`.
+/// The line InstaADE puts first in `~/.ssh/config`.
 pub const INCLUDE: &str = "Include ~/.ssh/instabox/config";
 /// The file `INCLUDE` names, as it names it.
 const HOSTS_ARG: &str = "~/.ssh/instabox/config";
-/// Starts each block InstaBox wrote, followed by the sandbox id.
+/// Starts each block InstaADE wrote, followed by the sandbox id.
 const MARKER: &str = "# instabox-sandbox ";
+/// The first line of a new hosts file. It keeps the app's old name: new blocks go right after
+/// it, so a file older releases wrote must still match it.
 const HEADER: &str =
     "# InstaBox writes the blocks that start with \"# instabox-sandbox\". It keeps all else.";
 const ALIAS_PREFIX: &str = "instabox-";
@@ -32,7 +34,7 @@ const ALIAS_PREFIX: &str = "instabox-";
 const MAX_SLUG: usize = 40;
 /// The length of the id suffix that tells two sandboxes with the same name apart.
 const SHORT_ID: usize = 6;
-/// The copy of `~/.ssh/config` made before InstaBox first changes it.
+/// The copy of `~/.ssh/config` made before InstaADE first changes it.
 const BACKUP: &str = "config.instabox.bak";
 
 /// One change at a time to the two files, across every flow.
@@ -73,7 +75,7 @@ pub fn write_host(home: &Path, id: &str, name: &str, t: &SshToken) -> Result<Str
             if lines.is_empty() {
                 lines.push(Line::new(HEADER, sep));
             }
-            // After the last line InstaBox wrote, so lines the user added below stay as they
+            // After the last line InstaADE wrote, so lines the user added below stay as they
             // are, down to the end of the file.
             let at = match blocks.last() {
                 Some(b) => b.end,
@@ -127,7 +129,7 @@ pub fn remove_host(home: &Path, id: &str) -> Result<bool> {
     remove_where(home, |b| b.id == id).map(|n| n > 0)
 }
 
-/// Removes every host InstaBox wrote. Returns how many.
+/// Removes every host InstaADE wrote. Returns how many.
 pub fn remove_all(home: &Path) -> Result<usize> {
     remove_where(home, |_| true)
 }
@@ -153,7 +155,7 @@ fn remove_where(home: &Path, gone: impl Fn(&Block) -> bool) -> Result<usize> {
     Ok(doomed.len())
 }
 
-/// The aliases of the hosts InstaBox wrote, by sandbox id.
+/// The aliases of the hosts InstaADE wrote, by sandbox id.
 pub fn aliases(home: &Path) -> Result<Vec<(String, String)>> {
     check_home(home)?;
     let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -164,7 +166,7 @@ pub fn aliases(home: &Path) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// A block InstaBox wrote: its lines `start..end`, the sandbox id and the alias.
+/// A block InstaADE wrote: its lines `start..end`, the sandbox id and the alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Block {
     start: usize,
@@ -174,7 +176,7 @@ struct Block {
 }
 
 /// A line of the hosts file and the end it had: `\n`, `\r\n`, or none for a last line without
-/// one. A line InstaBox did not write is written back with its own end.
+/// one. A line InstaADE did not write is written back with its own end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Line {
     text: String,
@@ -190,7 +192,7 @@ impl Line {
     }
 }
 
-/// The line end most lines of the file have, for the lines InstaBox writes: `\r\n` when most
+/// The line end most lines of the file have, for the lines InstaADE writes: `\r\n` when most
 /// do, else `\n`.
 fn separator(lines: &[Line]) -> &'static str {
     let crlf = lines.iter().filter(|l| l.end == "\r\n").count();
@@ -211,7 +213,7 @@ fn replace_block(lines: &mut Vec<Line>, b: &Block, block: Vec<String>) {
     lines.splice(b.start..b.end, new);
 }
 
-/// The blocks InstaBox wrote: a marker line, then its `Host` line, then the indented lines
+/// The blocks InstaADE wrote: a marker line, then its `Host` line, then the indented lines
 /// under it. The first line that is blank or not indented ends a block, so a block the user
 /// added right after one of these stays theirs.
 fn blocks(lines: &[Line]) -> Vec<Block> {
@@ -510,7 +512,7 @@ fn split_option(line: &str) -> (&str, &str) {
 
 /// A token store that keeps the hosts in step: a new token of a sandbox that has a host
 /// becomes the host's `User`, and clearing every token (an account boundary) removes every
-/// host InstaBox wrote.
+/// host InstaADE wrote.
 pub struct SyncedStore<S> {
     inner: S,
     home: PathBuf,
@@ -787,7 +789,7 @@ Host instabox-dev-1
     fn removing_a_host_keeps_every_line_it_did_not_write() {
         let home = tempfile::tempdir().unwrap();
         write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
-        // The user adds a block right under InstaBox's, and one of their own lower down.
+        // The user adds a block right under InstaADE's, and one of their own lower down.
         let path = hosts_path(home.path());
         let mut text = read(&path);
         text.push_str("Host mine\n  User me\n\n# keep me\n");
@@ -813,7 +815,7 @@ Host instabox-dev-1
         assert_eq!(remove_all(home.path()).unwrap(), 0);
     }
 
-    /// Runs a token update, an add and a removal on a hosts file that holds InstaBox's `m1`
+    /// Runs a token update, an add and a removal on a hosts file that holds InstaADE's `m1`
     /// followed by `user`, and checks after each that `user` is still its last bytes.
     fn user_part_survives(user: &str) {
         let home = tempfile::tempdir().unwrap();

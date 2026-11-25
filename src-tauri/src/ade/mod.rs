@@ -238,7 +238,7 @@ impl Ade {
     /// True when the app at `path` is the ADE's own, checked again right before the app hands
     /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
     /// link). T3: the app gets no token from a link, so the path `locate` found stands. Orca:
-    /// on macOS its identifier and signature, as the app InstaBox starts. Paradev: its
+    /// on macOS its identifier and signature, as the app InstaADE starts. Paradev: its
     /// identifier and signature (it gets the sandbox's SSH address with a token).
     /// Blocks for a few seconds, so run it off the async runtime.
     pub fn verify(self, path: &Path) -> bool {
@@ -518,7 +518,7 @@ mod tests {
             "https://github.com/paradevai/paradev/releases/latest"
         );
         assert_eq!(p.url_scheme(), "superset");
-        // InstaBox installs, keeps in step and probes nothing: Paradev's app sets its host up.
+        // InstaADE installs, keeps in step and probes nothing: Paradev's app sets its host up.
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(p.port(), None);

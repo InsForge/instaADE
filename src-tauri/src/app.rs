@@ -24,6 +24,7 @@ use crate::connected::ConnectedStore;
 use crate::errors::ErrorView;
 use crate::gate::{Gate, guarded};
 use crate::mcp::{self, KeyStore, McpClient};
+use crate::old_app::OldAppView;
 use crate::sandbox::connect::{Connected, NewSandbox, Source, Step};
 use crate::sandbox::sync::{Decision, SyncOutcome};
 use crate::sandbox::view::{
@@ -34,11 +35,11 @@ use crate::ssh::{self, SshTokenStore};
 use crate::ssh_config;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
-/// A sandbox with an InstaBox SSH host (Orca) gets a new token once the stored one has fewer days
+/// A sandbox with an InstaADE SSH host (Orca) gets a new token once the stored one has fewer days
 /// left than this, so the host keeps working without a click.
 const HOST_TOKEN_RENEW_DAYS: i64 = 7;
-const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instabox-bridge/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/InsForge/instabox-bridge/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/InsForge/instaADE/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/InsForge/instaADE/releases/latest";
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
 /// Account data and the desktop ADE versions are read this often.
@@ -149,6 +150,8 @@ pub struct AppState {
     pub snapshots: Vec<SnapshotView>,
     pub mcp: McpStatus,
     pub progress: Option<ProgressView>,
+    /// The old app (Instabox.app) left next to this one, offered to move to the Trash.
+    pub old_app: Option<OldAppView>,
     pub error: Option<ErrorView>,
     pub start_at_login: bool,
     pub update: Option<UpdateInfo>,
@@ -574,6 +577,7 @@ impl AppState {
         AppState {
             t3: self.t3.clone(),
             ades: self.ades.clone(),
+            old_app: self.old_app.clone(),
             start_at_login: self.start_at_login,
             update: self.update.clone(),
             ..AppState::default()
@@ -787,7 +791,7 @@ fn account_changed() -> ErrorView {
 
 fn unknown_ade() -> ErrorView {
     ErrorView::other(
-        "A newer version of InstaBox connected this sandbox to another ADE. Update InstaBox to use it.",
+        "A newer version of InstaADE connected this sandbox to another ADE. Update InstaADE to use it.",
     )
 }
 
@@ -808,7 +812,7 @@ fn not_signed_in() -> ErrorView {
 type Res<T> = Result<T, ErrorView>;
 
 /// What the user does next in an ADE's app after an action opened it, when opening it does not
-/// finish the job (Orca: connect the host InstaBox wrote). None for every other ADE.
+/// finish the job (Orca: connect the host InstaADE wrote). None for every other ADE.
 pub type Notice = Option<String>;
 
 /// The ids of every sandbox in an account's whole machine list.
@@ -1133,6 +1137,11 @@ impl Core {
         self.update(|i| i.state.start_at_login = on);
     }
 
+    /// The old copies of the app to offer, or None once they are gone or dismissed.
+    pub fn set_old_app(&self, old: Option<OldAppView>) {
+        self.update(|i| i.state.old_app = old);
+    }
+
     pub fn open_url(&self, url: &str) -> Res<()> {
         let r = if allowed_url(url) {
             (self.open)(url, None).map_err(ErrorView::other)
@@ -1337,7 +1346,7 @@ impl Core {
         })
     }
 
-    /// The sandbox ids of the SSH hosts InstaBox wrote; None when the file cannot be read.
+    /// The sandbox ids of the SSH hosts InstaADE wrote; None when the file cannot be read.
     async fn host_ids(&self) -> Option<Vec<String>> {
         let home = self.home.clone();
         match tokio::task::spawn_blocking(move || ssh_config::aliases(&home)).await {
@@ -1360,7 +1369,7 @@ impl Core {
             .push(line);
     }
 
-    /// Keeps every SSH host InstaBox wrote (Orca) working without a click. For each sandbox
+    /// Keeps every SSH host InstaADE wrote (Orca) working without a click. For each sandbox
     /// with a host, a stored token with fewer than 7 days left, or none, is renewed the way
     /// `ssh::token` makes one, and the token store rewrites the host's `User` as it saves it.
     /// A token with 7 days or more is left alone. Tokens are made over the API only, so no
@@ -2484,6 +2493,9 @@ mod tests {
             claude_code: Some(true),
             codex: Some(false),
         };
+        s.old_app = Some(OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        });
         s.progress = Some(ProgressView {
             kind: "create".into(),
             step: "installing".into(),
@@ -2495,7 +2507,7 @@ mod tests {
         s.start_at_login = true;
         s.update = Some(UpdateInfo {
             version: "0.2.0".into(),
-            url: "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0".into(),
+            url: "https://github.com/InsForge/instaADE/releases/tag/v0.2.0".into(),
         });
         s
     }
@@ -2532,6 +2544,7 @@ mod tests {
             "snapshots",
             "mcp",
             "progress",
+            "oldApp",
             "error",
             "startAtLogin",
             "update",
@@ -3094,9 +3107,13 @@ mod tests {
         assert_eq!(s.ades.len(), 1, "one entry per ADE");
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
         s.set_desktop(Ade::T3, Some("0.1.11".into()));
+        s.old_app = Some(OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        });
         let out = s.signed_out();
         assert_eq!(out.ades, s.ades, "desktop facts stay");
         assert_eq!(out.t3.as_deref(), Some("0.1.11"));
+        assert_eq!(out.old_app, s.old_app, "the old app on this computer stays");
     }
 
     #[test]
@@ -3279,7 +3296,7 @@ mod tests {
             "0.1.0",
             &body(
                 "v0.2.0",
-                "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0",
+                "https://github.com/InsForge/instaADE/releases/tag/v0.2.0",
             ),
         )
         .unwrap();
@@ -3564,6 +3581,32 @@ mod tests {
         );
         core.open_url("https://github.com/x").unwrap();
         assert_eq!(core.state().error, None, "next success clears it");
+    }
+
+    #[test]
+    fn the_old_app_is_offered_until_cleared() {
+        let emitted = Arc::new(Mutex::new(Vec::<AppState>::new()));
+        let sink = emitted.clone();
+        let core = Core::new(
+            api_base(None),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
+            PathBuf::from("/nonexistent"),
+        );
+        assert_eq!(core.state().old_app, None);
+        let old = OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        };
+        core.set_old_app(Some(old.clone()));
+        assert_eq!(core.state().old_app, Some(old.clone()));
+        assert_eq!(emitted.lock().unwrap().last().unwrap().old_app, Some(old));
+        // Moved to the Trash, or Not now.
+        core.set_old_app(None);
+        assert_eq!(core.state().old_app, None);
+        assert_eq!(emitted.lock().unwrap().last().unwrap().old_app, None);
     }
 
     #[test]

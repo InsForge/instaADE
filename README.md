@@ -1,15 +1,15 @@
 <div align="center">
   <a href="https://instabox.sh">
-    <img src="src-tauri/icons/128x128@2x.png" alt="InstaBox" width="96">
+    <img src="src-tauri/icons/128x128@2x.png" alt="InstaADE" width="96">
   </a>
 
-  <h1>InstaBox</h1>
+  <h1>InstaADE</h1>
 
   <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.<br>Works with T3 Code, cmux, Orca and Paradev.</p>
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-    <a href="https://github.com/InsForge/instabox-bridge/releases/latest"><img src="https://img.shields.io/github/v/release/InsForge/instabox-bridge" alt="Latest release"></a>
+    <a href="https://github.com/InsForge/instaADE/releases/latest"><img src="https://img.shields.io/github/v/release/InsForge/instaADE" alt="Latest release"></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg" alt="Platform: macOS | Windows">
   </p>
 </div>
@@ -25,17 +25,18 @@
 
 You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need its desktop app: [T3 Code](https://github.com/pingdotgg/t3code/releases/latest) or [Orca](https://github.com/stablyai/orca/releases/latest) on macOS or Windows, [cmux](https://github.com/manaflow-ai/cmux/releases/latest) or [Paradev](https://github.com/paradevai/paradev/releases/latest) on macOS.
 
-1. Download the latest release from [Releases](https://github.com/InsForge/instabox-bridge/releases/latest):
+1. Download the latest release from [Releases](https://github.com/InsForge/instaADE/releases/latest):
    - macOS: the `.dmg`, `aarch64` for Apple silicon, `x64` for Intel.
    - Windows: the `x64-setup.exe` installer.
 2. Install it:
-   - macOS: drag InstaBox to Applications and open it. It is signed and notarized, so it opens normally.
+   - macOS: drag InstaADE to Applications and open it. It is signed and notarized, so it opens normally.
    - Windows: run the installer. It is not signed yet, so Windows SmartScreen asks once: click **More info**, then **Run anyway**.
-3. Click the InstaBox icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
+   - InstaADE was called Instabox before. If Instabox is running, quit it from its menu first. On macOS, InstaADE then offers to move Instabox to the Trash. On Windows, uninstall Instabox in Settings, under Apps, and keep its app data. Your sign-in stays.
+3. Click the InstaADE icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
 4. Sign in with GitHub or Google.
-5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca or Paradev in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaBox before, it starts in T3 Code.
+5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca or Paradev in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaADE before, it starts in T3 Code.
 6. Click **New sandbox**, pick a size, then click **Create sandbox**.
-7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaBox names from the SSH menu. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaBox copied, then click **Install Paradev** again.
+7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaADE names from the SSH menu. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaADE copied, then click **Install Paradev** again.
 
 ## Features
 
@@ -51,7 +52,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 
 ## Supported ADEs
 
-| ADE | Desktop app on | How InstaBox opens a sandbox in it |
+| ADE | Desktop app on | How InstaADE opens a sandbox in it |
 | --- | --- | --- |
 | [T3 Code](docs/ades.md#t3-code) | macOS, Windows | Installs T3 on the sandbox and pairs it with the app |
 | [cmux](docs/ades.md#cmux-macos) | macOS | Opens a `cmux://ssh` link, and cmux connects over SSH |
@@ -59,17 +60,17 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 | [Paradev](docs/ades.md#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
 
 - **T3 Code**: You need the T3 Code desktop app. **Install T3 Code** installs T3 on the sandbox at your app's version and pairs the two. Every **Open in T3 Code** wakes the sandbox and pairs again, so T3 Code gets the sandbox back even if it lost it.
-- **cmux**: You need the cmux app in Applications. **Install cmux** and **Open in cmux** open the sandbox in cmux, which connects to it over SSH. InstaBox installs nothing on the sandbox for cmux.
-- **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then connect the host InstaBox names from Orca's SSH menu, and open `/data/home`.
-- **Paradev**: You need the Paradev app in Applications, not its Canary build. **Install Paradev** wakes the sandbox, puts its SSH address on the clipboard for one minute, and opens Paradev's host settings. In Paradev, click **Set up a host over SSH** and paste the address, then click **Install Paradev** in InstaBox again to open a workspace on the sandbox.
+- **cmux**: You need the cmux app in Applications. **Install cmux** and **Open in cmux** open the sandbox in cmux, which connects to it over SSH. InstaADE installs nothing on the sandbox for cmux.
+- **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then connect the host InstaADE names from Orca's SSH menu, and open `/data/home`.
+- **Paradev**: You need the Paradev app in Applications, not its Canary build. **Install Paradev** wakes the sandbox, puts its SSH address on the clipboard for one minute, and opens Paradev's host settings. In Paradev, click **Set up a host over SSH** and paste the address, then click **Install Paradev** in InstaADE again to open a workspace on the sandbox.
 
-**Your SSH config**: InstaBox changes it only for Orca. It adds one line at the top of `~/.ssh/config`, `Include ~/.ssh/instabox/config`, and copies the file to `~/.ssh/config.instabox.bak` before its first change. It keeps the Orca hosts in `~/.ssh/instabox/config`. That file holds SSH tokens, and on macOS only you can read it.
+**Your SSH config**: InstaADE changes it only for Orca. It adds one line at the top of `~/.ssh/config`, `Include ~/.ssh/instabox/config`, and copies the file to `~/.ssh/config.instabox.bak` before its first change. It keeps the Orca hosts in `~/.ssh/instabox/config`. That file holds SSH tokens, and on macOS only you can read it.
 
-For how InstaBox works with each ADE, see [docs/ades.md](docs/ades.md).
+For how InstaADE works with each ADE, see [docs/ades.md](docs/ades.md).
 
 ## Troubleshooting
 
-- **No InstaBox icon in the macOS menu bar.** When the menu bar is crowded, the icon can hide behind the notch. Hold Command and drag the icon to the right to bring it back. You can also open InstaBox again from Applications, which shows the popover.
+- **No InstaADE icon in the macOS menu bar.** When the menu bar is crowded, the icon can hide behind the notch. Hold Command and drag the icon to the right to bring it back. You can also open InstaADE again from Applications, which shows the popover.
 - **The popover is in the way.** Drag it by its top bar.
 
 ## Roadmap
@@ -96,9 +97,9 @@ bun install
 
 ### Run with hot reload
 
-1. Quit any installed copy of InstaBox. Only one instance runs at a time.
+1. Quit any installed copy of InstaADE (or Instabox, its old name). Only one instance runs at a time.
 2. Run `bun tauri dev`.
-3. Click the InstaBox icon in the menu bar or system tray.
+3. Click the InstaADE icon in the menu bar or system tray.
 4. Edit the code. UI changes reload at once, and Rust changes rebuild the app.
 
 **Tips:**
@@ -134,7 +135,7 @@ A local build is not notarized, so macOS blocks it on other Macs.
 
 ### Share a preview build
 
-To let others try a pull request, build Instabox Preview in CI. It installs next to InstaBox and keeps its own sign-in. The macOS `.dmg` is signed and notarized like a release. The Windows installer is not signed yet, so SmartScreen asks once.
+To let others try a pull request, build InstaADE Preview in CI. It installs next to InstaADE and keeps its own sign-in. The macOS `.dmg` is signed and notarized like a release. The Windows installer is not signed yet, so SmartScreen asks once.
 
 1. Add the `preview-build` label to the pull request. The pull request's author must be listed in `.github/PREVIEW_AUTHORS`.
 2. **Preview build** builds the app from the pull request without any secrets. **Preview publish** then runs main's code only: it checks the author and the app, signs and notarizes it, and takes the label off.
@@ -145,7 +146,7 @@ To let others try a pull request, build Instabox Preview in CI. It installs next
 
 **Pull requests**: Welcome, including ones that add an ADE. Start with [Adding an ADE](DEVELOPMENT.md#adding-an-ade).
 
-**Issues**: Open an [issue](https://github.com/InsForge/instabox-bridge/issues) for bugs or ideas.
+**Issues**: Open an [issue](https://github.com/InsForge/instaADE/issues) for bugs or ideas.
 
 ## License
 

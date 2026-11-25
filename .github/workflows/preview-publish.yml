@@ -3,7 +3,7 @@ name: Preview publish
 # Stage two of a preview. Everything here is main's code: it never checks out or runs the
 # pull request's code. When Preview build succeeds, it checks the pull request still carries
 # the preview-build label and that its author is in .github/PREVIEW_AUTHORS, takes the label
-# off (one label, one build), checks the build is Instabox Preview, signs and notarizes it,
+# off (one label, one build), checks the build is InstaADE Preview, signs and notarizes it,
 # and publishes it on the rolling instabox-preview prerelease. Closing the pull request, or
 # removing the label before the build is published, deletes its files there.
 on:
@@ -128,7 +128,7 @@ jobs:
           SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           .github/scripts/sign-preview.sh "$RUNNER_TEMP/build/preview.zip" "${{ matrix.arch }}" \
-            "$RUNNER_TEMP/signed/Instabox-Preview-pr$PR-${SHA::7}-${{ matrix.arch }}.dmg"
+            "$RUNNER_TEMP/signed/InstaADE-Preview-pr$PR-${SHA::7}-${{ matrix.arch }}.dmg"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: signed-${{ matrix.target }}
@@ -164,7 +164,9 @@ jobs:
           AT: ${{ needs.resolve.outputs.at }}
         run: |
           short=${SHA::7}
-          prefix="Instabox-Preview-pr$PR-"
+          prefix="InstaADE-Preview-pr$PR-"
+          # The prefix before the app became InstaADE. Its files go like those of older commits.
+          old_prefix="Instabox-Preview-pr$PR-"
           # Prints why this build may no longer be published: the pull request closed, it has a
           # newer commit, or a person took the label off after this build took it. Prints
           # nothing when it may. Checked before and after the upload, so a cleanup or a push
@@ -199,13 +201,13 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Another pull request's publish may create it at the same time.
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target main --prerelease --latest=false \
-              --title "Instabox Preview" \
-              --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. Instabox Preview installs next to Instabox and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs." ||
+              --title "InstaADE Preview" \
+              --notes "Preview builds of open pull requests, not releases. Each file is named after its pull request and commit. InstaADE Preview installs next to InstaADE and keeps its own sign-in. The Windows installer is not signed yet, so SmartScreen asks once before it runs." ||
               gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
           # Older commits of this pull request go. A file of this commit is replaced.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
-            { grep "^$prefix" | grep -v "^$prefix$short-" || true; } |
+            { grep -e "^$prefix" -e "^$old_prefix" | grep -v "^$prefix$short-" || true; } |
             while read -r name; do
               gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
             done
@@ -220,13 +222,13 @@ jobs:
             exit 0
           fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
-          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Instabox Preview for $short is ready.
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "InstaADE Preview for $short is ready.
 
           - macOS, Apple silicon: $base/$prefix$short-arm64.dmg
           - macOS, Intel: $base/$prefix$short-x86_64.dmg
           - Windows: $base/$prefix$short-x64-setup.exe (not signed yet, SmartScreen asks once)
 
-          It installs next to Instabox. Add the preview-build label again to build a newer commit."
+          It installs next to InstaADE. Add the preview-build label again to build a newer commit."
 
   # A failed build leaves the label on, and only a new label starts a build. Take it off, so
   # adding it again retries.
@@ -282,7 +284,7 @@ jobs:
             exit 0
           fi
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" |
-            { grep "^Instabox-Preview-pr$PR-" || true; } |
+            { grep -e "^InstaADE-Preview-pr$PR-" -e "^Instabox-Preview-pr$PR-" || true; } |
             while read -r name; do
               gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
             done

@@ -144,6 +144,11 @@
     "claudeCode": true,
     "codex": false
   },
+  "oldApp": {
+    "paths": [
+      "/Applications/Instabox.app"
+    ]
+  },
   "progress": {
     "kind": "create",
     "step": "installing",
@@ -159,6 +164,6 @@
   "startAtLogin": true,
   "update": {
     "version": "0.2.0",
-    "url": "https://github.com/InsForge/instabox-bridge/releases/tag/v0.2.0"
+    "url": "https://github.com/InsForge/instaADE/releases/tag/v0.2.0"
   }
 }

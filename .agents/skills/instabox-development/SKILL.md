@@ -1,12 +1,12 @@
 ---
 name: instabox-development
-description: Use when working on the Instabox app codebase itself (InsForge/instabox-bridge), such as changing the Rust core under src-tauri/ or the React UI under src/, adding an ADE, running the app in dev mode, preparing a pull request, building a preview of a pull request, or cutting a release. Covers the code layout, the checks CI runs, the sandbox mark rules, adding an ADE, preview builds and the release flow.
+description: Use when working on the InstaADE app codebase itself (InsForge/instaADE, formerly Instabox and InsForge/instabox-bridge), such as changing the Rust core under src-tauri/ or the React UI under src/, adding an ADE, running the app in dev mode, preparing a pull request, building a preview of a pull request, or cutting a release. Covers the code layout, the checks CI runs, the sandbox mark rules, adding an ADE, preview builds and the release flow.
 license: MIT
 metadata:
   organization: InsForge
 ---
 
-# Instabox Development
+# InstaADE Development
 
 See the canonical development guide at [DEVELOPMENT.md](../../../DEVELOPMENT.md) in the repo root. It covers:
 
