@@ -134,7 +134,7 @@ test("fixture and sample have the same nested keys", () => {
     sandboxes: [box],
     progress: { kind: "create", step: "x", machineId: null, ade: "t3", error: null },
     error: { kind: "other", message: "" },
-    update: { version: "", step: "available", percent: null, error: null },
+    update: { current: "", enabled: true, step: "idle", version: null, percent: null, error: null },
   };
   // minutes and code are optional on ErrorView.
   const strip = (ks: string[]) => [...new Set(ks.filter((k) => !/\.(minutes|code)$/.test(k)))].sort();
@@ -906,45 +906,99 @@ test("settings: no section for agents on this Mac, whatever their MCP state", as
   expect(calls("add_mcp").length).toBe(0);
 });
 
-// ---- the update of InstaBox ----
+// ---- updates of InstaBox ----
 
-const offered: UpdateView = { version: "0.2.0", step: "available", percent: null, error: null };
+/** The updates of InstaBox 0.1.7, a build that updates itself. */
+const updates = (over: Partial<UpdateView> = {}): UpdateView => ({
+  current: "0.1.7",
+  enabled: true,
+  step: "idle",
+  version: null,
+  percent: null,
+  error: null,
+  ...over,
+});
+const offered = updates({ step: "available", version: "0.2.0" });
+const openSettings = async () => userEvent.click(await screen.findByRole("button", { name: /^Settings/ }));
+const updatesSection = () => within(screen.getByRole("heading", { name: "Updates" }).closest("section") as HTMLElement);
 
-test("update: no row while no update is offered", async () => {
-  show({}, [{}]);
-  await screen.findByText("dev-1");
-  expect(screen.queryByText(/InstaBox .* is available/)).toBeNull();
+test("updates: the Settings button has a dot only while an update is on offer, and the popover no row", async () => {
+  const { state } = show({ update: updates() }, [{}]);
+  const gear = await screen.findByRole("button", { name: "Settings" });
+  expect(gear.querySelector(".badge")).toBeNull();
+
+  act(() => emit({ ...state, update: offered }));
+  const dotted = screen.getByRole("button", { name: "Settings, update available" });
+  expect(dotted.querySelector(".badge")).toBeTruthy();
+  // Nothing pops up in the popover itself.
+  expect(screen.queryByText(/is available/)).toBeNull();
   expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
-  expect(screen.queryByRole("progressbar", { name: "Update progress" })).toBeNull();
+
+  act(() => emit({ ...state, update: updates({ step: "downloading", version: "0.2.0", percent: 10 }) }));
+  expect(screen.getByRole("button", { name: "Settings, update available" })).toBeTruthy();
+  act(() => emit({ ...state, update: updates({ step: "upToDate" }) }));
+  expect(screen.getByRole("button", { name: "Settings" }).querySelector(".badge")).toBeNull();
 });
 
-test("update: Update downloads with progress, then installs", async () => {
+test("updates: Check for updates shows checking, then up to date", async () => {
+  const { state } = show({ update: updates() }, [{}]);
+  await openSettings();
+  const section = updatesSection();
+  expect(section.getByText("Version 0.1.7")).toBeTruthy();
+  await userEvent.click(section.getByRole("button", { name: "Check for updates" }));
+  expect(invoke).toHaveBeenCalledWith("check_for_updates");
+
+  act(() => emit({ ...state, update: updates({ step: "checking" }) }));
+  expect(updatesSection().getByText("Checking for updates…")).toBeTruthy();
+  expect((updatesSection().getByRole("button", { name: "Check for updates" }) as HTMLButtonElement).disabled).toBe(true);
+
+  act(() => emit({ ...state, update: updates({ step: "upToDate" }) }));
+  expect(updatesSection().getByText("InstaBox is up to date")).toBeTruthy();
+  expect((updatesSection().getByRole("button", { name: "Check for updates" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("updates: a failed check shows why inline", async () => {
+  const message = "Could not check for updates: offline";
+  show({ update: updates({ step: "checkFailed", error: { kind: "other", message } }) }, [{}], {
+    check_for_updates: () => Promise.reject({ kind: "other", message }),
+  });
+  await openSettings();
+  const row = updatesSection().getByText(message).closest(".group-row") as HTMLElement;
+  expect(row.getAttribute("role")).toBe("alert");
+  await userEvent.click(updatesSection().getByRole("button", { name: "Check for updates" }));
+  // The rejection shows in state.update only.
+  await act(() => new Promise((r) => setTimeout(r, 0)));
+  expect(screen.getAllByText(message).length).toBe(1);
+});
+
+test("updates: Update downloads with progress, then installs", async () => {
   const { state } = show({ update: offered }, [{}]);
-  const row = (await screen.findByText("InstaBox 0.2.0 is available")).closest(".banner") as HTMLElement;
-  await userEvent.click(within(row).getByRole("button", { name: "Update" }));
+  await openSettings();
+  expect(updatesSection().getByText("InstaBox 0.2.0 is available")).toBeTruthy();
+  // The update is the one action: no check while it is on offer.
+  expect(updatesSection().queryByRole("button", { name: "Check for updates" })).toBeNull();
+  await userEvent.click(updatesSection().getByRole("button", { name: "Update" }));
   expect(invoke).toHaveBeenCalledWith("install_update");
 
   // The back end reports the download. The size may come later.
   act(() => emit({ ...state, update: { ...offered, step: "downloading" } }));
-  expect(screen.getByText("Downloading InstaBox 0.2.0")).toBeTruthy();
-  expect(screen.getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBeNull();
-  // Nothing to click while it downloads.
-  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Later" })).toBeNull();
+  expect(updatesSection().getByText("Downloading InstaBox 0.2.0")).toBeTruthy();
+  expect(updatesSection().getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBeNull();
+  expect(updatesSection().queryByRole("button")).toBeNull();
   act(() => emit({ ...state, update: { ...offered, step: "downloading", percent: 42 } }));
-  expect(screen.getByText("Downloading InstaBox 0.2.0 (42%)")).toBeTruthy();
-  expect(screen.getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBe("42");
+  expect(updatesSection().getByText("Downloading InstaBox 0.2.0 (42%)")).toBeTruthy();
+  expect(updatesSection().getByRole("progressbar", { name: "Update progress" }).getAttribute("aria-valuenow")).toBe("42");
   act(() => emit({ ...state, update: { ...offered, step: "installing" } }));
-  expect(screen.getByText("Installing InstaBox 0.2.0, then restarting")).toBeTruthy();
+  expect(updatesSection().getByText("Installing InstaBox 0.2.0, then restarting")).toBeTruthy();
   expect(calls("install_update").length).toBe(1);
 });
 
-test("update: a failure shows why with Retry, and no second banner", async () => {
+test("updates: a failed update shows why with Retry, and no second banner", async () => {
   const error = { kind: "other" as const, message: "Could not update to 0.2.0: signature mismatch" };
   show({ update: { ...offered, step: "failed", error } }, [{}], { install_update: () => Promise.reject(error) });
-  const row = (await screen.findByText(error.message)).closest(".banner") as HTMLElement;
+  await openSettings();
+  const row = updatesSection().getByText(error.message).closest(".group-row") as HTMLElement;
   expect(row.getAttribute("role")).toBe("alert");
-  expect(within(row).getByRole("button", { name: "Later" })).toBeTruthy();
   await userEvent.click(within(row).getByRole("button", { name: "Retry" }));
   expect(calls("install_update").length).toBe(1);
   // The rejection shows in state.update only.
@@ -952,20 +1006,16 @@ test("update: a failure shows why with Retry, and no second banner", async () =>
   expect(screen.getAllByText(error.message).length).toBe(1);
 });
 
-test("update: Later hides the row", async () => {
-  const { state } = show({ update: offered }, [{}]);
-  await userEvent.click(await screen.findByRole("button", { name: "Later" }));
-  expect(invoke).toHaveBeenCalledWith("update_later");
-  // The back end hides it for the rest of this run.
-  act(() => emit({ ...state, update: null }));
-  expect(screen.queryByText("InstaBox 0.2.0 is available")).toBeNull();
-  expect(calls("install_update").length).toBe(0);
-});
-
-test("update: the row shows on the other screens too, sign-in included", async () => {
-  show({ update: offered, signedIn: false });
-  await screen.findByRole("button", { name: "Sign in with GitHub" });
-  expect(screen.getByText("InstaBox 0.2.0 is available")).toBeTruthy();
+test("updates: a dev or preview build shows its version and never checks", async () => {
+  show({ update: updates({ enabled: false }) }, [{}]);
+  await openSettings();
+  const section = updatesSection();
+  expect(section.getByText("Version 0.1.7")).toBeTruthy();
+  expect(section.getByText("Updates are only for released builds")).toBeTruthy();
+  const check = section.getByRole("button", { name: "Check for updates" }) as HTMLButtonElement;
+  expect(check.disabled).toBe(true);
+  await userEvent.click(check);
+  expect(calls("check_for_updates").length).toBe(0);
 });
 
 // ---- first run ----

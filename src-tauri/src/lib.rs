@@ -166,7 +166,7 @@ pub fn run() {
                 })),
                 {
                     let c = core.clone();
-                    Arc::new(move |u| c.set_update(u))
+                    Arc::new(move |u| c.set_update(Some(u)))
                 },
                 // Through the app's exit, so `on_quit` runs before the new version starts.
                 {
@@ -174,6 +174,7 @@ pub fn run() {
                     Arc::new(move || h.request_restart())
                 },
             ));
+            updates.publish();
             app.manage(updates.clone());
             tauri::async_runtime::spawn(updates.run());
             tray::build(&handle, core.clone())?;
@@ -230,8 +231,8 @@ pub fn run() {
             commands::add_mcp,
             commands::set_start_at_login,
             commands::open_url,
+            commands::check_for_updates,
             commands::install_update,
-            commands::update_later,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Instabox");

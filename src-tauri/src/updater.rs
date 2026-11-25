@@ -1,6 +1,7 @@
 //! Updates of InstaBox itself. A check reads the update manifest of the latest release and
-//! never downloads. Only the user's Update click downloads the update, checks its signature,
-//! installs it and restarts the app. Later hides the offer until the next launch. Instabox
+//! never downloads. The app checks on a timer, and Settings has Check for updates. A newer
+//! version puts a dot on the Settings button and an Update button in Settings. Only that click
+//! downloads the update, checks its signature, installs it and restarts the app. Instabox
 //! Preview and dev builds never check.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,23 +23,36 @@ pub const CHECK_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UpdateStep {
-    /// Offer Update and Later.
+    /// No check has said anything yet. Offer Check for updates.
     #[default]
+    Idle,
+    /// Check for updates runs.
+    Checking,
+    /// Check for updates found nothing newer.
+    UpToDate,
+    /// Check for updates failed: `error` says why.
+    CheckFailed,
+    /// `version` is newer. Offer Update.
     Available,
     /// `percent` says how far, once the size is known.
     Downloading,
     /// The app restarts when the install is done.
     Installing,
-    /// `error` says why. Offer Retry and Later.
+    /// The update failed: `error` says why. Offer Retry.
     Failed,
 }
 
-/// The update of InstaBox the popover offers.
+/// What Settings shows under Updates, and whether the Settings button has a dot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateView {
-    pub version: String,
+    /// This build's version.
+    pub current: String,
+    /// Whether this build updates itself (see `enabled`).
+    pub enabled: bool,
     pub step: UpdateStep,
+    /// The newer version on offer, from Available on.
+    pub version: Option<String>,
     pub percent: Option<u8>,
     pub error: Option<ErrorView>,
 }
@@ -53,8 +67,8 @@ pub enum Progress {
 }
 
 pub type OnProgress = Arc<dyn Fn(Progress) + Send + Sync>;
-/// Puts the offer in the app state, which sends it to the popover.
-pub type Show = Arc<dyn Fn(Option<UpdateView>) + Send + Sync>;
+/// Puts the view in the app state, which sends it to the popover.
+pub type Show = Arc<dyn Fn(UpdateView) + Send + Sync>;
 /// Quits the app through its own exit, so its cleanup runs, and starts the installed version.
 pub type Restart = Arc<dyn Fn() + Send + Sync>;
 
@@ -88,63 +102,77 @@ fn percent(bytes: u64, total: Option<u64>) -> Option<u8> {
     Some((bytes.min(total) * 100 / total) as u8)
 }
 
-/// The offer and what the user did with it in this run.
+/// Where updates are in this run.
 #[derive(Debug, Default)]
-struct Offer {
+struct Status {
+    step: UpdateStep,
     /// The newer version the last check found.
     version: Option<Version>,
-    step: UpdateStep,
     percent: Option<u8>,
     error: Option<String>,
-    /// Later was clicked: nothing is offered until the next launch.
-    later: bool,
 }
 
-impl Offer {
-    fn view(&self) -> Option<UpdateView> {
-        if self.later {
-            return None;
-        }
-        self.version.as_ref().map(|v| UpdateView {
-            version: v.to_string(),
+impl Status {
+    fn view(&self, current: &Version, enabled: bool) -> UpdateView {
+        UpdateView {
+            current: current.to_string(),
+            enabled,
             step: self.step,
+            version: self.version.as_ref().map(Version::to_string),
             percent: self.percent,
             error: self.error.clone().map(ErrorView::other),
-        })
+        }
     }
 
     fn busy(&self) -> bool {
-        self.version.is_some()
-            && matches!(self.step, UpdateStep::Downloading | UpdateStep::Installing)
+        matches!(self.step, UpdateStep::Downloading | UpdateStep::Installing)
     }
 
-    /// A check found `offered`; None: the manifest offers nothing for this computer. Changes
-    /// nothing after Later or while an update installs. A failed update of the same version
-    /// keeps its error and Retry.
-    fn found(&mut self, current: &Version, offered: Option<Version>) {
-        if self.later || self.busy() {
+    /// Check for updates starts. False while an update installs.
+    fn checking(&mut self) -> bool {
+        if self.busy() {
+            return false;
+        }
+        self.step = UpdateStep::Checking;
+        self.error = None;
+        true
+    }
+
+    /// A check found `offered`; None: the manifest offers nothing for this computer. `manual`:
+    /// Check for updates, which says when the app is up to date. Changes nothing while an
+    /// update installs. A failed update of the same version keeps its error and Retry, and a
+    /// timed check that finds nothing leaves a running Check for updates alone.
+    fn found(&mut self, current: &Version, offered: Option<Version>, manual: bool) {
+        if self.busy() {
             return;
         }
-        let offered = offered.filter(|v| is_newer(current, v));
-        if offered.is_some() && offered == self.version {
-            return;
-        }
-        *self = Offer {
-            version: offered,
-            ..Offer::default()
+        let (step, version) = match offered.filter(|v| is_newer(current, v)) {
+            Some(v) if self.step == UpdateStep::Failed && self.version.as_ref() == Some(&v) => {
+                return;
+            }
+            Some(v) => (UpdateStep::Available, Some(v)),
+            None if !manual && self.step == UpdateStep::Checking => return,
+            None if manual || self.step == UpdateStep::UpToDate => (UpdateStep::UpToDate, None),
+            None => (UpdateStep::Idle, None),
+        };
+        *self = Status {
+            step,
+            version,
+            ..Status::default()
         };
     }
 
-    fn later(&mut self) {
-        if !self.busy() {
-            self.later = true;
+    fn check_failed(&mut self, error: String) {
+        if self.step == UpdateStep::Checking {
+            self.step = UpdateStep::CheckFailed;
+            self.error = Some(error);
         }
     }
 
     /// The Update or Retry click: the version to install, when one is offered and none is
     /// installing yet.
     fn start(&mut self) -> Option<Version> {
-        if self.later || self.busy() {
+        if self.busy() || !matches!(self.step, UpdateStep::Available | UpdateStep::Failed) {
             return None;
         }
         let version = self.version.clone()?;
@@ -173,16 +201,16 @@ impl Offer {
     }
 }
 
-/// Checks for updates on a timer and installs one when the user clicks Update.
+/// Checks for updates on a timer and when asked, and installs one when the user clicks Update.
 pub struct Updater {
     current: Version,
     enabled: bool,
     source: Arc<dyn Source>,
     show: Show,
     restart: Restart,
-    /// Held while the offer is shown, so the popover gets the changes in order. Only commands
+    /// Held while the view is shown, so the popover gets the changes in order. Only commands
     /// that run off the main thread take it, as showing may wait for the main thread (the tray).
-    offer: Mutex<Offer>,
+    status: Mutex<Status>,
 }
 
 impl Updater {
@@ -199,70 +227,89 @@ impl Updater {
             source,
             show,
             restart,
-            offer: Mutex::new(Offer::default()),
+            status: Mutex::new(Status::default()),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Offer> {
-        self.offer.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Status> {
+        self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Changes the offer, then shows it when what the popover sees changed.
-    fn change<R>(&self, f: impl FnOnce(&mut Offer) -> R) -> R {
-        let mut offer = self.lock();
-        let before = offer.view();
-        let r = f(&mut offer);
-        let after = offer.view();
+    /// Shows the view as it is: the version, and whether this build updates itself.
+    pub fn publish(&self) {
+        let status = self.lock();
+        (self.show)(status.view(&self.current, self.enabled));
+    }
+
+    /// Changes the status, then shows it when the view changed.
+    fn change<R>(&self, f: impl FnOnce(&mut Status) -> R) -> R {
+        let mut status = self.lock();
+        let before = status.view(&self.current, self.enabled);
+        let r = f(&mut status);
+        let after = status.view(&self.current, self.enabled);
         if after != before {
             (self.show)(after);
         }
         r
     }
 
-    /// Checks once, `FIRST_CHECK` after launch, then every `CHECK_EVERY`, until Later.
+    /// Checks `FIRST_CHECK` after launch, then every `CHECK_EVERY`.
     pub async fn run(self: Arc<Self>) {
         if !self.enabled {
             return;
         }
         tokio::time::sleep(FIRST_CHECK).await;
-        while !self.lock().later {
+        loop {
             self.check().await;
             tokio::time::sleep(CHECK_EVERY).await;
         }
     }
 
-    /// Reads the update manifest and offers a newer version. Never downloads. A failed check
-    /// shows nothing.
+    /// A timed check: reads the update manifest and offers a newer version. Never downloads.
+    /// A failed check shows nothing.
     pub async fn check(&self) {
-        let idle = {
-            let o = self.lock();
-            !o.later && !o.busy()
-        };
-        if !self.enabled || !idle {
+        if !self.enabled || self.lock().busy() {
             return;
         }
         if let Ok(offered) = self.source.check().await {
-            self.change(|o| o.found(&self.current, offered));
+            self.change(|s| s.found(&self.current, offered, false));
         }
     }
 
-    /// Later: nothing is offered until the next launch.
-    pub fn later(&self) {
-        self.change(Offer::later);
+    /// Check for updates: the same check, now, showing that it runs and what it found, or
+    /// why it failed. Never downloads. Does nothing while an update installs.
+    pub async fn check_now(&self) -> Result<(), ErrorView> {
+        if !self.enabled {
+            return Err(ErrorView::other("Updates are only for released builds"));
+        }
+        if !self.change(Status::checking) {
+            return Ok(());
+        }
+        match self.source.check().await {
+            Ok(offered) => {
+                self.change(|s| s.found(&self.current, offered, true));
+                Ok(())
+            }
+            Err(e) => {
+                let message = format!("Could not check for updates: {e}");
+                self.change(|s| s.check_failed(message.clone()));
+                Err(ErrorView::other(message))
+            }
+        }
     }
 
     /// The Update or Retry click: downloads the offered version, checks its signature,
-    /// installs it and restarts the app. The offer shows the progress, and a failure with
+    /// installs it and restarts the app. The view shows the progress, and a failure with
     /// Retry. Does nothing when no update is offered or one is installing already.
     pub async fn install(self: &Arc<Self>) -> Result<(), ErrorView> {
         if !self.enabled {
-            return Err(ErrorView::other("This build does not update itself"));
+            return Err(ErrorView::other("Updates are only for released builds"));
         }
-        let Some(version) = self.change(Offer::start) else {
+        let Some(version) = self.change(Status::start) else {
             return Ok(());
         };
         let me = self.clone();
-        let progress: OnProgress = Arc::new(move |p| me.change(|o| o.progress(p)));
+        let progress: OnProgress = Arc::new(move |p| me.change(|s| s.progress(p)));
         match self.source.install(&version, progress).await {
             Ok(()) => {
                 (self.restart)();
@@ -270,7 +317,7 @@ impl Updater {
             }
             Err(e) => {
                 let message = format!("Could not update to {version}: {e}");
-                self.change(|o| o.failed(message.clone()));
+                self.change(|s| s.failed(message.clone()));
                 Err(ErrorView::other(message))
             }
         }
@@ -369,10 +416,12 @@ mod tests {
         Version::parse(s).unwrap()
     }
 
-    /// A manifest that offers `offered`, and an install that fails while `fail` is set.
+    /// A manifest that offers `offered` (a check fails while `check_fails` is set), and an
+    /// install that fails while `fail` is set.
     #[derive(Default)]
     struct Fake {
         offered: Mutex<Option<Version>>,
+        check_fails: Mutex<Option<String>>,
         fail: Mutex<Option<String>>,
         checks: AtomicUsize,
         installs: AtomicUsize,
@@ -382,6 +431,9 @@ mod tests {
     impl Source for Fake {
         async fn check(&self) -> Result<Option<Version>, String> {
             self.checks.fetch_add(1, Ordering::SeqCst);
+            if let Some(e) = self.check_fails.lock().unwrap().clone() {
+                return Err(e);
+            }
             Ok(self.offered.lock().unwrap().clone())
         }
 
@@ -406,17 +458,29 @@ mod tests {
     struct Run {
         updater: Arc<Updater>,
         source: Arc<Fake>,
-        shown: Arc<Mutex<Vec<Option<UpdateView>>>>,
+        shown: Arc<Mutex<Vec<UpdateView>>>,
         restarts: Arc<AtomicUsize>,
     }
 
     impl Run {
-        fn shown(&self) -> Vec<Option<UpdateView>> {
+        fn shown(&self) -> Vec<UpdateView> {
             self.shown.lock().unwrap().clone()
         }
 
         fn last(&self) -> Option<UpdateView> {
-            self.shown().last().cloned().flatten()
+            self.shown().last().cloned()
+        }
+
+        fn checks(&self) -> usize {
+            self.source.checks.load(Ordering::SeqCst)
+        }
+
+        fn installs(&self) -> usize {
+            self.source.installs.load(Ordering::SeqCst)
+        }
+
+        fn restarts(&self) -> usize {
+            self.restarts.load(Ordering::SeqCst)
         }
     }
 
@@ -446,12 +510,22 @@ mod tests {
         }
     }
 
-    fn view(version: &str, step: UpdateStep, percent: Option<u8>) -> UpdateView {
+    /// The view of InstaBox 0.1.7, a build that updates itself.
+    fn view(step: UpdateStep, version: Option<&str>, percent: Option<u8>) -> UpdateView {
         UpdateView {
-            version: version.into(),
+            current: "0.1.7".into(),
+            enabled: true,
             step,
+            version: version.map(str::to_string),
             percent,
             error: None,
+        }
+    }
+
+    fn failed(step: UpdateStep, version: Option<&str>, message: &str) -> UpdateView {
+        UpdateView {
+            error: Some(ErrorView::other(message)),
+            ..view(step, version, None)
         }
     }
 
@@ -552,24 +626,46 @@ mod tests {
         assert_eq!(percent(50, Some(0)), None);
     }
 
+    #[test]
+    fn publish_shows_the_version_and_whether_updates_are_on() {
+        let r = launch(true, None);
+        r.updater.publish();
+        assert_eq!(r.shown(), [view(UpdateStep::Idle, None, None)]);
+        let off = launch(false, None);
+        off.updater.publish();
+        assert_eq!(
+            off.shown(),
+            [UpdateView {
+                enabled: false,
+                ..view(UpdateStep::Idle, None, None)
+            }]
+        );
+    }
+
     #[tokio::test]
-    async fn a_check_offers_a_newer_version_and_never_downloads() {
+    async fn a_timed_check_offers_a_newer_version_and_never_downloads() {
         let r = launch(true, Some("0.1.8"));
         r.updater.check().await;
         assert_eq!(
             r.shown(),
-            [Some(view("0.1.8", UpdateStep::Available, None))]
+            [view(UpdateStep::Available, Some("0.1.8"), None)]
         );
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 0);
-        assert_eq!(r.restarts.load(Ordering::SeqCst), 0);
         // The same offer again shows nothing new.
         r.updater.check().await;
         assert_eq!(r.shown().len(), 1);
         // A newer one replaces it.
         *r.source.offered.lock().unwrap() = Some(v("0.1.9"));
         r.updater.check().await;
-        assert_eq!(r.last(), Some(view("0.1.9", UpdateStep::Available, None)));
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            r.last(),
+            Some(view(UpdateStep::Available, Some("0.1.9"), None))
+        );
+        // An offer the manifest drops goes away.
+        *r.source.offered.lock().unwrap() = None;
+        r.updater.check().await;
+        assert_eq!(r.last(), Some(view(UpdateStep::Idle, None, None)));
+        assert_eq!(r.installs(), 0);
+        assert_eq!(r.restarts(), 0);
     }
 
     #[tokio::test]
@@ -577,36 +673,66 @@ mod tests {
         for offered in [Some("0.1.7"), Some("0.1.6"), Some("0.1.7+build.2"), None] {
             let r = launch(true, offered);
             r.updater.check().await;
-            assert_eq!(r.shown(), Vec::<Option<UpdateView>>::new(), "{offered:?}");
+            assert_eq!(r.shown(), Vec::<UpdateView>::new(), "{offered:?}");
+            r.updater.check_now().await.unwrap();
+            assert_eq!(
+                r.last(),
+                Some(view(UpdateStep::UpToDate, None, None)),
+                "{offered:?}"
+            );
         }
-        // An offer the manifest drops goes away.
-        let r = launch(true, Some("0.1.8"));
-        r.updater.check().await;
-        *r.source.offered.lock().unwrap() = None;
-        r.updater.check().await;
-        assert_eq!(r.last(), None);
     }
 
     #[tokio::test]
-    async fn later_hides_the_offer_for_the_rest_of_the_run() {
-        let r = launch(true, Some("0.1.8"));
-        r.updater.check().await;
-        r.updater.later();
-        assert_eq!(r.last(), None);
-        // No more checks this run, even when a newer version comes out.
-        *r.source.offered.lock().unwrap() = Some(v("0.1.9"));
-        r.updater.check().await;
-        assert_eq!(r.source.checks.load(Ordering::SeqCst), 1);
-        assert_eq!(r.last(), None);
-        // A click that comes in late installs nothing.
-        r.updater.install().await.unwrap();
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 0);
-        // The next launch offers it again.
-        let next = launch(true, Some("0.1.9"));
-        next.updater.check().await;
+    async fn check_for_updates_shows_checking_then_what_it_found() {
+        let r = launch(true, None);
+        r.updater.check_now().await.unwrap();
         assert_eq!(
-            next.last(),
-            Some(view("0.1.9", UpdateStep::Available, None))
+            r.shown(),
+            [
+                view(UpdateStep::Checking, None, None),
+                view(UpdateStep::UpToDate, None, None),
+            ]
+        );
+        // A timed check that finds nothing keeps saying so.
+        r.updater.check().await;
+        assert_eq!(r.shown().len(), 2);
+        *r.source.offered.lock().unwrap() = Some(v("0.1.8"));
+        r.updater.check_now().await.unwrap();
+        assert_eq!(
+            r.shown()[2..],
+            [
+                view(UpdateStep::Checking, None, None),
+                view(UpdateStep::Available, Some("0.1.8"), None),
+            ]
+        );
+        assert_eq!(r.checks(), 3);
+        assert_eq!(r.installs(), 0, "a check never downloads");
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_for_updates_shows_why() {
+        let r = launch(true, Some("0.1.8"));
+        *r.source.check_fails.lock().unwrap() = Some("offline".into());
+        let e = r.updater.check_now().await.unwrap_err();
+        assert_eq!(e.message, "Could not check for updates: offline");
+        assert_eq!(
+            r.last(),
+            Some(failed(
+                UpdateStep::CheckFailed,
+                None,
+                "Could not check for updates: offline"
+            ))
+        );
+        // A failed timed check shows nothing.
+        r.updater.check().await;
+        assert_eq!(r.shown().len(), 2);
+        // Checking again clears it.
+        *r.source.check_fails.lock().unwrap() = None;
+        r.updater.check_now().await.unwrap();
+        assert_eq!(
+            r.last(),
+            Some(view(UpdateStep::Available, Some("0.1.8"), None))
         );
     }
 
@@ -614,11 +740,13 @@ mod tests {
     async fn a_build_without_updates_never_checks_or_installs() {
         let r = launch(false, Some("0.1.8"));
         r.updater.check().await;
+        let e = r.updater.check_now().await.unwrap_err();
+        assert_eq!(e.message, "Updates are only for released builds");
         assert!(r.updater.install().await.is_err());
         r.updater.clone().run().await;
-        assert_eq!(r.source.checks.load(Ordering::SeqCst), 0);
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 0);
-        assert_eq!(r.shown(), Vec::<Option<UpdateView>>::new());
+        assert_eq!(r.checks(), 0);
+        assert_eq!(r.installs(), 0);
+        assert_eq!(r.shown(), Vec::<UpdateView>::new());
     }
 
     #[tokio::test]
@@ -626,21 +754,22 @@ mod tests {
         let r = launch(true, Some("0.1.8"));
         // Nothing offered yet: the click does nothing.
         r.updater.install().await.unwrap();
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 0);
+        assert_eq!(r.installs(), 0);
         r.updater.check().await;
         r.updater.install().await.unwrap();
+        let v8 = Some("0.1.8");
         assert_eq!(
             r.shown(),
             [
-                Some(view("0.1.8", UpdateStep::Available, None)),
-                Some(view("0.1.8", UpdateStep::Downloading, None)),
-                Some(view("0.1.8", UpdateStep::Downloading, Some(0))),
-                Some(view("0.1.8", UpdateStep::Downloading, Some(50))),
-                Some(view("0.1.8", UpdateStep::Installing, None)),
+                view(UpdateStep::Available, v8, None),
+                view(UpdateStep::Downloading, v8, None),
+                view(UpdateStep::Downloading, v8, Some(0)),
+                view(UpdateStep::Downloading, v8, Some(50)),
+                view(UpdateStep::Installing, v8, None),
             ]
         );
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 1);
-        assert_eq!(r.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(r.installs(), 1);
+        assert_eq!(r.restarts(), 1);
     }
 
     #[tokio::test]
@@ -652,43 +781,57 @@ mod tests {
         assert_eq!(e.message, "Could not update to 0.1.8: signature mismatch");
         assert_eq!(
             r.last(),
-            Some(UpdateView {
-                error: Some(e),
-                ..view("0.1.8", UpdateStep::Failed, None)
-            })
+            Some(failed(UpdateStep::Failed, Some("0.1.8"), &e.message))
         );
-        assert_eq!(r.restarts.load(Ordering::SeqCst), 0);
-        // A check keeps the error and Retry on screen.
+        assert_eq!(r.restarts(), 0);
+        // A timed check keeps the error and Retry on screen.
         let before = r.shown().len();
         r.updater.check().await;
         assert_eq!(r.shown().len(), before);
         // Retry.
         *r.source.fail.lock().unwrap() = None;
         r.updater.install().await.unwrap();
-        assert_eq!(r.last(), Some(view("0.1.8", UpdateStep::Installing, None)));
-        assert_eq!(r.source.installs.load(Ordering::SeqCst), 2);
-        assert_eq!(r.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            r.last(),
+            Some(view(UpdateStep::Installing, Some("0.1.8"), None))
+        );
+        assert_eq!(r.installs(), 2);
+        assert_eq!(r.restarts(), 1);
     }
 
     #[test]
-    fn an_install_in_progress_ignores_checks_later_and_clicks() {
+    fn an_install_in_progress_ignores_checks_and_clicks() {
         let current = v("0.1.7");
-        let mut o = Offer::default();
-        o.found(&current, Some(v("0.1.8")));
-        assert_eq!(o.start(), Some(v("0.1.8")));
-        o.progress(Progress::Downloaded {
+        let mut s = Status::default();
+        s.found(&current, Some(v("0.1.8")), false);
+        assert_eq!(s.start(), Some(v("0.1.8")));
+        s.progress(Progress::Downloaded {
             bytes: 10,
             total: Some(100),
         });
-        let downloading = o.view();
-        o.found(&current, Some(v("0.1.9")));
-        o.found(&current, None);
-        o.later();
-        assert_eq!(o.start(), None, "a second click");
-        assert_eq!(o.view(), downloading);
-        // Later still works on a failed update.
-        o.failed("boom".into());
-        o.later();
-        assert_eq!(o.view(), None);
+        let downloading = s.view(&current, true);
+        s.found(&current, Some(v("0.1.9")), false);
+        s.found(&current, None, true);
+        assert!(!s.checking(), "Check for updates");
+        assert_eq!(s.start(), None, "a second click");
+        assert_eq!(s.view(&current, true), downloading);
+    }
+
+    #[test]
+    fn a_timed_check_leaves_a_running_check_for_updates_alone() {
+        let current = v("0.1.7");
+        let mut s = Status::default();
+        assert!(s.checking());
+        s.found(&current, None, false);
+        assert_eq!(s.step, UpdateStep::Checking);
+        // What it finds still counts.
+        s.found(&current, Some(v("0.1.8")), false);
+        assert_eq!(s.step, UpdateStep::Available);
+        // A failure of the click's own check, after that, changes nothing.
+        s.check_failed("offline".into());
+        assert_eq!(
+            s.view(&current, true),
+            view(UpdateStep::Available, Some("0.1.8"), None)
+        );
     }
 }

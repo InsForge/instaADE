@@ -569,6 +569,15 @@ pre {
   border: 1px solid var(--control);
   color: var(--text);
 }
+.badge {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
 
 /* Native selects drawn as the dropdown buttons of the design */
 .select {
@@ -1190,12 +1199,20 @@ pre.banner-text {
   color: var(--muted);
 }
 
-/* The update's download: the text, with the bar under it */
-.banner.update-progress {
+/* Settings > Updates: what a check found, or how the update goes */
+.group-row.update-status {
+  padding: 8px 10px;
+}
+.update-status > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.update-status.update-progress {
   flex-direction: column;
   align-items: stretch;
+  justify-content: center;
   gap: 6px;
-  padding: 8px 10px;
 }
 
 .switch {

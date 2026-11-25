@@ -158,8 +158,10 @@
   },
   "startAtLogin": true,
   "update": {
-    "version": "0.2.0",
+    "current": "0.1.7",
+    "enabled": true,
     "step": "downloading",
+    "version": "0.2.0",
     "percent": 42,
     "error": null
   }

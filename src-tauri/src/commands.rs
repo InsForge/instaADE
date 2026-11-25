@@ -191,17 +191,17 @@ pub fn open_url(core: Shared<'_>, url: String) -> Res<()> {
     core.open_url(&url)
 }
 
-/// Update: downloads the update the popover offers, checks its signature, installs it and
-/// restarts the app. A failure shows in `state.update`, with Retry. Async, like `update_later`,
-/// so it never runs on the main thread (see `Updater`).
+/// Check for updates: reads the update manifest now and shows what it found in
+/// `state.update`. Never downloads. Async, like `install_update`, so it never runs on the main
+/// thread (see `Updater`).
+#[tauri::command]
+pub async fn check_for_updates(updater: State<'_, Arc<Updater>>) -> Res<()> {
+    updater.check_now().await
+}
+
+/// Update: downloads the update on offer, checks its signature, installs it and restarts the
+/// app. A failure shows in `state.update`, with Retry.
 #[tauri::command]
 pub async fn install_update(updater: State<'_, Arc<Updater>>) -> Res<()> {
     updater.inner().clone().install().await
-}
-
-/// Later: no update is offered until the next launch.
-#[tauri::command]
-pub async fn update_later(updater: State<'_, Arc<Updater>>) -> Res<()> {
-    updater.later();
-    Ok(())
 }

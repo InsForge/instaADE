@@ -143,7 +143,7 @@ pub struct AppState {
     pub progress: Option<ProgressView>,
     pub error: Option<ErrorView>,
     pub start_at_login: bool,
-    /// The update of InstaBox on offer (see `updater`).
+    /// This build's version and its updates (see `updater`). Set once the app starts.
     pub update: Option<UpdateView>,
 }
 
@@ -2450,8 +2450,10 @@ mod tests {
         s.error = Some(ErrorView::from(SandboxError::Cooldown { minutes: 12 }));
         s.start_at_login = true;
         s.update = Some(UpdateView {
-            version: "0.2.0".into(),
+            current: "0.1.7".into(),
+            enabled: true,
             step: UpdateStep::Downloading,
+            version: Some("0.2.0".into()),
             percent: Some(42),
             error: None,
         });

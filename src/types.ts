@@ -104,14 +104,23 @@ export interface ProgressView {
   error: ErrorView | null;
 }
 
-/** The update of InstaBox on offer (Rust: `updater::UpdateView`). */
+/**
+ * idle: nothing to say yet. checking, upToDate, checkFailed: Check for updates. available: offer
+ * Update. downloading, installing: the app restarts when done. failed: offer Retry.
+ */
+export type UpdateStep = "idle" | "checking" | "upToDate" | "checkFailed" | "available" | "downloading" | "installing" | "failed";
+
+/** This build's version and its updates (Rust: `updater::UpdateView`). */
 export interface UpdateView {
-  version: string;
-  /** available: offer Update and Later. downloading, installing: the app restarts when done. failed: offer Retry and Later. */
-  step: "available" | "downloading" | "installing" | "failed";
+  current: string;
+  /** False in dev and preview builds: they never update. */
+  enabled: boolean;
+  step: UpdateStep;
+  /** The newer version on offer, from available on. */
+  version: string | null;
   /** downloading: how far, once the size is known. */
   percent: number | null;
-  /** failed: why. */
+  /** checkFailed, failed: why. */
   error: ErrorView | null;
 }
 

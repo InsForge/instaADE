@@ -57,10 +57,10 @@ export const openSsh = (id: string) => invoke<void>("open_ssh", { id });
 export const addMcp = (client: McpClient) => invoke<void>("add_mcp", { client });
 export const setStartAtLogin = (on: boolean) => invoke<void>("set_start_at_login", { on });
 export const openUrl = (url: string) => invoke<void>("open_url", { url });
+/** Reads the update manifest now. Never downloads. The result shows in state.update. */
+export const checkForUpdates = () => invoke<void>("check_for_updates");
 /** Downloads, installs and restarts the app. A failure shows in state.update. */
 export const installUpdate = () => invoke<void>("install_update");
-/** Hides the update until the next launch. */
-export const updateLater = () => invoke<void>("update_later");
 
 export const T3_DOWNLOAD_URL = "https://github.com/pingdotgg/t3code/releases/latest";
 

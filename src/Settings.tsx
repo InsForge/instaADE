@@ -4,6 +4,7 @@ import { AdeBadge, COMING_SOON } from "./ades";
 import { cap, thisComputer } from "./common";
 import type { Run } from "./common";
 import type { AppState } from "./types";
+import UpdatesSection from "./UpdatesSection";
 
 /** Settings. The organization is picked in the list's footer. */
 export default function Settings({ state, run }: { state: AppState; run: Run }) {
@@ -72,6 +73,8 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
             </div>
           </div>
         </section>
+
+        {state.update && <UpdatesSection update={state.update} />}
       </div>
     </div>
   );
