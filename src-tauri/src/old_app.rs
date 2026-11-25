@@ -133,8 +133,10 @@ pub fn trash_offered(view: &OldAppView, identifier: &str) -> Result<usize, Strin
 
 /// How long a launch waits for an old copy to quit. Its quit clears a copied secret first,
 /// which takes at most a second.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const QUIT_WAIT: Duration = Duration::from_secs(5);
 /// How often the launch checks whether it has quit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const QUIT_STEP: Duration = Duration::from_millis(100);
 
 /// What asking the running old copies to quit came to.
