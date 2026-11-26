@@ -107,6 +107,16 @@ function Status({ update }: { update: UpdateView }) {
   }
 }
 
+/** On the sign-in page, which has no Settings: an update on offer and its action, so a signed-out app still updates. */
+export function SignedOutUpdate({ update }: { update: UpdateView | null }) {
+  if (!update || !updateOffered(update)) return null;
+  return (
+    <div className="group signed-out-update" role="group" aria-label="Update">
+      <Status update={update} />
+    </div>
+  );
+}
+
 /** Settings > Updates: this build's version, then what a check found and its action. */
 export default function UpdatesSection({ update }: { update: UpdateView }) {
   return (

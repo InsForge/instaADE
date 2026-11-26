@@ -1286,6 +1286,10 @@ pre.banner-text {
   gap: 8px;
   width: 100%;
 }
+/* An update on offer, under the sign-in buttons. */
+.signed-out-update {
+  width: 100%;
+}
 .sign-in-provider {
   height: 36px;
   padding: 0 10px 0 4px;
