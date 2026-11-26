@@ -11,7 +11,7 @@ export type ViewState =
   | "deleting";
 
 /** An ADE's id. */
-export type AdeId = "t3" | "cmux" | "orca" | "paradev" | "paseo";
+export type AdeId = "t3" | "cmux" | "orca" | "paradev" | "paseo" | "herdr";
 
 export type ErrorKind =
   | "freeLimit"
@@ -45,7 +45,7 @@ export interface SandboxView {
   name: string;
   state: ViewState;
   size: string;
-  /** T3 was paired with it from this computer. cmux, Orca, Paradev and Paseo never set it. */
+  /** T3 was paired with it from this computer. cmux, Orca, Paradev, Paseo and Herdr never set it. */
   connected: boolean;
   /** The ADEs set up on the sandbox (its mark), in the order they were added. */
   ades: AdeId[];
@@ -76,7 +76,8 @@ export interface AdeView {
   id: AdeId;
   name: string;
   shortName: string;
-  /** The desktop app's version; null when it is not found on this computer. */
+  /** The desktop app's version; null when it is not found on this computer. For Herdr, which
+   * runs on the sandbox, the OpenSSH client's, such as "OpenSSH 10.3p1". */
   version: string | null;
   downloadUrl: string;
 }

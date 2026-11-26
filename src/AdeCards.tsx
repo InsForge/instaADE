@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { refreshAdes } from "./api";
-import { AdeBadge, adeName, localAde } from "./ades";
+import { AdeBadge, adeName, inTerminal, localAde } from "./ades";
 import { openExternal, thisComputer } from "./common";
 import type { Run } from "./common";
 import { Alert } from "./icons";
@@ -25,10 +25,12 @@ export function CheckAdesButton({ run, text }: { run: Run; text?: boolean }) {
   );
 }
 
-/** The selected ADE is not on this computer: shown at the top of the list. */
+/** The selected ADE is not on this computer: shown at the top of the list. For Herdr, which
+ * runs on the sandbox, that is the OpenSSH client. */
 export function AdeMissing({ state, ade, run }: { state: AppState; ade: AdeId; run: Run }) {
   const name = adeName(state, ade);
   const url = localAde(state, ade)?.downloadUrl;
+  const ssh = inTerminal(ade);
   return (
     <div className="warn-card">
       <div className="warn-head">
@@ -37,16 +39,18 @@ export function AdeMissing({ state, ade, run }: { state: AppState; ade: AdeId; r
         </span>
         <div className="warn-text">
           <span className="strong">
-            {name} is not on {thisComputer()}
+            {ssh ? "OpenSSH" : name} is not on {thisComputer()}
           </span>
-          <span className="small soft">InstaADE opens sandboxes in {name}. Install it first.</span>
+          <span className="small soft">
+            {ssh ? `InstaADE opens ${name} in a terminal over SSH. Install the OpenSSH client first.` : `InstaADE opens sandboxes in ${name}. Install it first.`}
+          </span>
         </div>
       </div>
       <div className="warn-buttons">
         <CheckAdesButton run={run} />
         {url && (
           <button className="btn primary" onClick={() => openExternal(url)}>
-            Download {name}
+            {ssh ? "Get OpenSSH" : `Download ${name}`}
           </button>
         )}
       </div>

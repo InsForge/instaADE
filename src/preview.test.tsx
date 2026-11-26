@@ -48,7 +48,7 @@ test("preview update and connect actions preserve other connected ADEs", async (
   expect(design.getByRole("img", { name: "T3 Code" })).toBeTruthy();
 });
 
-test("preview shows every ADE: all five in the switcher, Orca, Paradev and Paseo on sample sandboxes", async () => {
+test("preview shows every ADE: all six in the switcher, Orca, Paradev, Paseo and Herdr on sample sandboxes", async () => {
   render(<App />);
   await screen.findByText("mobile-app");
   const mobile = within(screen.getByText("mobile-app").closest("li")!);
@@ -56,9 +56,10 @@ test("preview shows every ADE: all five in the switcher, Orca, Paradev and Paseo
   expect(mobile.getByRole("img", { name: "Paradev" })).toBeTruthy();
   const design = within(screen.getByText("design-system").closest("li")!);
   expect(design.getByRole("img", { name: "Paseo" })).toBeTruthy();
+  expect(design.getByRole("img", { name: "Herdr" })).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: /Switch ADE/ }));
   const names = screen.getAllByRole("menuitemradio").map((item) => item.querySelector(".strong")?.textContent);
-  expect(names).toEqual(["InstaBox", "T3 Code", "cmux", "Orca", "Paradev", "Paseo"]);
+  expect(names).toEqual(["InstaBox", "T3 Code", "cmux", "Orca", "Paradev", "Paseo", "Herdr"]);
 });
 
 test("preview: Connect in Paseo mode marks the sandbox and says where to add it in Paseo", async () => {

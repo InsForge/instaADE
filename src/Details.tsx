@@ -354,7 +354,7 @@ export default function Details({ state, sandbox: s, run, mode, agents, onAgentS
             // cmux installs nothing to reinstall: Reconnect runs its prep again and opens it.
             // Paradev's Reconnect checks its host again, and hands the setup back to Paradev
             // when the host does not run. Paseo's runs its setup again, which starts a stopped
-            // daemon.
+            // daemon. Herdr's installs Herdr again when the sandbox lost it, and opens it.
             <div className="pair">
               <button className="btn md" disabled={BUSY.includes(s.state)} onClick={() => onConnect(s.id, ade)}>
                 Reconnect

@@ -11,11 +11,12 @@ let state: AppState = {
   // Like a dev build: Settings shows the version and says updates are only for released builds.
   update: { current: fixture.update.current, enabled: false, step: "idle", version: null, percent: null, error: null },
   startAtLogin: false,
-  // Every ADE a Mac can have. The shared fixture has no Paradev or Paseo.
+  // Every ADE a Mac can have. The shared fixture has no Paradev, Paseo or Herdr.
   ades: [
     ...fixture.ades,
     { id: "paradev", name: "Paradev", shortName: "Paradev", version: "2.0.11", downloadUrl: "https://github.com/paradevai/paradev/releases/latest" },
     { id: "paseo", name: "Paseo", shortName: "Paseo", version: "0.17.4", downloadUrl: "https://github.com/getpaseo/paseo/releases/latest" },
+    { id: "herdr", name: "Herdr", shortName: "Herdr", version: "OpenSSH 10.3p1", downloadUrl: "https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse" },
   ] as AdeView[],
   sandboxes: [
     ...fixture.sandboxes.slice(0, 3).map((s, i) => ({
@@ -25,7 +26,7 @@ let state: AppState = {
     ...[
       { id: "preview-api", name: "api-server", state: "running", connected: true, ades: ["t3", "cmux"] },
       { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false, ades: ["orca", "paradev"] },
-      { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux", "paseo"] },
+      { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux", "paseo", "herdr"] },
       { id: "preview-staging", name: "staging", state: "paused", connected: true, ades: ["t3"] },
     ].map((machine) => ({
       ...fixture.sandboxes[2],
@@ -65,7 +66,7 @@ export async function invokePreview(command: string, args: Record<string, unknow
     case "connect_sandbox": {
       const sandbox = state.sandboxes.find((s) => s.id === args.id);
       const ade = args.ade;
-      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca" && ade !== "paradev" && ade !== "paseo")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca" && ade !== "paradev" && ade !== "paseo" && ade !== "herdr")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
       // Paradev sets the host up itself, so the app hands the setup over and marks nothing yet.
       if (ade === "paradev") {
         result = "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";

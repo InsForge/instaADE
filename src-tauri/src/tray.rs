@@ -63,6 +63,7 @@ fn open_target(s: &SandboxView) -> (Ade, bool) {
             Open::Link(_) => true,
             Open::SshHost(_) => true,
             Open::Host(_) => true,
+            Open::Terminal(_) => true,
         };
     (ade, ready)
 }
@@ -522,6 +523,16 @@ mod tests {
         r.ades = vec![Ade::Paradev];
         assert_eq!(open_target(&r), (Ade::Paradev, true));
         assert_eq!(open_label(Ade::Paradev, true), "Open in Paradev");
+    }
+
+    #[test]
+    fn a_herdr_sandbox_opens_in_herdr_from_any_computer() {
+        // Herdr pairs nothing: any computer opens it in a terminal.
+        let mut r = row("a", ViewState::Paused);
+        r.connected = false;
+        r.ades = vec![Ade::Herdr];
+        assert_eq!(open_target(&r), (Ade::Herdr, true));
+        assert_eq!(open_label(Ade::Herdr, true), "Open in Herdr");
     }
 
     const SCREEN: Bounds = Bounds {

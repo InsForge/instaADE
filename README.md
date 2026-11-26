@@ -5,7 +5,7 @@
 
   <h1>InstaADE</h1>
 
-  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.<br>Works with T3 Code, cmux, Orca, Paradev and Paseo.</p>
+  <p>Run your ADE (agentic development environment) on an instabox sandbox, from your menu bar or system tray.<br>Works with T3 Code, cmux, Orca, Paradev, Paseo and Herdr.</p>
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
@@ -23,7 +23,7 @@
 
 ## Getting Started
 
-You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need its desktop app: [T3 Code](https://github.com/pingdotgg/t3code/releases/latest), [Orca](https://github.com/stablyai/orca/releases/latest) or [Paseo](https://github.com/getpaseo/paseo/releases/latest) on macOS or Windows, [cmux](https://github.com/manaflow-ai/cmux/releases/latest) or [Paradev](https://github.com/paradevai/paradev/releases/latest) on macOS.
+You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. To open sandboxes in an ADE, you also need its desktop app: [T3 Code](https://github.com/pingdotgg/t3code/releases/latest), [Orca](https://github.com/stablyai/orca/releases/latest) or [Paseo](https://github.com/getpaseo/paseo/releases/latest) on macOS or Windows, [cmux](https://github.com/manaflow-ai/cmux/releases/latest) or [Paradev](https://github.com/paradevai/paradev/releases/latest) on macOS. [Herdr](https://herdr.dev) has no desktop app: it runs on the sandbox and opens in your terminal.
 
 1. Download the latest release from [Releases](https://github.com/InsForge/instaADE/releases/latest):
    - macOS: the `.dmg`, `aarch64` for Apple silicon, `x64` for Intel.
@@ -34,14 +34,14 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
    - InstaADE was called Instabox before. On macOS, InstaADE asks a running Instabox to quit, or asks you to quit it when it does not, and offers to move it to the Trash. On Windows, the installer removes Instabox first. Your sign-in, your data and Start at login stay.
 3. Click the InstaADE icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
 4. Sign in with GitHub or Google.
-5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca, Paradev or Paseo in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaADE before, it starts in T3 Code.
+5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca, Paradev, Paseo or Herdr in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaADE before, it starts in T3 Code.
 6. Click **New sandbox**, pick a size, then click **Create sandbox**.
-7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaADE names from the SSH menu. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaADE copied, then click **Install Paradev** again. In Paseo, add the address InstaADE copied once, under **Settings**, **Add host**, **Remote SSH**.
+7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaADE names from the SSH menu. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaADE copied, then click **Install Paradev** again. In Paseo, add the address InstaADE copied once, under **Settings**, **Add host**, **Remote SSH**. Herdr opens in your terminal with nothing to confirm.
 
 ## Features
 
 - Create a sandbox or connect one you already have
-- Pick T3 Code, cmux, Orca, Paradev or Paseo at the top: each sandbox gets **Open in** it, or **Install** it when the sandbox does not have it yet
+- Pick T3 Code, cmux, Orca, Paradev, Paseo or Herdr at the top: each sandbox gets **Open in** it, or **Install** it when the sandbox does not have it yet
 - The popover takes on the look of the ADE you pick
 - Set up the ADE on the sandbox the way it needs (see [Supported ADEs](#supported-ades))
 - Use several ADEs on one sandbox: its details list each one with **Open**, and offer the other ADEs on your computer
@@ -60,6 +60,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 | [Orca](docs/ades.md#orca) | macOS, Windows | Adds the sandbox as an SSH host that Orca imports |
 | [Paradev](docs/ades.md#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
 | [Paseo](docs/ades.md#paseo) | macOS, Windows | Runs the Paseo daemon on the sandbox and adds the sandbox as an SSH host, which you add in Paseo once |
+| [Herdr](docs/ades.md#herdr) | None (macOS, Windows) | Installs Herdr on the sandbox and opens it in your terminal over SSH |
 
 Is your favorite ADE missing? Add it, or ask for it in an issue. See [CONTRIBUTING.md](CONTRIBUTING.md#add-an-ade).
 
@@ -68,6 +69,7 @@ Is your favorite ADE missing? Add it, or ask for it in an issue. See [CONTRIBUTI
 - **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then connect the host InstaADE names from Orca's SSH menu, and open `/data/home`.
 - **Paradev**: You need the Paradev app in Applications, not its Canary build. **Install Paradev** wakes the sandbox, puts its SSH address on the clipboard for one minute, and opens Paradev's host settings. In Paradev, click **Set up a host over SSH** and paste the address, then click **Install Paradev** in InstaADE again to open a workspace on the sandbox.
 - **Paseo**: You need the Paseo app, in Applications on macOS. **Install Paseo** installs the Paseo daemon on the sandbox. **Install Paseo** and **Open in Paseo** wake the sandbox, add it as an SSH host, copy its address (`ssh://instabox-<name>`) and start Paseo. Add the address in Paseo once, under **Settings**, **Add host**, **Remote SSH**.
+- **Herdr**: You need no Herdr app, only the OpenSSH client, which macOS has and recent Windows 10 and Windows 11 install by default. **Install Herdr** installs Herdr on the sandbox, then opens your terminal with an SSH session that runs Herdr there. **Open in Herdr** wakes the sandbox and does the same. Closing the terminal leaves Herdr and its agents running on the sandbox, and the next **Open in Herdr** attaches to them again.
 
 **Your SSH config**: InstaADE changes it only for Orca and Paseo. It adds one line at the top of `~/.ssh/config`, `Include ~/.ssh/instabox/config`, and copies the file to `~/.ssh/config.instabox.bak` before its first change. It keeps their hosts in `~/.ssh/instabox/config`. That file holds SSH tokens, and on macOS only you can read it.
 
