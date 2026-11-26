@@ -9,7 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  # One job makes the release, so the build jobs never race to create it.
+  # One job makes the release, so the build jobs never race to create it. It starts as a draft:
+  # releases/latest stays on the release before, whose latest.json still works, until the
+  # manifest job publishes this one.
   release:
     runs-on: ubuntu-latest
     steps:
@@ -21,7 +23,7 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG exists"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --generate-notes
           fi
 
   build:
@@ -166,7 +168,8 @@ jobs:
           retention-days: 1
 
   # The manifest the app reads at releases/latest/download/latest.json. It goes up last, once
-  # every build has put its files on the release, so the app never sees a half release.
+  # every build has put its files on the release, and then the release is published, so the app
+  # never sees a half release. When a build fails, the release stays a draft.
   manifest:
     needs: build
     runs-on: ubuntu-latest
@@ -206,3 +209,4 @@ jobs:
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson platforms "$platforms" \
             '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' > latest.json
           gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

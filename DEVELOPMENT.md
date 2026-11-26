@@ -99,8 +99,8 @@ Repository admins cut releases.
 
 1. Bump the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`, and merge that through a pull request.
 2. Push a `vX.Y.Z` tag on `main`. Only admins may push `v*` tags.
-3. **Release** (`.github/workflows/release.yml`) builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signatures, and uploads them to the GitHub release with the updater files.
-4. When all three builds are done, it uploads `latest.json`. From then on, the app offers the release.
+3. **Release** (`.github/workflows/release.yml`) makes a draft GitHub release. It builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signatures, and uploads them to the draft with the updater files.
+4. When all three builds are done, it uploads `latest.json` and publishes the release. From then on, the app offers the release. When a build fails, the release stays a draft and the app keeps offering the release before. Re-run the failed jobs to finish it.
 
 The signing secrets live in two environments: `release`, which only `v*` tags may use, and `preview`, which only `main` may use. Never add them at the repository level.
 
