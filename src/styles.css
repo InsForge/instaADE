@@ -257,7 +257,8 @@ pre {
 }
 
 .ade-logo[data-ade="orca"],
-.ade-logo[data-ade="paradev"] { background: #171717; }
+.ade-logo[data-ade="paradev"],
+.ade-logo[data-ade="paseo"] { background: #171717; }
 .ade-logo[data-ade="cmux"] { background: transparent; }
 
 .ade-picker:focus-visible {

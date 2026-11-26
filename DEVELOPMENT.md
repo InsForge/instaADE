@@ -8,9 +8,9 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `app.rs`: the app state and every action. `commands.rs`: the commands the UI calls.
   - `api/`: the instabox API client. `auth.rs`: device sign-in and token storage.
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
-  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`).
-  - `ssh_config.rs`: the SSH hosts InstaADE writes for Orca, and the one line it adds to `~/.ssh/config`.
-  - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
+  - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`, `paseo.rs`).
+  - `ssh_config.rs`: the SSH hosts InstaADE writes for Orca and Paseo, and the one line it adds to `~/.ssh/config`.
+  - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later, and copies Paseo's host address, which holds no secret and stays.
   - `old_app.rs`: finds a copy of the app from before it was InstaADE, and moves it to the Trash (see [The old app](#the-old-app)).
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
   - `updater.rs`: checks for a new version of InstaADE and installs it when the user clicks Update in Settings (see [In-app updates](#in-app-updates)).
@@ -59,18 +59,18 @@ cargo test
 
 ## Adding an ADE
 
-Pull requests that add an ADE are welcome. Read [How InstaADE works with each ADE](docs/ades.md) first to see how the four current ADEs differ.
+Pull requests that add an ADE are welcome. Read [How InstaADE works with each ADE](docs/ades.md) first to see how the current ADEs differ.
 
 - Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
-- ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link. `src-tauri/src/ade/orca.rs` finds Orca and reads its version, from its app bundle on macOS and from `Orca.exe` on Windows. `src-tauri/src/ade/paradev.rs` finds Paradev like cmux, and holds its host check, host id and links.
-- How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux), `SshHost` for an app that imports the sandbox as a host from `~/.ssh/config` (Orca), `Host` for an app that runs the sandbox as one of its hosts, set up in the app (Paradev). `src-tauri/src/ssh_config.rs` writes the Orca hosts.
+- ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link. `src-tauri/src/ade/orca.rs` finds Orca and reads its version, from its app bundle on macOS and from `Orca.exe` on Windows. `src-tauri/src/ade/paradev.rs` finds Paradev like cmux, and holds its host check, host id and links. `src-tauri/src/ade/paseo.rs` finds Paseo like Orca (it uses Orca's reader for `.exe` files), and holds its daemon setup, host address and notice.
+- How it opens (`Open`): `Pair` for an app that pairs with a server on the sandbox (T3), `Link` for an app that reaches the sandbox over SSH from a link (cmux), `SshHost` for an app that reaches the sandbox through a host in `~/.ssh/config`, which it imports (Orca) or the user adds by its address (Paseo), `Host` for an app that runs the sandbox as one of its hosts, set up in the app (Paradev). `src-tauri/src/ssh_config.rs` writes the hosts of Orca and Paseo.
 - Flow: `src-tauri/src/sandbox/connect.rs` sets the ADE up and adds its id to the sandbox's mark. `src-tauri/src/sandbox/sync.rs` keeps the versions in step for an ADE that pins them. `open_in_ade` in `src-tauri/src/app.rs` opens it.
 - UI: `src/ades.tsx` holds what the app does with each ADE (its badge, names and text), `src/mode.ts` the ADE the user picked, and `src/ade.ts` with `src/hero/` each ADE's look (logo and background). The switcher is `src/AdeSwitcher.tsx`.
 - Docs: add the ADE to the README's Supported ADEs and give it a section in `docs/ades.md`.
 
-A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host.
+A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. If the user adds the host by hand, it also needs the address to copy, and if its app needs a server on the sandbox, a setup that runs it (Paseo's daemon). A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host.
 
-An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca and Paradev do.
+An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca, Paradev and Paseo do.
 
 ## The old app
 

@@ -1,4 +1,5 @@
-//! SSH hosts for an ADE that imports them from the user's SSH config (Orca). InstaADE writes
+//! SSH hosts for an ADE that reads them from the user's SSH config: Orca imports them, and the
+//! user adds one to Paseo by its alias. InstaADE writes
 //! one block per sandbox to `~/.ssh/instabox/config`, and `~/.ssh/config` includes that file
 //! from its first line, before any `Host *`, so the block's options win. InstaADE changes only
 //! the blocks it marked and that one `Include` line. Every other line stays as it is, with its
