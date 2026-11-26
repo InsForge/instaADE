@@ -75,9 +75,11 @@ pub enum Open {
     Link(Link),
     /// The app writes the sandbox as a host in the user's SSH config, which the desktop app
     /// imports (Orca) or the user adds by its address (Paseo), and starts the desktop app. The
-    /// user connects the host there.
+    /// user connects the host there. A desktop app that takes the ADE's add-host link opens on
+    /// the host instead, and the user only confirms.
     SshHost(SshHost),
     /// The desktop app runs the sandbox as one of its hosts, which the user sets up in the app.
+    /// A desktop app that takes the ADE's add-host link opens the setup filled in.
     Host(Host),
     /// The ADE runs on the sandbox, and the app opens the user's terminal with an SSH session
     /// that starts it there. Nothing of the ADE runs on this computer.
@@ -105,6 +107,9 @@ pub struct SshHost {
     /// the desktop version. It runs at Install, before the mark. None: the desktop app brings
     /// its own part (Orca).
     pub setup: Option<fn(&str) -> String>,
+    /// The link that opens the app on the host, from its alias, when the app takes it. It then
+    /// replaces the copy of `address`, the plain start of the app, and `notice`.
+    pub add_link: Option<AddHostLink>,
 }
 
 /// An ADE that runs the sandbox as one of its hosts (Paradev). The desktop app sets the host
@@ -119,6 +124,59 @@ pub struct Host {
     pub ssh_address: fn(&SshLogin<'_>) -> String,
     pub notice: &'static str,
     pub link: fn(&str) -> String,
+    /// The link that opens the host setup with `ssh_address` filled in, when the app takes it.
+    /// It then replaces the copy, `setup_link` and `notice`.
+    pub add_link: Option<AddHostLink>,
+}
+
+/// Set to `1`, InstaADE opens the add-host links of Orca, Paseo and Paradev whatever the app's
+/// version, to try builds of those apps that have the links before a release does.
+pub const ADD_HOST_LINKS_ENV: &str = "INSTAADE_ADD_HOST_LINKS";
+
+/// A link that opens the ADE's app on its own add-host step, filled in for the sandbox, so the
+/// user only confirms there. It carries what the user would enter without it: the host's alias
+/// (Orca, Paseo) or the SSH address (Paradev). It opens only in the app InstaADE checked.
+#[derive(Debug, Clone, Copy)]
+pub struct AddHostLink {
+    /// The link, from the host's alias (Orca, Paseo) or the SSH address (Paradev).
+    pub link: fn(&str) -> String,
+    /// What the user does in the app once the link opened it.
+    pub notice: &'static str,
+    /// The first version of the app that takes the link. None while no release has it.
+    pub since: Option<&'static str>,
+}
+
+impl AddHostLink {
+    /// True when the app at `version` takes the link: it is `since` or newer, or `forced`
+    /// (`ADD_HOST_LINKS_ENV`). An app whose version does not read counts as older.
+    pub fn taken_by(&self, version: Option<&str>, forced: bool) -> bool {
+        forced
+            || self.since.zip(version).is_some_and(|(since, v)| {
+                matches!(
+                    (version_order(v), version_order(since)),
+                    (Some(v), Some(s)) if v >= s
+                )
+            })
+    }
+}
+
+/// True when `value`, the value of `ADD_HOST_LINKS_ENV`, turns the links on.
+pub fn add_host_links_forced(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Percent-encodes everything but the unreserved characters, for a value in a link or in the
+/// user and host of an `ssh://` address.
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// An ADE that runs on the sandbox in a terminal (Herdr). `command` is what the SSH session
@@ -666,7 +724,7 @@ mod tests {
             o.download_url(),
             "https://github.com/stablyai/orca/releases/latest"
         );
-        assert_eq!(o.url_scheme(), "", "Orca takes no links");
+        assert_eq!(o.url_scheme(), "orca");
         // Orca installs its own server on the first connect: nothing to set up or keep in step.
         assert!(!o.pins_local_version());
         assert!(!o.reinstalls());
@@ -683,6 +741,12 @@ mod tests {
             panic!("Orca opens through an SSH host")
         };
         assert_eq!((h.notice)("instabox-x"), orca::notice("instabox-x"));
+        let l = h.add_link.expect("Orca's connect link");
+        assert_eq!(
+            (l.link)("instabox-x"),
+            "orca://ssh/connect?alias=instabox-x"
+        );
+        assert_eq!(l.since, None, "no Orca release has it yet");
         assert_eq!(o.platforms(), &[Platform::MacOs, Platform::Windows]);
         assert_eq!(o.runs_here(), cfg!(any(target_os = "macos", windows)));
     }
@@ -716,6 +780,12 @@ mod tests {
         assert_eq!(h.script, paradev::HOST_SCRIPT);
         assert_eq!(h.setup_link, "superset://settings/hosts");
         assert_eq!(h.notice, paradev::NOTICE);
+        let l = h.add_link.expect("Paradev's host setup link");
+        assert_eq!(
+            (l.link)("ssh://u@h:2222"),
+            "superset://settings/hosts?ssh=ssh%3A%2F%2Fu%40h%3A2222"
+        );
+        assert_eq!(l.since, None, "no Paradev release has it yet");
         assert_eq!(p.setup_script("ignored"), paradev::HOST_SCRIPT);
         assert_eq!(p.platforms(), &[Platform::MacOs]);
     }
@@ -731,7 +801,7 @@ mod tests {
             p.download_url(),
             "https://github.com/getpaseo/paseo/releases/latest"
         );
-        assert_eq!(p.url_scheme(), "", "Paseo's links open agents, not hosts");
+        assert_eq!(p.url_scheme(), "paseo");
         // InstaADE installs Paseo's daemon, but keeps no version in step and has no probe yet.
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
@@ -757,6 +827,12 @@ mod tests {
             Some("ssh://instabox-x")
         );
         assert_eq!(h.setup.map(|s| s("0.17.4")), Some(p.setup_script("0.17.4")));
+        let l = h.add_link.expect("Paseo's add host link");
+        assert_eq!(
+            (l.link)("instabox-x"),
+            "paseo://hosts/add?ssh=ssh%3A%2F%2Finstabox-x"
+        );
+        assert_eq!(l.since, None, "no Paseo release has it yet");
         assert_eq!(p.platforms(), &[Platform::MacOs, Platform::Windows]);
         // Orca brings its own server and imports the host by itself.
         let Open::SshHost(o) = Ade::Orca.open() else {
@@ -854,16 +930,27 @@ mod tests {
                 }
                 Open::Terminal(_) => assert_eq!(a.url_scheme(), "", "{a:?} takes no links"),
                 Open::SshHost(h) => {
-                    assert_eq!(a.url_scheme(), "", "{a:?} takes no links");
                     // An address the user adds by hand holds no token: ssh reads it from the host.
                     if let Some(address) = h.address {
                         assert_eq!(address("instabox-x"), "ssh://instabox-x", "{a:?}");
+                    }
+                    match h.add_link {
+                        Some(l) => {
+                            let link = (l.link)("instabox-x");
+                            assert!(link.starts_with(&scheme), "{a:?}");
+                            // It names the host's alias only: the token stays in the host.
+                            assert!(link.ends_with("instabox-x"), "{link}");
+                        }
+                        None => assert_eq!(a.url_scheme(), "", "{a:?} takes no links"),
                     }
                 }
                 Open::Host(h) => {
                     assert!(h.setup_link.starts_with(&scheme), "{a:?}");
                     let id = "0123456789abcdef0123456789abcdef";
                     assert!((h.link)(id).starts_with(&scheme), "{a:?}");
+                    if let Some(l) = h.add_link {
+                        assert!((l.link)("ssh://u@h").starts_with(h.setup_link), "{a:?}");
+                    }
                 }
             }
         }
@@ -962,5 +1049,66 @@ mod tests {
         assert!(parse_probe(r#"{"busy":true,"reason":"x"}"#).busy);
         assert!(parse_probe("").busy);
         assert!(parse_probe(r#"{"reason":"x"}"#).busy);
+    }
+
+    #[test]
+    fn an_add_host_link_is_taken_from_its_version_on_or_when_forced() {
+        fn link(_: &str) -> String {
+            String::new()
+        }
+        let none = AddHostLink {
+            link,
+            notice: "",
+            since: None,
+        };
+        // No release has it: only forced, whatever the version.
+        assert!(!none.taken_by(Some("9.9.9"), false));
+        assert!(!none.taken_by(None, false));
+        assert!(none.taken_by(Some("1.0.0"), true));
+        assert!(none.taken_by(None, true));
+        let since = AddHostLink {
+            since: Some("1.5.0"),
+            ..none
+        };
+        assert!(since.taken_by(Some("1.5.0"), false));
+        assert!(since.taken_by(Some("1.5.1"), false));
+        assert!(since.taken_by(Some("1.10.0"), false), "numbers, not text");
+        assert!(!since.taken_by(Some("1.4.269"), false));
+        assert!(
+            !since.taken_by(Some("1.5.0-rc.1"), false),
+            "before the release"
+        );
+        // A version that does not read, or none, is older.
+        assert!(!since.taken_by(Some("1.5.x"), false));
+        assert!(!since.taken_by(None, false));
+        assert!(since.taken_by(Some("1.4.269"), true));
+    }
+
+    #[test]
+    fn only_1_forces_the_add_host_links() {
+        assert!(add_host_links_forced(Some("1")));
+        assert!(add_host_links_forced(Some(" 1\n")));
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("11"),
+        ] {
+            assert!(!add_host_links_forced(off), "{off:?}");
+        }
+        assert_eq!(ADD_HOST_LINKS_ENV, "INSTAADE_ADD_HOST_LINKS");
+    }
+
+    #[test]
+    fn percent_encode_keeps_only_unreserved_characters() {
+        assert_eq!(percent_encode("instabox-dev_1.x~"), "instabox-dev_1.x~");
+        assert_eq!(
+            percent_encode("ssh://a@b:22/c d?e=f&g#h"),
+            "ssh%3A%2F%2Fa%40b%3A22%2Fc%20d%3Fe%3Df%26g%23h"
+        );
+        assert_eq!(percent_encode("%41\n"), "%2541%0A");
+        assert_eq!(percent_encode("é"), "%C3%A9");
     }
 }

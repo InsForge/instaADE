@@ -3,7 +3,9 @@
 //! service on the sandbox, which then connects out to Paradev's relay. After that a link opens a
 //! new workspace on the host by its host id. Paradev has no link or CLI that adds a host from
 //! an SSH address without the user, so InstaADE copies the address and opens the app's host
-//! settings, and the user finishes there.
+//! settings, and the user finishes there. A Paradev that takes
+//! `superset://settings/hosts?ssh=<address>` links (none released yet) gets the address in that
+//! link instead, which opens Set up a host over SSH filled in.
 //! On this computer: find the real Paradev app (its identifier and its signature, not only its
 //! name), the newest when there are several, and read its version from its bundle.
 
@@ -12,7 +14,7 @@ use ring::hmac;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Host, HostState, Platform, SshLogin};
+use crate::ade::{AddHostLink, Host, HostState, Platform, SshLogin, percent_encode};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "paradev";
@@ -167,7 +169,26 @@ pub const HOST: Host = Host {
     ssh_address,
     notice: NOTICE,
     link: workspace_link,
+    add_link: Some(ADD_HOST_LINK),
 };
+
+/// Paradev's link that opens Set up a host over SSH with the address filled in
+/// (ParadevAI/Paradev issue 10245). No Paradev release takes it yet.
+pub const ADD_HOST_LINK: AddHostLink = AddHostLink {
+    link: setup_link_with,
+    notice: LINK_NOTICE,
+    since: None,
+};
+
+/// What the user does in Paradev once the link opened the host setup.
+pub const LINK_NOTICE: &str = "In Paradev, click Set up to add this sandbox as a host.";
+
+/// `superset://settings/hosts?ssh=<address>`: Paradev opens Set up a host over SSH with
+/// `address` filled in, and sets the host up once the user clicks Set up. The address holds
+/// the SSH token, so the link opens only in the Paradev app InstaADE checked.
+pub fn setup_link_with(address: &str) -> String {
+    format!("{SETUP_LINK}?ssh={}", percent_encode(address))
+}
 
 /// Reads `HOST_SCRIPT`'s output. The host runs only when systemd says `active`. A machine id
 /// counts only in the form Paradev accepts for a Linux host: 32 lowercase hex digits.
@@ -205,25 +226,15 @@ pub fn workspace_link(machine_id: &str) -> String {
     format!("{URL_SCHEME}://new-workspace?host={}", host_id(machine_id))
 }
 
-/// Percent-encodes everything but the unreserved characters. ssh decodes the user and host of
-/// an `ssh://` address.
-fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// The address the user pastes into Paradev's Set up a host over SSH:
 /// `ssh://<token>@<host>:<port>`, the SSH token as the user. The port is left out when it is
-/// 22, as ssh assumes it then.
+/// 22, as ssh assumes it then. ssh decodes the percent-encoded user and host.
 pub fn ssh_address(login: &SshLogin<'_>) -> String {
-    let at = format!("{}@{}", encode(login.user), encode(login.host));
+    let at = format!(
+        "{}@{}",
+        percent_encode(login.user),
+        percent_encode(login.host)
+    );
     if login.port == 22 {
         format!("ssh://{at}")
     } else {
@@ -294,6 +305,32 @@ mod tests {
         }
         assert_eq!(SETUP_LINK, "superset://settings/hosts");
         assert_eq!(HOST.setup_link, SETUP_LINK);
+    }
+
+    #[test]
+    fn the_setup_link_holds_the_whole_address_in_one_parameter() {
+        assert_eq!(
+            setup_link_with(&ssh_address(&login(2222))),
+            "superset://settings/hosts?ssh=ssh%3A%2F%2Fibssh_AbC-12_x%40ssh.instabox.sh%3A2222"
+        );
+        // An address with encoded characters is encoded again, so Paradev reads it back whole.
+        let odd = SshLogin {
+            host: "ssh.example.test",
+            port: 2222,
+            user: "a@b&ssh=x#y",
+            title: "",
+        };
+        assert_eq!(
+            setup_link_with(&ssh_address(&odd)),
+            "superset://settings/hosts?ssh=ssh%3A%2F%2Fa%2540b%2526ssh%253Dx%2523y%40ssh.example.test%3A2222"
+        );
+        assert!(
+            !LINK_NOTICE.contains("ssh://"),
+            "the notice never shows the address"
+        );
+        let l = HOST.add_link.unwrap();
+        assert_eq!((l.link)("ssh://u@h"), setup_link_with("ssh://u@h"));
+        assert_eq!((l.notice, l.since), (LINK_NOTICE, None));
     }
 
     #[test]

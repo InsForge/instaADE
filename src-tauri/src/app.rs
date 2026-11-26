@@ -15,7 +15,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use url::Url;
 
-use crate::ade::{self, Ade, Open, SshLogin};
+use crate::ade::{self, AddHostLink, Ade, Open, SshLogin};
 use crate::agents::{self, Agent};
 use crate::api::{Client, Credentials, Machine, MachineSpec, Me, Org, Snapshot, Template};
 use crate::auth::{self, Provider, Session};
@@ -693,6 +693,9 @@ pub struct Core {
     /// The clipboard for secrets, which clears them a minute later; a test puts its own in
     /// place.
     clipboard: Arc<SecretClipboard>,
+    /// Opens the add-host links of Orca, Paseo and Paradev whatever the app's version
+    /// (`ade::ADD_HOST_LINKS_ENV`).
+    add_host_links: bool,
     emit: Emitter,
     home: PathBuf,
     inner: Mutex<Inner>,
@@ -835,6 +838,7 @@ impl Core {
             locate: Arc::new(Ade::locate),
             verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
             clipboard: Arc::new(SecretClipboard::system()),
+            add_host_links: false,
             emit,
             home,
             side_effects: Mutex::new(()),
@@ -851,6 +855,14 @@ impl Core {
                 account: 0,
             }),
         }
+    }
+
+    /// Opens the add-host links of Orca, Paseo and Paradev whatever the app's version when `on`,
+    /// to try builds of those apps that have the links before a release does
+    /// (`ade::ADD_HOST_LINKS_ENV`).
+    pub fn forcing_add_host_links(mut self, on: bool) -> Core {
+        self.add_host_links = on;
+        self
     }
 
     /// Test only: finds the ADEs' apps with `locate` and checks them with `verify` instead of
@@ -1766,7 +1778,8 @@ impl Core {
     /// checks the app again (the wake can take minutes), makes or loads the token, writes it into
     /// the sandbox's host in the user's SSH config, copies the host's address for an app that
     /// adds hosts by it (Paseo), starts the app that passed the last check and returns what the
-    /// user does next there.
+    /// user does next there. When that app takes the ADE's add-host link (`add_host_link`), it
+    /// opens the link in that app instead, and copies nothing.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let open = ade.open();
         if let Open::Pair(_) = open {
@@ -1828,6 +1841,12 @@ impl Core {
                         "Could not add the sandbox to your SSH config: {e:#}"
                     ))
                 })?;
+                if let Some(l) = self.add_host_link(ade, &app, h.add_link).await {
+                    // The app opens on the host it reads from the SSH config, so nothing is
+                    // copied. The link names the alias only.
+                    self.open_with(account, &(l.link)(&alias), Some(&app))?;
+                    return Ok(Some(l.notice.to_string()));
+                }
                 if let Some(address) = h.address {
                     self.copy_address(ade, address(&alias)).await;
                 }
@@ -1882,6 +1901,29 @@ impl Core {
         }
     }
 
+    /// `link` when the ADE's app at `app` takes it: the links are forced
+    /// (`ade::ADD_HOST_LINKS_ENV`), or the app's version, read from it now, is the link's
+    /// `since` or newer. None otherwise, and then the app opens as before.
+    async fn add_host_link(
+        &self,
+        ade: Ade,
+        app: &Path,
+        link: Option<AddHostLink>,
+    ) -> Option<AddHostLink> {
+        let link = link?;
+        if self.add_host_links {
+            return Some(link);
+        }
+        // No release takes the link yet: nothing to read.
+        link.since?;
+        let app = app.to_path_buf();
+        let version = tokio::task::spawn_blocking(move || ade.local_version(&app).ok())
+            .await
+            .ok()
+            .flatten();
+        link.taken_by(version.as_deref(), false).then_some(link)
+    }
+
     /// For an ADE whose app reaches the sandbox over SSH (cmux, Orca, Paradev, Paseo), the app is
     /// checked before the sandbox is touched: with no app, or one that fails the check, nothing
     /// wakes, is created or is marked. `open_link` and `open_host` check it again right before
@@ -1897,8 +1939,10 @@ impl Core {
     /// again right before. With the sandbox's `link` (its host runs), it opens the sandbox in
     /// the app. Without one, the user sets the host up in the app: the SSH address, with an
     /// SSH token from `ssh::token`, goes on the clipboard, the app opens its host setup, and the
-    /// answer is the ADE's notice of what to do there. With no app, or one that fails the
-    /// check, no token is made, nothing is copied and nothing opens.
+    /// answer is the ADE's notice of what to do there. When the app takes the ADE's add-host
+    /// link (`add_host_link`), the address goes in that link instead, opened in the same app,
+    /// and nothing is copied. With no app, or one that fails the check, no token is made,
+    /// nothing is copied and nothing opens.
     async fn open_host(
         self: &Arc<Self>,
         ade: Ade,
@@ -1930,6 +1974,12 @@ impl Core {
             user: &t.token,
             title: "",
         });
+        if let Some(l) = self.add_host_link(ade, &app, h.add_link).await {
+            // The address goes in the link, which opens only in the app checked above, so
+            // nothing is copied.
+            self.open_with(account, &(l.link)(&address), Some(&app))?;
+            return Ok(Some(l.notice.to_string()));
+        }
         // pbcopy blocks for a moment, so off the async runtime. The address is cleared a minute
         // later, unless the user copied something else since.
         let core = self.clone();
@@ -4813,6 +4863,11 @@ mod tests {
     }
 
     fn paradev_core(base: &Url, here: CmuxHere) -> ParadevCore {
+        paradev_core_linking(base, here, false)
+    }
+
+    /// `paradev_core`, with the add-host links forced when `links`.
+    fn paradev_core_linking(base: &Url, here: CmuxHere, links: bool) -> ParadevCore {
         let dir = tempfile::tempdir().unwrap();
         let id = if here == CmuxHere::OtherId {
             "com.superset.desktop.canary"
@@ -4829,6 +4884,7 @@ mod tests {
         let copied = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = copied.clone();
         let found = app.clone();
+        let core = core.forcing_add_host_links(links);
         let core = Arc::new(
             core.with_apps(
                 Arc::new(move |ade| {
@@ -4996,6 +5052,47 @@ mod tests {
         assert_eq!(
             *opened.lock().unwrap(),
             [format!("{PARADEV_LINK} in {}", new.display())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paradev_that_takes_the_link_gets_the_address_in_it_and_nothing_is_copied() {
+        let (server, base) = paradev_server(serde_json::json!({}), "inactive").await;
+        let ParadevCore {
+            core,
+            opened,
+            copied,
+            app,
+            _dir,
+        } = paradev_core_linking(&base, CmuxHere::Real, true);
+        core.refresh(false).await;
+        let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(Some(ade::paradev::LINK_NOTICE.to_string())));
+        // The whole address in one parameter, only in the Paradev app it checked.
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!(
+                "superset://settings/hosts?ssh=ssh%3A%2F%2Fibssh_new%40ssh.example.test%3A2222 in {}",
+                app.display()
+            )]
+        );
+        assert!(copied.lock().unwrap().is_empty(), "nothing to paste");
+        // As without the link: one token, and no mark until the host runs.
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        let s = core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        // Once the host runs, the link to the sandbox's host opens, as before.
+        let (_server, base) =
+            paradev_server(serde_json::json!({"instabox-bridge": "t3"}), "active").await;
+        let p = paradev_core_linking(&base, CmuxHere::Real, true);
+        p.core.refresh(false).await;
+        let r = p.core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(None));
+        assert_eq!(
+            *p.opened.lock().unwrap(),
+            [format!("{PARADEV_LINK} in {}", p.app.display())]
         );
     }
 
@@ -6014,6 +6111,11 @@ mod tests {
     }
 
     fn orca_core(base: &Url, here: OrcaHere) -> OrcaCore {
+        orca_core_linking(base, here, false)
+    }
+
+    /// `orca_core`, with the add-host links forced when `links`.
+    fn orca_core_linking(base: &Url, here: OrcaHere, links: bool) -> OrcaCore {
         let dir = tempfile::tempdir().unwrap();
         let app = ade::orca::test_bundle(dir.path(), ade::orca::BUNDLE_ID, "1.4.269");
         orca_core_with(
@@ -6024,16 +6126,19 @@ mod tests {
             Arc::new(move |ade, path| {
                 ade == Ade::Orca && ade::orca::verify_with(path, |_| here != OrcaHere::BadSignature)
             }),
+            links,
         )
     }
 
-    /// `orca_core` with the app at `app` (found when `found`) and the check `verify`.
+    /// `orca_core` with the app at `app` (found when `found`), the check `verify`, and the
+    /// add-host links forced when `links`.
     fn orca_core_with(
         base: &Url,
         dir: tempfile::TempDir,
         app: PathBuf,
         found: bool,
         verify: Verifier,
+        links: bool,
     ) -> OrcaCore {
         let home = tempfile::tempdir().unwrap();
         let (core, opened) = recording_core(
@@ -6046,6 +6151,7 @@ mod tests {
             home.path().to_path_buf(),
         );
         let at = app.clone();
+        let core = core.forcing_add_host_links(links);
         let core = Arc::new(core.with_apps(
             Arc::new(move |ade| (found && ade == Ade::Orca).then(|| at.clone())),
             verify,
@@ -6105,6 +6211,76 @@ mod tests {
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
         // Orca pairs nothing, so the sandbox does not join the T3 pairings from here.
         assert!(!o.core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn an_orca_that_takes_the_link_opens_on_the_host_it_wrote() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let o = orca_core_linking(&base, OrcaHere::Real, true);
+        o.core.refresh(false).await;
+        let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(ade::orca::LINK_NOTICE));
+        // The link names the alias only, and opens only in the Orca that passed the check.
+        assert_eq!(
+            *o.opened.lock().unwrap(),
+            [format!(
+                "orca://ssh/connect?alias=instabox-dev-1 in {}",
+                o.app.display()
+            )]
+        );
+        // The host the link names is written as without the link, with the token.
+        assert!(
+            hosts_of(o.home.path()).contains(
+                "Host instabox-dev-1\n  HostName ssh.example.test\n  Port 2222\n  User ibssh_new\n"
+            ),
+            "{}",
+            hosts_of(o.home.path())
+        );
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
+    }
+
+    /// The links follow the app's version once a release has them: an app from `since` on gets
+    /// the link without the env, an older one does not, and with no `since` only the env counts.
+    #[tokio::test]
+    async fn an_app_from_the_links_version_on_takes_it_without_the_env() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        // Orca 1.4.269, links not forced.
+        let o = orca_core(&base, OrcaHere::Real);
+        let at = |since| AddHostLink {
+            since: Some(since),
+            ..ade::orca::ADD_HOST_LINK
+        };
+        let taken = |link| o.core.add_host_link(Ade::Orca, &o.app, link);
+        assert!(taken(Some(at("1.4.269"))).await.is_some());
+        assert!(taken(Some(at("1.4.200"))).await.is_some());
+        assert!(taken(Some(at("1.4.270"))).await.is_none());
+        assert!(
+            taken(Some(ade::orca::ADD_HOST_LINK)).await.is_none(),
+            "no release has it yet"
+        );
+        assert!(taken(None).await.is_none());
+        // An app whose version does not read counts as older.
+        let dir = tempfile::tempdir().unwrap();
+        let odd = ade::orca::test_bundle(dir.path(), ade::orca::BUNDLE_ID, "nightly");
+        let odd = o
+            .core
+            .add_host_link(Ade::Orca, &odd, Some(at("1.4.0")))
+            .await;
+        assert!(odd.is_none());
+        // Forced, the version does not count.
+        let f = orca_core_linking(&base, OrcaHere::Real, true);
+        let forced = f.core.add_host_link(Ade::Orca, &f.app, Some(at("9.0.0")));
+        assert!(forced.await.is_some());
+        assert!(
+            f.core
+                .add_host_link(Ade::Orca, &f.app, None)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6602,6 +6778,11 @@ mod tests {
     }
 
     fn paseo_core(base: &Url, here: OrcaHere, clipboard: bool) -> PaseoCore {
+        paseo_core_linking(base, here, clipboard, false)
+    }
+
+    /// `paseo_core`, with the add-host links forced when `links`.
+    fn paseo_core_linking(base: &Url, here: OrcaHere, clipboard: bool, links: bool) -> PaseoCore {
         let dir = tempfile::tempdir().unwrap();
         let app = ade::paseo::test_bundle(dir.path(), ade::paseo::BUNDLE_ID, "0.17.4");
         let home = tempfile::tempdir().unwrap();
@@ -6621,6 +6802,7 @@ mod tests {
             Arc::new(NoClipboard)
         };
         let found = app.clone();
+        let core = core.forcing_add_host_links(links);
         let core = Arc::new(
             core.with_apps(
                 Arc::new(move |ade| {
@@ -6710,6 +6892,67 @@ mod tests {
         assert_eq!((s.progress, s.error), (None, None));
         // Paseo pairs nothing, so the sandbox does not join the T3 pairings from here.
         assert!(!p.core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn a_paseo_that_takes_the_link_gets_the_daemon_the_host_and_the_link_but_no_copy() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let p = paseo_core_linking(&base, OrcaHere::Real, true, true);
+        p.core.refresh(false).await;
+        let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(ade::paseo::LINK_NOTICE));
+        // The setup and the host as without the link.
+        assert_eq!(
+            exec_cmds(&server).await,
+            [ade::paseo::setup_script("0.17.4")]
+        );
+        assert!(hosts_of(p.home.path()).contains("Host instabox-dev-1\n"));
+        // The address goes in the link, opened only in the Paseo that passed the check.
+        assert_eq!(
+            *p.opened.lock().unwrap(),
+            [format!(
+                "paseo://hosts/add?ssh=ssh%3A%2F%2Finstabox-dev-1 in {}",
+                p.app.display()
+            )]
+        );
+        assert!(p.copied.lock().unwrap().is_empty(), "nothing to paste");
+        let s = p.core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+    }
+
+    /// Forced links change nothing for an app that is missing or fails the check: no setup, no
+    /// token, no host, nothing copied or opened.
+    #[tokio::test]
+    async fn forced_links_still_need_the_verified_app() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        for here in [OrcaHere::Missing, OrcaHere::BadSignature] {
+            let p = paseo_core_linking(&base, here, true, true);
+            p.core.refresh(false).await;
+            assert!(p.core.open_in_ade("m1", Some(Ade::Paseo)).await.is_err());
+            assert!(p.opened.lock().unwrap().is_empty());
+            assert!(p.copied.lock().unwrap().is_empty());
+            assert_eq!(hosts_of(p.home.path()), "");
+            let o = orca_core_linking(&base, here, true);
+            o.core.refresh(false).await;
+            assert!(o.core.open_in_ade("m1", Some(Ade::Orca)).await.is_err());
+            assert!(o.opened.lock().unwrap().is_empty());
+            assert_eq!(hosts_of(o.home.path()), "");
+        }
+        for here in [CmuxHere::Missing, CmuxHere::OtherId, CmuxHere::BadSignature] {
+            let d = paradev_core_linking(&base, here, true);
+            d.core.refresh(false).await;
+            assert!(
+                d.core
+                    .connect_sandbox("m1", Some(Ade::Paradev))
+                    .await
+                    .is_err()
+            );
+            assert!(d.opened.lock().unwrap().is_empty());
+            assert!(d.copied.lock().unwrap().is_empty());
+        }
+        let r = requests(&server).await;
+        assert!(!r.iter().any(|x| x.ends_with("/ssh-tokens")), "{r:?}");
+        assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
     }
 
     #[tokio::test]
@@ -6988,6 +7231,7 @@ mod tests {
                     && !replaced.load(std::sync::atomic::Ordering::SeqCst)
                     && ade::orca::verify_with(path, |_| true)
             }),
+            false,
         );
         o.core.refresh(false).await;
         let e = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap_err();
@@ -7022,6 +7266,7 @@ mod tests {
             exe.clone(),
             true,
             Arc::new(|ade, path| ade == Ade::Orca && ade::orca::verify_exe(path)),
+            false,
         );
         // A version found when the file was still good.
         o.core

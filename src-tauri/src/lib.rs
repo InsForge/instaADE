@@ -93,7 +93,7 @@ pub fn run() {
                     tray::update(&h, state);
                 })
             };
-            let core = Arc::new(Core::new(
+            let core = Core::new(
                 api_base(std::env::var("INSTABOX_API_URL").ok()),
                 Arc::new(KeyringKeyStore),
                 // A new token also rewrites the sandbox's SSH host (Orca, Paseo), and a sign-out
@@ -112,7 +112,12 @@ pub fn run() {
                 opener,
                 emit,
                 dirs::home_dir().unwrap_or_default(),
-            ));
+            );
+            // INSTAADE_ADD_HOST_LINKS=1: the add-host links, for builds of Orca, Paseo and
+            // Paradev that have them before a release does.
+            let links = std::env::var(ade::ADD_HOST_LINKS_ENV).ok();
+            let core =
+                Arc::new(core.forcing_add_host_links(ade::add_host_links_forced(links.as_deref())));
             let release = !cfg!(debug_assertions);
             // On macOS 13 and later, a LaunchAgent an older build wrote becomes the app's own
             // login item.
