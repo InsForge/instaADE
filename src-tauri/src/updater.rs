@@ -380,7 +380,7 @@ impl<R: Runtime> PluginSource<R> {
     }
 
     /// Test only: other limits for a check and a download.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     fn with_timeouts(mut self, check: Duration, download: Duration) -> PluginSource<R> {
         self.check_timeout = check;
         self.download_timeout = download;
@@ -460,10 +460,7 @@ impl<R: Runtime> Source for PluginSource<R> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
     use tokio::sync::Semaphore;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
@@ -979,108 +976,117 @@ mod tests {
         assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(15 * 60));
     }
 
-    /// A manifest that offers `version` for every computer, with its file at `package`.
-    fn manifest(version: &str, package: &str) -> serde_json::Value {
-        let file = serde_json::json!({ "url": package, "signature": "c2ln" });
-        serde_json::json!({
-            "version": version,
-            "pub_date": "2026-11-25T21:24:33Z",
-            "platforms": {
-                "darwin-aarch64": file, "darwin-x86_64": file, "windows-x86_64": file,
-                "linux-x86_64": file, "linux-aarch64": file
-            }
-        })
-    }
+    /// The real plugin in a mock app. Not on Windows, where such a test binary does not start.
+    #[cfg(not(windows))]
+    mod plugin {
+        use super::*;
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// An app whose updater plugin reads `server`'s /latest.json, with InstaADE's key.
-    fn plugin_app(server: &MockServer) -> tauri::App<tauri::test::MockRuntime> {
-        let conf: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
-        context.config_mut().plugins.0.insert(
-            "updater".into(),
+        /// A manifest that offers `version` for every computer, with its file at `package`.
+        fn manifest(version: &str, package: &str) -> serde_json::Value {
+            let file = serde_json::json!({ "url": package, "signature": "c2ln" });
             serde_json::json!({
-                "pubkey": conf["plugins"]["updater"]["pubkey"],
-                "endpoints": [format!("{}/latest.json", server.uri())],
-                // The test server speaks plain HTTP.
-                "dangerousInsecureTransportProtocol": true
-            }),
-        );
-        tauri::test::mock_builder()
-            .plugin(tauri_plugin_updater::Builder::new().build())
-            .build(context)
-            .unwrap()
-    }
+                "version": version,
+                "pub_date": "2026-11-25T21:24:33Z",
+                "platforms": {
+                    "darwin-aarch64": file, "darwin-x86_64": file, "windows-x86_64": file,
+                    "linux-x86_64": file, "linux-aarch64": file
+                }
+            })
+        }
 
-    async fn serve(server: &MockServer, at: &str, answer: ResponseTemplate) {
-        Mock::given(method("GET"))
-            .and(path(at))
-            .respond_with(answer)
-            .mount(server)
-            .await;
-    }
+        /// An app whose updater plugin reads `server`'s /latest.json, with InstaADE's key.
+        fn plugin_app(server: &MockServer) -> tauri::App<tauri::test::MockRuntime> {
+            let conf: serde_json::Value =
+                serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+            let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+            context.config_mut().plugins.0.insert(
+                "updater".into(),
+                serde_json::json!({
+                    "pubkey": conf["plugins"]["updater"]["pubkey"],
+                    "endpoints": [format!("{}/latest.json", server.uri())],
+                    // The test server speaks plain HTTP.
+                    "dangerousInsecureTransportProtocol": true
+                }),
+            );
+            tauri::test::mock_builder()
+                .plugin(tauri_plugin_updater::Builder::new().build())
+                .build(context)
+                .unwrap()
+        }
 
-    #[tokio::test]
-    async fn a_stalled_check_fails_at_its_limit_and_can_run_again() {
-        let server = MockServer::start().await;
-        let package = format!("{}/package", server.uri());
-        let late = ResponseTemplate::new(200)
-            .set_body_json(manifest("9.0.0", &package))
-            .set_delay(Duration::from_secs(20));
-        serve(&server, "/latest.json", late).await;
-        let app = plugin_app(&server);
-        let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
-            .with_timeouts(Duration::from_millis(300), DOWNLOAD_TIMEOUT);
-        let (updater, shown, _) = updater_on(true, Arc::new(source));
+        async fn serve(server: &MockServer, at: &str, answer: ResponseTemplate) {
+            Mock::given(method("GET"))
+                .and(path(at))
+                .respond_with(answer)
+                .mount(server)
+                .await;
+        }
 
-        let started = Instant::now();
-        let e = updater.check_now().await.unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(
-            e.message.starts_with("Could not check for updates: "),
-            "{e:?}"
-        );
-        let last = shown.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.step, UpdateStep::CheckFailed);
-        assert_eq!(last.error, Some(e));
+        #[tokio::test]
+        async fn a_stalled_check_fails_at_its_limit_and_can_run_again() {
+            let server = MockServer::start().await;
+            let package = format!("{}/package", server.uri());
+            let late = ResponseTemplate::new(200)
+                .set_body_json(manifest("9.0.0", &package))
+                .set_delay(Duration::from_secs(20));
+            serve(&server, "/latest.json", late).await;
+            let app = plugin_app(&server);
+            let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
+                .with_timeouts(Duration::from_millis(300), DOWNLOAD_TIMEOUT);
+            let (updater, shown, _) = updater_on(true, Arc::new(source));
 
-        // Check for updates again, once the server answers.
-        server.reset().await;
-        let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
-        serve(&server, "/latest.json", ok).await;
-        updater.check_now().await.unwrap();
-        let last = shown.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.step, UpdateStep::Available);
-        assert_eq!(last.version.as_deref(), Some("9.0.0"));
-    }
+            let started = Instant::now();
+            let e = updater.check_now().await.unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                e.message.starts_with("Could not check for updates: "),
+                "{e:?}"
+            );
+            let last = shown.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last.step, UpdateStep::CheckFailed);
+            assert_eq!(last.error, Some(e));
 
-    #[tokio::test]
-    async fn a_stalled_download_fails_at_its_own_limit_with_retry() {
-        let server = MockServer::start().await;
-        let package = format!("{}/package", server.uri());
-        let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
-        serve(&server, "/latest.json", ok).await;
-        let late = ResponseTemplate::new(200)
-            .set_body_bytes(vec![0u8; 1024])
-            .set_delay(Duration::from_secs(20));
-        serve(&server, "/package", late).await;
-        let app = plugin_app(&server);
-        // The download's limit is far below the check's: only its own can end it in time.
-        let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
-            .with_timeouts(Duration::from_secs(10), Duration::from_millis(300));
-        let (updater, shown, restarts) = updater_on(true, Arc::new(source));
-        updater.check().await;
+            // Check for updates again, once the server answers.
+            server.reset().await;
+            let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
+            serve(&server, "/latest.json", ok).await;
+            updater.check_now().await.unwrap();
+            let last = shown.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last.step, UpdateStep::Available);
+            assert_eq!(last.version.as_deref(), Some("9.0.0"));
+        }
 
-        let started = Instant::now();
-        let e = updater.install().await.unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(
-            e.message.starts_with("Could not update to 9.0.0: "),
-            "{e:?}"
-        );
-        let last = shown.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.step, UpdateStep::Failed, "with Retry");
-        assert_eq!(last.error, Some(e));
-        assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        #[tokio::test]
+        async fn a_stalled_download_fails_at_its_own_limit_with_retry() {
+            let server = MockServer::start().await;
+            let package = format!("{}/package", server.uri());
+            let ok = ResponseTemplate::new(200).set_body_json(manifest("9.0.0", &package));
+            serve(&server, "/latest.json", ok).await;
+            let late = ResponseTemplate::new(200)
+                .set_body_bytes(vec![0u8; 1024])
+                .set_delay(Duration::from_secs(20));
+            serve(&server, "/package", late).await;
+            let app = plugin_app(&server);
+            // The download's limit is far below the check's: only its own can end it in time.
+            let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}))
+                .with_timeouts(Duration::from_secs(10), Duration::from_millis(300));
+            let (updater, shown, restarts) = updater_on(true, Arc::new(source));
+            updater.check().await;
+
+            let started = Instant::now();
+            let e = updater.install().await.unwrap_err();
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                e.message.starts_with("Could not update to 9.0.0: "),
+                "{e:?}"
+            );
+            let last = shown.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last.step, UpdateStep::Failed, "with Retry");
+            assert_eq!(last.error, Some(e));
+            assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        }
     }
 }

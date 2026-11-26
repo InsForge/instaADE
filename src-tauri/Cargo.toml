@@ -53,7 +53,10 @@ libc = "0.2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
-# A mock app, so the updater plugin runs in tests.
+
+# A mock app, so the updater plugin runs in tests. Not on Windows, where such a test binary
+# does not start.
+[target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 
 [profile.release]
