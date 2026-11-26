@@ -47,7 +47,7 @@ export function AdeMissing({ state, ade, run }: { state: AppState; ade: AdeId; r
         </div>
       </div>
       <div className="warn-buttons">
-        <CheckAdesButton run={run} />
+        <CheckAdesButton run={run} text />
         {url && (
           <button className="btn primary" onClick={() => openExternal(url)}>
             {ssh ? "Get OpenSSH" : `Download ${name}`}
