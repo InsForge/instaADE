@@ -21,7 +21,7 @@ For a large change, open an issue first, so we can agree on the approach before 
 
 ## Add an ADE
 
-An ADE fits InstaADE when it has a desktop app on macOS or Windows and can work on a remote Linux machine. InstaADE opens a sandbox in an ADE in one of four ways:
+An ADE fits InstaADE when it has a desktop app on macOS or Windows, or runs in a terminal, and can work on a remote Linux machine. InstaADE opens a sandbox in an ADE in one of five ways:
 
 | Way | What the ADE does | Example |
 | --- | --- | --- |
@@ -29,8 +29,9 @@ An ADE fits InstaADE when it has a desktop app on macOS or Windows and can work 
 | Link | Opens a link from InstaADE and connects to the sandbox over SSH | cmux |
 | SSH host | Imports the sandbox as a host from `~/.ssh/config` | Orca |
 | Host | Runs the sandbox as one of its hosts, set up in the ADE | Paradev |
+| Terminal | Runs on the sandbox, and InstaADE opens it in your terminal over SSH | Herdr |
 
-1. Read [How InstaADE works with each ADE](docs/ades.md) to see how the four ADEs differ.
+1. Read [How InstaADE works with each ADE](docs/ades.md) to see how the ADEs differ.
 2. Follow [Adding an ADE](DEVELOPMENT.md#adding-an-ade) for the files to change.
 3. If the ADE gets an SSH token, check in `Ade::verify` that its app is the real one.
 4. Add the ADE to the README's [Supported ADEs](README.md#supported-ades) and give it a section in `docs/ades.md`.
