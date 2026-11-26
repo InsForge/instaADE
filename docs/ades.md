@@ -66,6 +66,34 @@ The address holds an SSH token, so InstaADE copies it, and opens Paradev's links
 
 Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
+## Herdr
+
+Herdr is a terminal workspace manager for coding agents, with no desktop app. It runs on the sandbox, and InstaADE opens it in your terminal over SSH. Nothing of Herdr runs on your computer, and no app gets an SSH token.
+
+**Install Herdr** wakes the sandbox and runs one command on it:
+
+- When an SSH command cannot find `herdr`, the command runs Herdr's install script, `https://herdr.dev/install.sh`. It puts the latest Herdr in `~/.local/bin/herdr` and checks its SHA-256. An SSH command's PATH has no `~/.local/bin`, so InstaADE links Herdr as `/usr/local/bin/herdr`. A Herdr the sandbox already has stays as it is.
+- Then it prints `herdr --version`. When the command fails or prints no version, the sandbox does not get `herdr` in its mark.
+
+Then Herdr opens, as with **Open in Herdr**. **Reconnect** runs the same command again, which installs nothing while Herdr is there, and opens Herdr.
+
+**Open in Herdr** wakes the sandbox, since the SSH gateway refuses a paused one. Then it opens your terminal with this command:
+
+```
+ssh -t -o StrictHostKeyChecking=accept-new -p 2222 <SSH token>@ssh.instabox.sh herdr
+```
+
+- On macOS the terminal is Terminal, as for **Open in Terminal**: the command goes into a temporary `.command` file that only you can read, and InstaADE removes it 10 seconds later. On Windows it is Windows Terminal, else a console window.
+- The token is the one the SSH command in the sandbox's details uses: the stored one while it has more than a day left, else a new 30-day one.
+- The first time, ssh adds the gateway's host key to `~/.ssh/known_hosts` without asking.
+- Herdr keeps its panes in a server on the sandbox. Closing the terminal, or detaching with `ctrl+b q`, leaves the agents running, and the next Open attaches to them again. `herdr server stop` on the sandbox ends them.
+
+InstaADE never updates Herdr on the sandbox. Run `herdr update` there to update it.
+
+On your computer, InstaADE needs only the OpenSSH client: `/usr/bin/ssh` on macOS, and on Windows `ssh.exe` on the PATH, else in `System32\OpenSSH`. Settings shows its version next to Herdr. Without it, nothing wakes or changes, and InstaADE asks you to install the OpenSSH client.
+
+Herdr has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+
 ## Several ADEs on one sandbox
 
 A sandbox can have several ADEs, and its details list each one with **Open**. The sandbox's metadata records which ADEs it has, in a form older releases (named Instabox) still read. [ADEs and the sandbox mark](../DEVELOPMENT.md#ades-and-the-sandbox-mark) has the rules.

@@ -2,7 +2,8 @@
 //! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
 //! prep command, and the app opens its link afterwards. An SSH host ADE (Orca) gets only the
 //! mark, and the app writes its host afterwards. A host ADE (Paradev) is only checked: once
-//! its host runs, the sandbox is marked and gets its link.
+//! its host runs, the sandbox is marked and gets its link. A terminal ADE (Herdr) is installed,
+//! and the app opens it in a terminal afterwards.
 
 use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
@@ -45,10 +46,12 @@ pub struct Connected {
     pub machine_id: String,
     /// The pairing link to open. None for a link ADE: the app makes its link with an SSH
     /// token (`Open::Link`). For a host ADE (`Open::Host`), the link that opens the sandbox
-    /// once its host runs; None while the user still has to set the host up in the app.
+    /// once its host runs; None while the user still has to set the host up in the app. None
+    /// for a terminal ADE (`Open::Terminal`): the app opens a terminal with an SSH token.
     pub link: Option<String>,
     /// The ADE version the sandbox runs: the desktop's after a setup, or its own (newer, or
-    /// older with the update pending). None for an ADE that installs nothing there.
+    /// older with the update pending). None for an ADE that installs nothing there, or whose
+    /// version follows no desktop app (Herdr).
     pub version: Option<String>,
     /// The sandbox kept its older version because the ADE was busy: offer the update later.
     pub update_pending: bool,
@@ -204,6 +207,9 @@ async fn install_and_pair(
     if let Open::Host(h) = ade.open() {
         return check_host(client, ade, h, id, progress).await;
     }
+    if let Open::Terminal(_) = ade.open() {
+        return install(client, ade, id, desktop_version, progress).await;
+    }
     // Never move a sandbox to an older version: when it is ahead of the desktop, only pair.
     let found = match ade.version_script() {
         Some(script) => {
@@ -294,6 +300,46 @@ async fn prepare(
         if r.timed_out || r.exit_code != 0 {
             return Err(setup_failure(ade, &r, PREP_TIMEOUT_SECS));
         }
+    }
+    mark_connected(client, ade, id).await?;
+    progress(Step::Done);
+    Ok(Connected {
+        machine_id: id.to_string(),
+        link: None,
+        version: None,
+        update_pending: false,
+    })
+}
+
+/// Sets a terminal ADE (Herdr) up: one run of its setup script, which installs it when the
+/// sandbox lacks it and prints its version, then the mark. A setup that fails, or prints no
+/// version, leaves the mark alone. No link and no version: the app opens a terminal with an SSH
+/// token afterwards, and the version follows no desktop app.
+async fn install(
+    client: &Client,
+    ade: Ade,
+    id: &str,
+    desktop_version: &str,
+    progress: &impl Fn(Step),
+) -> Result<Connected, SandboxError> {
+    progress(Step::Installing(desktop_version.to_string()));
+    let r = client
+        .exec(
+            id,
+            &ExecRequest {
+                cmd: ade.setup_script(desktop_version),
+                timeout_seconds: Some(SETUP_TIMEOUT_SECS),
+            },
+        )
+        .await?;
+    if r.timed_out || r.exit_code != 0 {
+        return Err(setup_failure(ade, &r, SETUP_TIMEOUT_SECS));
+    }
+    if ade.parse_version(&r.stdout).is_none() {
+        return Err(SandboxError::Setup {
+            ade,
+            stderr_tail: format!("{} did not print its version", ade.short_name()),
+        });
     }
     mark_connected(client, ade, id).await?;
     progress(Step::Done);
@@ -1608,6 +1654,117 @@ mod tests {
         );
         let c = calls(&server).await;
         assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+    }
+
+    /// A running sandbox with `metadata`, whose exec answers Herdr's setup with `stdout`,
+    /// `stderr` and `code`.
+    async fn running_for_herdr(
+        server: &MockServer,
+        metadata: serde_json::Value,
+        (stdout, stderr, code): (&str, &str, i32),
+    ) {
+        mock(
+            server,
+            "GET",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", metadata)),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("https://herdr.dev/install.sh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"stdout": stdout, "stderr": stderr, "exitCode": code}),
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        mock(
+            server,
+            "PATCH",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", serde_json::json!({}))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn herdr_is_installed_then_added_to_the_mark() {
+        let server = MockServer::start().await;
+        running_for_herdr(
+            &server,
+            serde_json::json!({"a": "1", "instabox-bridge": "t3"}),
+            ("herdr 0.9.5\n", "", 0),
+        )
+        .await;
+        let steps = Mutex::new(Vec::new());
+        let out = connect_existing(&client(&server), Ade::Herdr, "m1", "OpenSSH 10.3p1", |s| {
+            steps.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap();
+        // No link: the app opens a terminal. No version: it follows no desktop app.
+        assert_eq!(
+            out,
+            Connected {
+                machine_id: "m1".into(),
+                link: None,
+                version: None,
+                update_pending: false,
+            }
+        );
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![Step::Installing("OpenSSH 10.3p1".into()), Step::Done]
+        );
+        let reqs = server.received_requests().await.unwrap();
+        // One exec (the setup, with the long limit), no port, no pairing; the mark keeps T3.
+        let execs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1);
+        let setup: serde_json::Value = serde_json::from_slice(&execs[0].body).unwrap();
+        assert_eq!(setup["cmd"], crate::ade::herdr::SETUP_SCRIPT);
+        assert_eq!(setup["timeoutSeconds"], SETUP_TIMEOUT_SECS);
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ports")));
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ssh-tokens")));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3,herdr"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_herdr_setup_or_one_without_a_version_leaves_no_mark() {
+        for (answer, want) in [
+            (
+                ("", "  ✗ can't reach https://herdr.dev/latest.json", 1),
+                "  ✗ can't reach https://herdr.dev/latest.json",
+            ),
+            (("", "", 0), "Herdr did not print its version"),
+            (
+                ("bash: herdr: command not found\n", "", 0),
+                "Herdr did not print its version",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            running_for_herdr(&server, serde_json::json!({}), answer).await;
+            let e = connect_existing(&client(&server), Ade::Herdr, "m1", "OpenSSH 10.3p1", |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(
+                e,
+                SandboxError::Setup {
+                    ade: Ade::Herdr,
+                    stderr_tail: want.into()
+                }
+            );
+            let c = calls(&server).await;
+            assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+        }
     }
 
     /// A running sandbox with `metadata`, whose exec answers Paradev's host check with `stdout`

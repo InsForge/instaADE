@@ -94,6 +94,12 @@
     radial-gradient(ellipse var(--paradev-light-width, 55%) var(--paradev-light-reach, 100%) at 50% -24%, #60666b 0%, #282c3066 50%, transparent 85%);
 }
 
+.hero-atmosphere[data-theme='herdr'] {
+  background:
+    radial-gradient(ellipse 70% 90% at 50% -30%, #e8912a2e 0%, transparent 70%),
+    linear-gradient(#1b1d21 0%, #121315 60%, #0e0f11 100%);
+}
+
 .paradev-pixels {
   position: relative;
   width: 100%;

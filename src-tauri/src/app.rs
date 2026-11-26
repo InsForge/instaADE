@@ -52,6 +52,8 @@ pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
 /// Opens a URL. With an app (the path of an app bundle), in that app only; without one, in the
 /// default handler (browser, or an ADE's app for its links, such as T3 Code for `t3code://`).
 pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send + Sync>;
+/// Opens a login command in the user's terminal (`ssh::open_in_terminal`).
+pub type TerminalOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// Finds an ADE's desktop app on this computer (`Ade::locate`).
 pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
 /// Checks that the app at a path is the ADE's own (`Ade::verify`).
@@ -709,6 +711,9 @@ pub struct Core {
     ssh: Arc<dyn SshTokenStore>,
     connected: Arc<dyn ConnectedStore>,
     open: Opener,
+    /// Opens a login command in the user's terminal, for Open in Terminal and a terminal ADE
+    /// (Herdr); a test puts its own in place.
+    terminal: TerminalOpener,
     /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
     locate: Locator,
     verify: Verifier,
@@ -800,6 +805,10 @@ fn host_not_link(ade: Ade) -> ErrorView {
     ErrorView::other(format!("{} runs sandboxes as hosts", ade.name()))
 }
 
+fn terminal_not_link(ade: Ade) -> ErrorView {
+    ErrorView::other(format!("{} opens in a terminal", ade.name()))
+}
+
 fn not_signed_in() -> ErrorView {
     ErrorView {
         kind: crate::errors::ErrorKind::SignedOut,
@@ -848,6 +857,7 @@ impl Core {
             ssh,
             connected,
             open,
+            terminal: Arc::new(ssh::open_in_terminal),
             locate: Arc::new(Ade::locate),
             verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
             clipboard: Arc::new(SecretClipboard::system()),
@@ -875,6 +885,13 @@ impl Core {
     fn with_apps(mut self, locate: Locator, verify: Verifier) -> Core {
         self.locate = locate;
         self.verify = verify;
+        self
+    }
+
+    /// Test only: opens login commands with `terminal` instead of in a terminal.
+    #[cfg(test)]
+    fn with_terminal(mut self, terminal: TerminalOpener) -> Core {
+        self.terminal = terminal;
         self
     }
 
@@ -1627,10 +1644,7 @@ impl Core {
                 self.update(|i| i.state.set_desktop(ade, Some(v.clone())));
                 Ok(v)
             }
-            None => Err(ErrorView::other(format!(
-                "{} is not installed. Install it first.",
-                ade.name()
-            ))),
+            None => Err(ErrorView::other(ade.missing())),
         }
     }
 
@@ -1685,7 +1699,8 @@ impl Core {
     /// link; a link ADE (cmux) gets its prep command, then its link opens; an SSH host ADE
     /// (Orca) gets its host written and its app started. A host ADE (Paradev) is checked:
     /// once its host runs, the sandbox is marked and opens in it; else the user sets the host
-    /// up in the app (`open_host`).
+    /// up in the app (`open_host`). A terminal ADE (Herdr) is installed, then opens in a
+    /// terminal (`open_terminal`).
     pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<Notice> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
@@ -1721,7 +1736,8 @@ impl Core {
     /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
     /// host ADE (Orca) on a sandbox marked with it: wake it, write its host and start the app.
     /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
-    /// its link. Anything else goes through the connect flow.
+    /// its link. A terminal ADE (Herdr) on a sandbox marked with it: `open_terminal`. Anything
+    /// else goes through the connect flow.
     pub async fn open_in_ade(self: &Arc<Self>, id: &str, asked: Option<Ade>) -> Res<Notice> {
         let snapshot = self.signed_in_with(|i| {
             // None: the sandbox is marked only with ADEs this build does not know.
@@ -1734,6 +1750,7 @@ impl Core {
                         Open::Link(_) => true,
                         Open::SshHost(_) => true,
                         Open::Host(_) => true,
+                        Open::Terminal(_) => true,
                     }
             });
             (ready, ade, ade.and_then(|a| i.sync_version(a)))
@@ -1743,6 +1760,9 @@ impl Core {
             _ => return self.connect_sandbox(id, asked).await,
         };
         let r = async {
+            if let Open::Terminal(_) = ade.open() {
+                return self.open_terminal(ade, id, account).await;
+            }
             if let Open::Host(_) = ade.open() {
                 // The app is checked before the sandbox wakes, and again right before it gets
                 // the link (`open_host`): the wake can take minutes.
@@ -1795,6 +1815,9 @@ impl Core {
         }
         if let Open::Host(_) = open {
             return Err(host_not_link(ade));
+        }
+        if let Open::Terminal(_) = open {
+            return Err(terminal_not_link(ade));
         }
         let app = self.checked_app(ade).await?;
         let (client, title) = self
@@ -1851,6 +1874,7 @@ impl Core {
             }
             Open::Pair(_) => Err(ErrorView::other(format!("{} opens by pairing", ade.name()))),
             Open::Host(_) => Err(host_not_link(ade)),
+            Open::Terminal(_) => Err(terminal_not_link(ade)),
         }
     }
 
@@ -1874,17 +1898,14 @@ impl Core {
                 "Could not verify the {} app. Install it again from its official download.",
                 ade.name()
             ))),
-            None => Err(ErrorView::other(format!(
-                "{} is not installed. Install it first.",
-                ade.name()
-            ))),
+            None => Err(ErrorView::other(ade.missing())),
         }
     }
 
     /// For an ADE whose app reaches the sandbox over SSH (cmux, Orca, Paradev), the app is
     /// checked before the sandbox is touched: with no app, or one that fails the check, nothing
     /// wakes, is created or is marked. `open_link` and `open_host` check it again right before
-    /// the token.
+    /// the token. For a terminal ADE (Herdr), the OpenSSH client is looked for the same way.
     async fn check_app_first(&self, ade: Ade) -> Res<()> {
         if matches!(ade.open(), Open::Pair(_)) {
             return Ok(());
@@ -1941,6 +1962,36 @@ impl Core {
         .map_err(ErrorView::other)?;
         self.open_with(account, h.setup_link, Some(&app))?;
         Ok(Some(h.notice.to_string()))
+    }
+
+    /// Opens a terminal ADE (Herdr) on sandbox `id`: the user's terminal opens with an SSH
+    /// session that runs the ADE on the sandbox. The OpenSSH client is looked for first, then
+    /// the sandbox wakes, since the SSH gateway refuses a paused one. The token comes from
+    /// `ssh::token`, and goes to the OpenSSH client only, on its command line, as with Open in
+    /// Terminal.
+    async fn open_terminal(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
+        let Open::Terminal(t) = ade.open() else {
+            return Err(ErrorView::other(format!(
+                "{} does not open in a terminal",
+                ade.name()
+            )));
+        };
+        self.check_app_first(ade).await?;
+        let client = self
+            .read_in(account, |i| i.client.clone())
+            .flatten()
+            .ok_or_else(account_changed)?;
+        sandbox::ensure_running(&client, id)
+            .await
+            .map_err(ErrorView::from)?;
+        let tok = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+            .await
+            .map_err(ErrorView::from)?;
+        let cmd = ssh::terminal_command(&tok, t.command);
+        guarded(&self.gate(account), || (self.terminal)(&cmd))
+            .ok_or_else(account_changed)?
+            .map_err(ErrorView::other)?;
+        Ok(None)
     }
 
     /// Makes a new pairing link for a connected sandbox and opens it. Like Open, it makes none
@@ -2105,6 +2156,9 @@ impl Core {
                     _ if matches!(ade.open(), Open::Host(_)) => {
                         self.open_host(ade, &c.machine_id, c.link.as_deref(), account)
                             .await
+                    }
+                    _ if matches!(ade.open(), Open::Terminal(_)) => {
+                        self.open_terminal(ade, &c.machine_id, account).await
                     }
                     Some(link) => self.open_for(account, link).map(|()| None),
                     None => self.open_link(ade, &c.machine_id, account).await,
@@ -2322,7 +2376,7 @@ impl Core {
         };
         let r = async {
             let cmd = self.login_command(&client, id, account).await?;
-            guarded(&self.gate(account), || ssh::open_in_terminal(&cmd))
+            guarded(&self.gate(account), || (self.terminal)(&cmd))
                 .ok_or_else(account_changed)?
                 .map_err(ErrorView::other)
         };
@@ -3089,14 +3143,19 @@ mod tests {
                     AdeView::new(Ade::T3, None),
                     AdeView::new(Ade::Cmux, None),
                     AdeView::new(Ade::Orca, None),
-                    AdeView::new(Ade::Paradev, None)
+                    AdeView::new(Ade::Paradev, None),
+                    AdeView::new(Ade::Herdr, None)
                 ]
             );
         }
         if cfg!(windows) {
             assert_eq!(
                 s.ades,
-                vec![AdeView::new(Ade::T3, None), AdeView::new(Ade::Orca, None)]
+                vec![
+                    AdeView::new(Ade::T3, None),
+                    AdeView::new(Ade::Orca, None),
+                    AdeView::new(Ade::Herdr, None)
+                ]
             );
         }
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
@@ -3259,6 +3318,8 @@ mod tests {
                     assert!(!allowed_url(h.setup_link), "{a:?}");
                     assert!(!allowed_url(&(h.link)("0123456789abcdef0123456789abcdef")));
                 }
+                // No link at all: the token goes on the ssh command line in a terminal.
+                Open::Terminal(_) => assert!(!allowed_url("://x"), "{a:?}"),
             }
         }
         assert!(!allowed_url("t3codex://x"));
@@ -3998,6 +4059,8 @@ mod tests {
     }
 
     /// A core on `base` with a recording opener and the given stores and home, not yet shared.
+    /// The opener also writes down each login command opened in a terminal, as
+    /// `terminal: <command>`, so no test opens a real one.
     fn recording_core(
         base: Url,
         keys: Arc<MemoryKeyStore>,
@@ -4006,6 +4069,7 @@ mod tests {
     ) -> (Core, Arc<Mutex<Vec<String>>>) {
         let opened = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = opened.clone();
+        let terminal = opened.clone();
         let core = Core::new(
             base,
             keys,
@@ -4017,7 +4081,11 @@ mod tests {
             }),
             Arc::new(|_| {}),
             home,
-        );
+        )
+        .with_terminal(Arc::new(move |cmd: &str| {
+            terminal.lock().unwrap().push(format!("terminal: {cmd}"));
+            Ok(())
+        }));
         (core, opened)
     }
 
@@ -5008,6 +5076,222 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Herdr: a terminal that runs it on the sandbox ----
+
+    /// The terminal Open in Herdr opens: an SSH session that runs `herdr`, with the token.
+    const HERDR_TERMINAL: &str = "terminal: ssh -t -o StrictHostKeyChecking=accept-new -p 2222 ibssh_new@ssh.example.test herdr";
+
+    /// `cmux_server`, whose exec answers Herdr's setup with `answer`.
+    async fn herdr_server(
+        metadata: serde_json::Value,
+        answer: serde_json::Value,
+    ) -> (wiremock::MockServer, Url) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) = cmux_server(metadata).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("https://herdr.dev/install.sh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        (server, base)
+    }
+
+    /// What Herdr's setup prints when it went well.
+    fn herdr_installed() -> serde_json::Value {
+        serde_json::json!({"stdout": "herdr 0.9.5\n", "stderr": "", "exitCode": 0})
+    }
+
+    /// A signed-in core with a recording opener and terminal, on a computer whose OpenSSH
+    /// client is found unless `ssh` is false.
+    fn herdr_core(base: &Url, ssh: bool) -> (Arc<Core>, Arc<Mutex<Vec<String>>>) {
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| (ssh && ade == Ade::Herdr).then(|| PathBuf::from("/usr/bin/ssh"))),
+            Arc::new(|ade, path| ade.verify(path)),
+        ));
+        sign_in_as(&core, base, 7);
+        if ssh {
+            core.update(|i| {
+                i.state
+                    .set_desktop(Ade::Herdr, Some("OpenSSH 10.3p1".into()))
+            });
+        }
+        (core, opened)
+    }
+
+    #[tokio::test]
+    async fn installing_herdr_sets_it_up_marks_the_sandbox_and_opens_a_terminal() {
+        let (server, base) = herdr_server(
+            serde_json::json!({"instabox-bridge": "t3"}),
+            herdr_installed(),
+        )
+        .await;
+        let (core, opened) = herdr_core(&base, true);
+        core.refresh(false).await;
+        let r = core.connect_sandbox("m1", Some(Ade::Herdr)).await;
+        assert_eq!(r, Ok(None), "no notice: the terminal shows Herdr");
+        // Only the terminal opens: no link and no app.
+        assert_eq!(*opened.lock().unwrap(), [HERDR_TERMINAL]);
+        let reqs = server.received_requests().await.unwrap();
+        let execs: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(execs.len(), 1, "only the setup: {execs:?}");
+        assert!(execs[0].contains("https://herdr.dev/install.sh"));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,herdr");
+        // The mark comes before the token, which the terminal gets.
+        let r = requests(&server).await;
+        let at = |p: &str| {
+            r.iter()
+                .position(|x| x == p)
+                .unwrap_or_else(|| panic!("{p}: {r:?}"))
+        };
+        assert!(at("PATCH /v1/machines/m1") < at("POST /v1/machines/m1/ssh-tokens"));
+        let s = core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        // Herdr pairs nothing from here.
+        assert!(!core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn open_in_herdr_wakes_the_sandbox_then_opens_a_terminal_and_installs_nothing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let md = serde_json::json!({"instabox-bridge": "herdr", "instabox-ades": "herdr"});
+        let (server, base) = herdr_server(md.clone(), herdr_installed()).await;
+        // Asleep: the SSH gateway refuses a paused sandbox.
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m1", "name": "dev 1", "state": "suspended",
+                "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+                "metadata": md, "orgId": "org-me"
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/resume"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "id": "op1", "machineId": "m1", "type": "resume", "state": "queued", "machine": null
+            })))
+            .mount(&server)
+            .await;
+        let (core, opened) = herdr_core(&base, true);
+        core.refresh(false).await;
+        let r = core.open_in_ade("m1", Some(Ade::Herdr)).await;
+        assert_eq!(r, Ok(None));
+        assert_eq!(*opened.lock().unwrap(), [HERDR_TERMINAL]);
+        let r = requests(&server).await;
+        let at = |p: &str| {
+            r.iter()
+                .position(|x| x == p)
+                .unwrap_or_else(|| panic!("{p}: {r:?}"))
+        };
+        assert!(at("POST /v1/machines/m1/resume") < at("POST /v1/machines/m1/ssh-tokens"));
+        assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        // The next open reuses the stored token.
+        core.open_in_ade("m1", Some(Ade::Herdr)).await.unwrap();
+        assert_eq!(*opened.lock().unwrap(), [HERDR_TERMINAL, HERDR_TERMINAL]);
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_sandbox_in_herdr_mode_gets_herdr_and_opens_in_a_terminal() {
+        let (server, base) = herdr_server(serde_json::json!({}), herdr_installed()).await;
+        let (core, opened) = herdr_core(&base, true);
+        let notice = core
+            .create_sandbox(CreateArgs {
+                name: "dev 1".into(),
+                snapshot_id: None,
+                vcpus: 2,
+                mem_mib: 4096,
+                auto_suspend_after_seconds: Some(1800),
+                ade: Some(Ade::Herdr),
+            })
+            .await
+            .unwrap();
+        assert_eq!(notice, None);
+        assert_eq!(*opened.lock().unwrap(), [HERDR_TERMINAL]);
+        let r = requests(&server).await;
+        assert_eq!(r.iter().filter(|x| x.ends_with("/exec")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn herdr_touches_nothing_without_an_ssh_client() {
+        for (md, open) in [
+            (serde_json::json!({}), false),
+            (serde_json::json!({"instabox-bridge": "herdr"}), true),
+        ] {
+            let (server, base) = herdr_server(md, herdr_installed()).await;
+            let (core, opened) = herdr_core(&base, false);
+            core.refresh(false).await;
+            let e = if open {
+                core.open_in_ade("m1", Some(Ade::Herdr)).await
+            } else {
+                core.connect_sandbox("m1", Some(Ade::Herdr)).await
+            }
+            .unwrap_err();
+            assert_eq!(e.message, ade::herdr::MISSING, "{open}");
+            assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+            let r = requests(&server).await;
+            assert!(
+                !r.iter().any(|x| x.ends_with("/ssh-tokens")
+                    || x.ends_with("/exec")
+                    || x.ends_with("/resume")
+                    || x.starts_with("PATCH")),
+                "{open}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_herdr_setup_opens_no_terminal() {
+        let answer = serde_json::json!({"stdout": "", "stderr": "download failed", "exitCode": 1});
+        let (server, base) = herdr_server(serde_json::json!({}), answer).await;
+        let (core, opened) = herdr_core(&base, true);
+        core.refresh(false).await;
+        let e = core
+            .connect_sandbox("m1", Some(Ade::Herdr))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("download failed"), "{e:?}");
+        assert!(opened.lock().unwrap().is_empty());
+        let r = requests(&server).await;
+        assert!(
+            !r.iter()
+                .any(|x| x.ends_with("/ssh-tokens") || x.starts_with("PATCH")),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_in_terminal_opens_the_login_command() {
+        let (_server, base) = cmux_server(serde_json::json!({})).await;
+        let (core, opened) = herdr_core(&base, true);
+        core.open_ssh("m1").await.unwrap();
+        assert_eq!(
+            *opened.lock().unwrap(),
+            ["terminal: ssh -p 2222 ibssh_new@ssh.example.test"]
+        );
     }
 
     #[tokio::test]

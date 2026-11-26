@@ -1329,6 +1329,108 @@ test("Windows has no Paradev: not in the switcher, a Paradev pick falls back, de
   }
 });
 
+// ---- Herdr ----
+
+const herdrAde: AdeView = {
+  id: "herdr",
+  name: "Herdr",
+  shortName: "Herdr",
+  version: "OpenSSH 10.3p1",
+  downloadUrl: "https://example.test/openssh",
+};
+
+test("Herdr in the switcher says what it needs on this Mac, and takes Herdr's look", async () => {
+  show({ ades: [t3Ade, cmuxAde, orcaAde, paradevAde, herdrAde] }, [{}, { id: "b", name: "web", ades: ["herdr"], connected: false }]);
+  await screen.findByText("dev-1");
+  await userEvent.click(switcher());
+  const items = within(screen.getByRole("menu", { name: "Open sandboxes in" })).getAllByRole("menuitemradio");
+  expect(items.map((b) => b.textContent)).toEqual([
+    "InstaBox" + "Sandboxes only, no ADE",
+    "T3 Code" + "0.1.10 on this Mac · on 1 sandbox",
+    "cmux" + "0.64.25 on this Mac",
+    "Orca" + "1.4.269 on this Mac",
+    "Paradev" + "2.0.11 on this Mac",
+    "Herdr" + "OpenSSH 10.3p1 on this Mac · on 1 sandbox",
+  ]);
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /Herdr/ }));
+  expect(localStorage.getItem(modeKey("alex"))).toBe("herdr");
+  expect(popover().dataset.mode).toBe("herdr");
+  expect(theme()).toBe("herdr");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: Herdr. Switch ADE");
+  expect(switcher().querySelector('.ade-logo[data-ade="herdr"] img')).toBeTruthy();
+
+  await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+  const ades = within(screen.getByRole("list", { name: "ADEs on this Mac" }));
+  expect(ades.getAllByRole("listitem").map((li) => li.textContent).at(-1)).toBe("HerdrOpenSSH 10.3p1");
+});
+
+test("Herdr rows: Install sets it up and Open opens it, neither with a notice", async () => {
+  picked("herdr");
+  show(
+    { ades: [t3Ade, herdrAde] },
+    [
+      { id: "a", name: "dev-1", ades: ["t3"] },
+      // Herdr pairs nothing from here, so it is not "connected", and any computer opens it.
+      { id: "b", name: "web", ades: ["herdr"], connected: false, state: "paused" },
+    ],
+    { connect_sandbox: () => null, open_in_t3: () => null },
+  );
+  const dev = within(await screen.findByText("dev-1").then(() => rowOf("dev-1")));
+  const install = dev.getByRole("button", { name: "Connect" });
+  expect(install.title).toBe("Connect to Herdr");
+  await userEvent.click(install);
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "herdr" });
+  await act(async () => {});
+  expect(screen.queryByRole("status")).toBeNull();
+
+  const web = within(rowOf("web"));
+  expect(web.getByRole("img", { name: "Herdr" })).toBeTruthy();
+  expect(web.getByText("connected")).toBeTruthy();
+  expect(web.queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(screen.getByText("web"));
+  await userEvent.click(screen.getByRole("button", { name: "Open in Herdr" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "herdr" });
+  await act(async () => {});
+  expect(screen.queryByRole("status")).toBeNull();
+  // No T3 pairing or reinstall; Reconnect sets Herdr up again and opens it.
+  expect(screen.queryByRole("button", { name: /Reinstall|Pair again/ })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "b", ade: "herdr" });
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+
+  await openMenu("web");
+  expect(menuItems()[0]).toBe("Open in Herdr");
+  await userEvent.keyboard("{Escape}");
+  await openMenu("dev-1");
+  expect(menuItems()[0]).toBe("Install Herdr");
+});
+
+test("a new sandbox in Herdr mode says it installs Herdr and opens a terminal", async () => {
+  picked("herdr");
+  show({ ades: [t3Ade, herdrAde], tier: "pro" }, [{}], { create_sandbox: () => null });
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText("Installs Herdr on the sandbox. Then it opens in a terminal on this Mac.")).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "herdr" }));
+});
+
+test("Herdr on a PC without OpenSSH asks for the OpenSSH client, not for Herdr", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    picked("herdr");
+    show({ ades: [t3Ade, orcaAde, { ...herdrAde, version: null }] }, [{}]);
+    expect(await screen.findByText("OpenSSH is not on this PC")).toBeTruthy();
+    expect(screen.getByText("InstaADE opens Herdr in a terminal over SSH. Install the OpenSSH client first.")).toBeTruthy();
+    expect(screen.queryByText(/Herdr is not on/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download Herdr" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Get OpenSSH" }));
+    expect(invoke).toHaveBeenCalledWith("open_url", { url: "https://example.test/openssh" });
+  } finally {
+    ua.mockRestore();
+  }
+});
+
 // ---- first run and the default mode ----
 
 test("first run after sign-in lands in plain Instabox with a Connect an ADE card", async () => {

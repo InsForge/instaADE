@@ -14,7 +14,7 @@ See the canonical development guide at [DEVELOPMENT.md](../../../DEVELOPMENT.md)
 2. **Running it**: `bun tauri dev` with hot reload, and the API environment variables.
 3. **Before a pull request**: the local checks, which cover CI's `check` job, tests with every fix, keeping `src/types.ts` in step with Rust.
 4. **ADEs and the sandbox mark**: the `instabox-ades` and `instabox-bridge` keys and the compatibility rules.
-5. **Adding an ADE**: the registry, the ADE modules, the four ways an ADE opens, the flow and UI files, and what each kind of ADE needs.
+5. **Adding an ADE**: the registry, the ADE modules, the five ways an ADE opens, the flow and UI files, and what each kind of ADE needs.
 6. **Preview builds**: the `preview-build` label, `.github/PREVIEW_AUTHORS`, and the two stage signing flow.
 7. **Releases**: the version bump, the `v*` tag, and where the signing secrets live.
 

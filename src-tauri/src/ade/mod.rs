@@ -3,6 +3,7 @@
 //! The flows that use them (connect, sync, reinstall) are in `sandbox`.
 
 pub mod cmux;
+pub mod herdr;
 pub mod orca;
 pub mod paradev;
 pub mod t3;
@@ -13,7 +14,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Every ADE the app knows, in the order the app lists them.
-pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev];
+pub const ALL: &[Ade] = &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev, Ade::Herdr];
 
 /// Exit code of every ADE's setup script when the ADE is busy and its update waits.
 pub const SETUP_EXIT_BUSY: i32 = 3;
@@ -21,7 +22,7 @@ pub const SETUP_EXIT_BUSY: i32 = 3;
 /// Where an ADE's setup puts its idle probe. instabox-guest-agent runs every file here.
 pub const ACTIVITY_DIR: &str = "/usr/local/lib/instabox/activity.d";
 
-/// An ADE. Its id (`t3`, `cmux`, `orca`, `paradev`) is its JSON form and an entry of a connected sandbox's mark.
+/// An ADE. Its id (`t3`, `cmux`, `orca`, `paradev`, `herdr`) is its JSON form and an entry of a connected sandbox's mark.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Ade {
@@ -30,6 +31,7 @@ pub enum Ade {
     Cmux,
     Orca,
     Paradev,
+    Herdr,
 }
 
 /// A platform the desktop side of an ADE runs on.
@@ -67,6 +69,9 @@ pub enum Open {
     SshHost(SshHost),
     /// The desktop app runs the sandbox as one of its hosts, which the user sets up in the app.
     Host(Host),
+    /// The ADE runs on the sandbox, and the app opens the user's terminal with an SSH session
+    /// that starts it there. Nothing of the ADE runs on this computer.
+    Terminal(Terminal),
 }
 
 /// An ADE opened by a link. `prep` readies the sandbox before the first link (over exec, so
@@ -96,6 +101,13 @@ pub struct Host {
     pub ssh_address: fn(&SshLogin<'_>) -> String,
     pub notice: &'static str,
     pub link: fn(&str) -> String,
+}
+
+/// An ADE that runs on the sandbox in a terminal (Herdr). `command` is what the SSH session
+/// runs there.
+#[derive(Debug, Clone, Copy)]
+pub struct Terminal {
+    pub command: &'static str,
 }
 
 /// What a host ADE's `script` found on the sandbox.
@@ -155,6 +167,7 @@ impl Ade {
             Ade::Cmux => cmux::ID,
             Ade::Orca => orca::ID,
             Ade::Paradev => paradev::ID,
+            Ade::Herdr => herdr::ID,
         }
     }
 
@@ -165,6 +178,7 @@ impl Ade {
             Ade::Cmux => cmux::NAME,
             Ade::Orca => orca::NAME,
             Ade::Paradev => paradev::NAME,
+            Ade::Herdr => herdr::NAME,
         }
     }
 
@@ -175,6 +189,7 @@ impl Ade {
             Ade::Cmux => cmux::SHORT_NAME,
             Ade::Orca => orca::SHORT_NAME,
             Ade::Paradev => paradev::SHORT_NAME,
+            Ade::Herdr => herdr::SHORT_NAME,
         }
     }
 
@@ -184,6 +199,7 @@ impl Ade {
             Ade::Cmux => cmux::PLATFORMS,
             Ade::Orca => orca::PLATFORMS,
             Ade::Paradev => paradev::PLATFORMS,
+            Ade::Herdr => herdr::PLATFORMS,
         }
     }
 
@@ -199,6 +215,7 @@ impl Ade {
             Ade::Cmux => cmux::DOWNLOAD_URL,
             Ade::Orca => orca::DOWNLOAD_URL,
             Ade::Paradev => paradev::DOWNLOAD_URL,
+            Ade::Herdr => herdr::DOWNLOAD_URL,
         }
     }
 
@@ -209,18 +226,21 @@ impl Ade {
             Ade::Cmux => cmux::URL_SCHEME,
             Ade::Orca => orca::URL_SCHEME,
             Ade::Paradev => paradev::URL_SCHEME,
+            Ade::Herdr => herdr::URL_SCHEME,
         }
     }
 
     // ---- this computer ----
 
-    /// Where the desktop app is, if it is installed: T3's CLI, cmux's or Paradev's app bundle.
+    /// Where the desktop app is, if it is installed: T3's CLI, cmux's or Paradev's app bundle,
+    /// the OpenSSH client for Herdr.
     pub fn locate(self) -> Option<PathBuf> {
         match self {
             Ade::T3 => t3::locate(),
             Ade::Cmux => cmux::locate(),
             Ade::Orca => orca::locate(),
             Ade::Paradev => paradev::locate(),
+            Ade::Herdr => herdr::locate(),
         }
     }
 
@@ -232,6 +252,7 @@ impl Ade {
             Ade::Cmux => cmux::version(path),
             Ade::Orca => orca::version(path),
             Ade::Paradev => paradev::version(path),
+            Ade::Herdr => herdr::version(path),
         }
     }
 
@@ -239,14 +260,25 @@ impl Ade {
     /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
     /// link). T3: the app gets no token from a link, so the path `locate` found stands. Orca:
     /// on macOS its identifier and signature, as the app InstaADE starts. Paradev: its
-    /// identifier and signature (it gets the sandbox's SSH address with a token).
-    /// Blocks for a few seconds, so run it off the async runtime.
+    /// identifier and signature (it gets the sandbox's SSH address with a token). Herdr: no
+    /// app gets the token, only the OpenSSH client in the user's terminal, as with Open in
+    /// Terminal. Blocks for a few seconds, so run it off the async runtime.
     pub fn verify(self, path: &Path) -> bool {
         match self {
             Ade::T3 => true,
             Ade::Cmux => cmux::verify(path),
             Ade::Orca => orca::verify(path),
             Ade::Paradev => paradev::verify(path),
+            Ade::Herdr => true,
+        }
+    }
+
+    /// What the app says when `locate` finds nothing: the desktop app is not installed, or for
+    /// Herdr, the OpenSSH client.
+    pub fn missing(self) -> String {
+        match self {
+            Ade::Herdr => herdr::MISSING.to_string(),
+            _ => format!("{} is not installed. Install it first.", self.name()),
         }
     }
 
@@ -265,6 +297,7 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
+            Ade::Herdr => herdr::parse_version(out),
         }
     }
 
@@ -276,6 +309,7 @@ impl Ade {
             Ade::Cmux => false,
             Ade::Orca => false,
             Ade::Paradev => false,
+            Ade::Herdr => false,
         }
     }
 
@@ -290,19 +324,22 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
+            Ade::Herdr => Some(herdr::VERSION_SCRIPT),
         }
     }
 
     /// Sets the ADE up on the sandbox. T3 installs `version` with its probe and starts it; it
     /// exits `SETUP_EXIT_BUSY` when the ADE is busy and the update waits. cmux runs its prep
     /// command, and `version` does not apply. Paradev's app sets its host up itself: this only
-    /// reads whether the host runs.
+    /// reads whether the host runs. Herdr is installed when the sandbox lacks it, at Herdr's
+    /// latest release, and its version printed.
     pub fn setup_script(self, version: &str) -> String {
         match self {
             Ade::T3 => t3::setup_script(version),
             Ade::Cmux => cmux::PREP_SCRIPT.to_string(),
             Ade::Orca => String::new(),
             Ade::Paradev => paradev::HOST_SCRIPT.to_string(),
+            Ade::Herdr => herdr::SETUP_SCRIPT.to_string(),
         }
     }
 
@@ -316,6 +353,7 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
+            Ade::Herdr => None,
         }
     }
 
@@ -327,6 +365,7 @@ impl Ade {
             Ade::Cmux => true,
             Ade::Orca => true,
             Ade::Paradev => true,
+            Ade::Herdr => true,
         }
     }
 
@@ -338,6 +377,7 @@ impl Ade {
             Ade::Cmux => false,
             Ade::Orca => false,
             Ade::Paradev => false,
+            Ade::Herdr => false,
         }
     }
 
@@ -348,6 +388,7 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
+            Ade::Herdr => None,
         }
     }
 
@@ -359,6 +400,7 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
+            Ade::Herdr => None,
         }
     }
 
@@ -374,6 +416,7 @@ impl Ade {
             Ade::Cmux => Open::Link(cmux::LINK),
             Ade::Orca => Open::SshHost(orca::SSH_HOST),
             Ade::Paradev => Open::Host(paradev::HOST),
+            Ade::Herdr => Open::Terminal(herdr::TERMINAL),
         }
     }
 
@@ -384,6 +427,7 @@ impl Ade {
             Open::Link(_) => None,
             Open::SshHost(_) => None,
             Open::Host(_) => None,
+            Open::Terminal(_) => None,
         }
     }
 }
@@ -428,12 +472,16 @@ mod tests {
 
     #[test]
     fn the_registry_lists_t3_then_cmux_by_their_ids() {
-        assert_eq!(ALL, &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev]);
+        assert_eq!(
+            ALL,
+            &[Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev, Ade::Herdr]
+        );
         assert_eq!(Ade::default(), Ade::T3);
         assert_eq!(Ade::from_id("t3"), Some(Ade::T3));
         assert_eq!(Ade::from_id("cmux"), Some(Ade::Cmux));
         assert_eq!(Ade::from_id("orca"), Some(Ade::Orca));
         assert_eq!(Ade::from_id("paradev"), Some(Ade::Paradev));
+        assert_eq!(Ade::from_id("herdr"), Some(Ade::Herdr));
         assert_eq!(Ade::from_id("superset"), None, "one entry, by its new name");
         assert_eq!(Ade::from_id("other"), None);
         assert_eq!(Ade::from_id(""), None);
@@ -586,6 +634,42 @@ mod tests {
     }
 
     #[test]
+    fn herdr_parts() {
+        let h = Ade::Herdr;
+        assert_eq!(
+            (h.id(), h.name(), h.short_name()),
+            ("herdr", "Herdr", "Herdr")
+        );
+        assert_eq!(h.url_scheme(), "", "Herdr takes no links");
+        // It installs Herdr, but no service, probe or pinned version: nothing to keep in step
+        // or reinstall, and Reconnect runs the setup again.
+        assert!(!h.pins_local_version());
+        assert!(!h.reinstalls());
+        assert_eq!(h.port(), None);
+        assert_eq!(h.version_script(), Some(herdr::VERSION_SCRIPT));
+        assert_eq!(h.stop_script(), None);
+        assert_eq!(h.probe(), None);
+        assert_eq!(h.refresh_script(), None);
+        assert!(h.setup_current(""));
+        assert!(!h.pairing_needs_setup("0.1.12", Some("0.1.12")));
+        assert_eq!(h.setup_script("ignored"), herdr::SETUP_SCRIPT);
+        assert_eq!(h.parse_version("herdr 0.9.5\n").as_deref(), Some("0.9.5"));
+        let Open::Terminal(t) = h.open() else {
+            panic!("Herdr opens in a terminal")
+        };
+        assert_eq!(t.command, "herdr");
+        // The token goes to the OpenSSH client, not to an app to check.
+        assert!(h.verify(Path::new("/nonexistent")));
+        assert_eq!(h.platforms(), &[Platform::MacOs, Platform::Windows]);
+        assert_eq!(h.runs_here(), cfg!(any(target_os = "macos", windows)));
+        assert!(h.missing().contains("no OpenSSH client"));
+        assert_eq!(
+            Ade::Orca.missing(),
+            "Orca is not installed. Install it first."
+        );
+    }
+
+    #[test]
     fn t3_runs_on_every_platform_the_app_ships_for_and_cmux_on_macos_only() {
         for p in [Platform::MacOs, Platform::Windows] {
             assert!(Ade::T3.platforms().contains(&p), "{p:?}");
@@ -594,13 +678,16 @@ mod tests {
         assert_eq!(Ade::Paradev.platforms(), &[Platform::MacOs]);
         if cfg!(target_os = "macos") {
             assert!(Ade::T3.runs_here() && Ade::Cmux.runs_here() && Ade::Paradev.runs_here());
-            assert_eq!(local(), vec![Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev]);
+            assert_eq!(
+                local(),
+                vec![Ade::T3, Ade::Cmux, Ade::Orca, Ade::Paradev, Ade::Herdr]
+            );
         }
         if cfg!(windows) {
             assert!(Ade::T3.runs_here() && !Ade::Cmux.runs_here() && !Ade::Paradev.runs_here());
             assert_eq!(
                 local(),
-                vec![Ade::T3, Ade::Orca],
+                vec![Ade::T3, Ade::Orca, Ade::Herdr],
                 "no cmux or Paradev on Windows"
             );
         }
@@ -626,7 +713,9 @@ mod tests {
                     };
                     assert!((l.link)(&login).starts_with(&scheme), "{a:?}");
                 }
-                Open::SshHost(_) => assert_eq!(a.url_scheme(), "", "{a:?} takes no links"),
+                Open::SshHost(_) | Open::Terminal(_) => {
+                    assert_eq!(a.url_scheme(), "", "{a:?} takes no links")
+                }
                 Open::Host(h) => {
                     assert!(h.setup_link.starts_with(&scheme), "{a:?}");
                     let id = "0123456789abcdef0123456789abcdef";

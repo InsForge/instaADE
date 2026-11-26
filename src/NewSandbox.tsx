@@ -26,6 +26,7 @@ function setupText(state: AppState, mode: Mode): string | null {
   }
   const name = adeName(state, mode);
   if (mode === "paradev") return `Copies the SSH address of the new sandbox and opens ${name}, where you set it up as a host.`;
+  if (mode === "herdr") return `Installs ${name} on the sandbox. Then it opens in a terminal on ${thisComputer()}.`;
   return `Sets the sandbox up for ${name}. Then it opens in ${name}.`;
 }
 

@@ -149,6 +149,16 @@ pub fn display_command(t: &SshToken) -> String {
     t.command.clone()
 }
 
+/// A login command that runs `remote` on the sandbox, such as `herdr`, in a terminal (`-t`), for
+/// `open_in_terminal`. Like the ADEs' other SSH logins, it accepts the gateway's host key the
+/// first time instead of asking.
+pub fn terminal_command(t: &SshToken, remote: &str) -> String {
+    format!(
+        "ssh -t -o StrictHostKeyChecking=accept-new -p {} {}@{} {remote}",
+        t.port, t.token, t.host
+    )
+}
+
 /// File content for the macOS `.command` launcher.
 #[cfg(any(target_os = "macos", test))]
 fn command_file_content(cmd: &str) -> String {
@@ -345,6 +355,22 @@ mod tests {
         ] {
             assert_eq!(plain_words(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_terminal_command_runs_the_remote_command_with_a_terminal() {
+        let t = tok("ibssh_a-B9", Duration::days(1));
+        let cmd = terminal_command(&t, "herdr");
+        assert_eq!(
+            cmd,
+            "ssh -t -o StrictHostKeyChecking=accept-new -p 2222 ibssh_a-B9@ssh.example.test herdr"
+        );
+        // Windows opens it as it is, with nothing to quote.
+        assert_eq!(plain_words(&cmd).map(|w| w.len()), Some(8));
+        assert_eq!(
+            command_file_content(&cmd),
+            format!("#!/bin/sh\nexec {cmd}\n")
+        );
     }
 
     #[test]
