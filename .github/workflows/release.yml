@@ -23,7 +23,19 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG exists"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --generate-notes
+            # The notes start with which file to download, before GitHub's list of changes.
+            notes=$(cat <<'EOF' | sed "s/__VERSION__/${TAG#v}/g"
+          **Download**
+
+          - macOS, Apple silicon: `InstaADE___VERSION___aarch64.dmg`
+          - macOS, Intel: `InstaADE___VERSION___x64.dmg`
+          - Windows: `InstaADE___VERSION___x64-setup.exe`
+
+          Already on 0.1.7 or later? Click **Update** in Settings. The `.app.tar.gz` files and `latest.json` are for in-app updates, so you do not need them.
+          EOF
+            )
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" \
+              --generate-notes --notes "$notes"
           fi
 
   build:
@@ -146,11 +158,12 @@ jobs:
             update="$RUNNER_TEMP/$(basename "${files[0]}" .dmg).app.tar.gz"
             cp "${archives[0]}" "$update"
             cp "${archives[0]}.sig" "$update.sig"
-            uploads=("${files[0]}" "$update" "$update.sig")
+            uploads=("${files[0]}" "$update")
           else
             update=${files[0]}
-            uploads=("$update" "$update.sig")
+            uploads=("$update")
           fi
+          # The signature is not uploaded: latest.json carries its text, which is all the app reads.
           if [ ! -s "$update.sig" ]; then
             echo "no updater signature for $update" >&2
             exit 1
