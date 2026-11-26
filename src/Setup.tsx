@@ -1,12 +1,13 @@
 import { signIn } from "./api";
 import type { Run } from "./common";
 import type { AppState } from "./types";
+import { SignedOutUpdate } from "./UpdatesSection";
 import symbol from "./assets/sign-in/instabox-symbol.svg";
 import github from "./assets/sign-in/github.svg";
 import google from "./assets/sign-in/google.svg";
 
 /** Sign-in. An ADE is never asked for here: it is offered after sign-in, in the list. */
-export default function Setup({ state, run }: { state: Pick<AppState, "signInCode">; run: Run }) {
+export default function Setup({ state, run }: { state: Pick<AppState, "signInCode" | "update">; run: Run }) {
   // Sign-in has no bar: its empty space drags the window. Its text and buttons do not.
   return (
     <div className="setup" data-tauri-drag-region>
@@ -36,6 +37,7 @@ export default function Setup({ state, run }: { state: Pick<AppState, "signInCod
           </p>
         )}
       </div>
+      <SignedOutUpdate update={state.update} />
     </div>
   );
 }

@@ -1023,6 +1023,24 @@ test("updates: a dev or preview build shows its version and never checks", async
   expect(calls("check_for_updates").length).toBe(0);
 });
 
+test("updates: signed out, the sign-in page offers the update and installs it", async () => {
+  const { state } = show({ ...noT3, signedIn: false, login: null, update: offered });
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  const card = () => screen.getByRole("group", { name: "Update" });
+  expect(within(card()).getByText("0.2.0 is available")).toBeTruthy();
+  await userEvent.click(within(card()).getByRole("button", { name: "Update" }));
+  expect(invoke).toHaveBeenCalledWith("install_update");
+  act(() => emit({ ...state, update: { ...offered, step: "downloading", percent: 42 } }));
+  expect(within(card()).getByText("Downloading 0.2.0 (42%)")).toBeTruthy();
+});
+
+test("updates: signed out with nothing on offer, the sign-in page shows no update", async () => {
+  show({ ...noT3, signedIn: false, login: null, update: updates({ step: "upToDate" }) });
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  expect(screen.queryByRole("group", { name: "Update" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Check for updates" })).toBeNull();
+});
+
 // ---- first run ----
 
 test("sign-in asks for no ADE", async () => {
