@@ -2630,6 +2630,20 @@ mod tests {
     }
 
     #[test]
+    fn templates_that_name_linux_still_show_their_machines() {
+        // Since Nov 26, 2026 the API names every template's os, and Linux templates say "linux".
+        let mut d = data();
+        for t in &mut d.templates {
+            if t.os.is_none() && t.pool.is_none() {
+                t.os = Some("linux".into());
+            }
+        }
+        let mut s = AppState::default();
+        s.apply(&d, now());
+        assert_eq!(ids(&s.sandboxes), ["a", "e", "f", "g"]);
+    }
+
+    #[test]
     fn plan_sizes_and_sleep_follow_the_selected_org() {
         let d = data();
         let mut s = AppState::default();
