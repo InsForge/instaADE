@@ -1030,7 +1030,7 @@ test("sign-in asks for no ADE", async () => {
   await userEvent.click(await screen.findByRole("button", { name: "Sign in with GitHub" }));
   expect(invoke).toHaveBeenCalledWith("sign_in", { provider: "github" });
   expect(screen.getByText("Run any ADE on an InstaBox Sandbox.")).toBeTruthy();
-  expect(screen.getByRole("img", { name: "InstaBox" })).toBeTruthy();
+  expect(screen.getByRole("img", { name: "InstaADE" })).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: "Sign in with Google" }));
   expect(invoke).toHaveBeenCalledWith("sign_in", { provider: "google" });
   expect(screen.queryByText(/T3 Code/)).toBeNull();

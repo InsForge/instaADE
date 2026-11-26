@@ -1,7 +1,6 @@
 import { signIn } from "./api";
 import type { Run } from "./common";
 import type { AppState } from "./types";
-import wordmark from "./assets/sign-in/instabox-wordmark.svg";
 import symbol from "./assets/sign-in/instabox-symbol.svg";
 import github from "./assets/sign-in/github.svg";
 import google from "./assets/sign-in/google.svg";
@@ -12,9 +11,9 @@ export default function Setup({ state, run }: { state: Pick<AppState, "signInCod
   return (
     <div className="setup" data-tauri-drag-region>
       <div className="brand-block">
-        <div className="sign-in-logo" role="img" aria-label="InstaBox">
+        <div className="sign-in-logo" role="img" aria-label="InstaADE">
           <img className="sign-in-symbol" src={symbol} alt="" />
-          <img className="sign-in-wordmark" src={wordmark} alt="" />
+          <span className="sign-in-name" aria-hidden="true">InstaADE</span>
         </div>
         <p className="muted">Run any ADE on an InstaBox Sandbox.</p>
       </div>
