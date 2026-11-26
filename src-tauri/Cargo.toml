@@ -1,6 +1,6 @@
 [package]
 name = "instabox-bridge"
-version = "0.1.7"
+version = "0.1.8"
 description = "Connect instabox cloud sandboxes to the T3 Code desktop app"
 license = "MIT"
 edition = "2024"
