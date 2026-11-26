@@ -27,7 +27,7 @@ An ADE fits InstaADE when it has a desktop app on macOS or Windows, or runs in a
 | --- | --- | --- |
 | Pair | Pairs with a server that InstaADE installs on the sandbox | T3 Code |
 | Link | Opens a link from InstaADE and connects to the sandbox over SSH | cmux |
-| SSH host | Imports the sandbox as a host from `~/.ssh/config` | Orca |
+| SSH host | Reaches the sandbox through a host in `~/.ssh/config`, which it imports or you add by its address | Orca, Paseo |
 | Host | Runs the sandbox as one of its hosts, set up in the ADE | Paradev |
 | Terminal | Runs on the sandbox, and InstaADE opens it in your terminal over SSH | Herdr |
 
