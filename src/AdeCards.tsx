@@ -39,7 +39,7 @@ export function AdeMissing({ state, ade, run }: { state: AppState; ade: AdeId; r
           <span className="strong">
             {name} is not on {thisComputer()}
           </span>
-          <span className="small soft">InstaBox opens sandboxes in {name}. Install it first.</span>
+          <span className="small soft">InstaADE opens sandboxes in {name}. Install it first.</span>
         </div>
       </div>
       <div className="warn-buttons">

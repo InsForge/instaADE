@@ -56,6 +56,10 @@ export const sshCommand = (id: string) => invoke<string>("ssh_command", { id });
 export const openSsh = (id: string) => invoke<void>("open_ssh", { id });
 export const addMcp = (client: McpClient) => invoke<void>("add_mcp", { client });
 export const setStartAtLogin = (on: boolean) => invoke<void>("set_start_at_login", { on });
+/** Moves the old app (Instabox.app) to the Trash. */
+export const trashOldApp = () => invoke<void>("trash_old_app");
+/** Stops offering the old app until the next launch. */
+export const dismissOldApp = () => invoke<void>("dismiss_old_app");
 export const openUrl = (url: string) => invoke<void>("open_url", { url });
 /** Reads the update manifest now. Never downloads. The result shows in state.update. */
 export const checkForUpdates = () => invoke<void>("check_for_updates");

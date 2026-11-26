@@ -10,6 +10,7 @@ pub mod errors;
 pub mod gate;
 pub mod login;
 pub mod mcp;
+pub mod old_app;
 pub mod process;
 pub mod sandbox;
 pub mod ssh;
@@ -20,6 +21,7 @@ pub mod updater;
 use std::sync::{Arc, OnceLock};
 
 use tauri::{Emitter, Manager, WindowEvent};
+#[cfg(target_os = "macos")]
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_opener::OpenerExt;
 
@@ -37,8 +39,8 @@ const DEFAULT_KEYCHAIN_SERVICE: &str = APP_IDENTIFIER;
 static KEYCHAIN_SERVICE: OnceLock<String> = OnceLock::new();
 
 /// The keychain service that holds the app's secrets: the identifier the app was bundled
-/// with, set at startup. Instabox Preview has its own identifier, so it never shares a
-/// sign-in with Instabox.
+/// with, set at startup. InstaADE Preview has its own identifier, so it never shares a
+/// sign-in with InstaADE.
 pub(crate) fn keychain_service() -> &'static str {
     service_or_default(KEYCHAIN_SERVICE.get())
 }
@@ -48,6 +50,10 @@ fn service_or_default(set: Option<&'static String>) -> &'static str {
 }
 
 pub fn run() {
+    let context = tauri::generate_context!();
+    // Before the single-instance plugin, which hands this launch to a running copy and exits:
+    // a running old copy (Instabox.app) is asked to quit first, so this app takes over.
+    old_app::quit_running(&context.config().identifier, !cfg!(debug_assertions));
     let app = tauri::Builder::default()
         // Single instance first: a second launch opens the running popover.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -58,10 +64,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // The login item on Windows and before macOS 13. `login` uses SMAppService instead on
         // macOS 13 and later.
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec![login::AT_LOGIN]),
-        ))
+        .plugin(autostart(&context.config().identifier))
         .manage(tray::TrayMemo::default())
         .manage(tray::HiddenAt::default())
         .setup(|app| {
@@ -114,6 +117,8 @@ pub fn run() {
             // On macOS 13 and later, a LaunchAgent an older build wrote becomes the app's own
             // login item.
             login::migrate(&handle, release);
+            // macOS: a copy of the app from before it was InstaADE is offered for the Trash.
+            core.set_old_app(old_app::look(&app.config().identifier, release));
             // Without a config dir there is nowhere to save the marker, so no default.
             let marker = handle
                 .path()
@@ -230,12 +235,14 @@ pub fn run() {
             commands::open_ssh,
             commands::add_mcp,
             commands::set_start_at_login,
+            commands::trash_old_app,
+            commands::dismiss_old_app,
             commands::open_url,
             commands::check_for_updates,
             commands::install_update,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building Instabox");
+        .build(context)
+        .expect("error while building InstaADE");
 
     app.run(|app, event| {
         #[cfg(target_os = "macos")]
@@ -252,6 +259,19 @@ pub fn run() {
     });
 }
 
+/// The autostart plugin: the login item on Windows and before macOS 13. On macOS its
+/// LaunchAgent keeps the label older releases gave it (see `login::agent_label`).
+fn autostart<R: tauri::Runtime>(identifier: &str) -> tauri::plugin::TauriPlugin<R> {
+    let builder = tauri_plugin_autostart::Builder::new().args([login::AT_LOGIN]);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .macos_launcher(MacosLauncher::LaunchAgent)
+        .app_name(login::agent_label(identifier));
+    #[cfg(not(target_os = "macos"))]
+    let _ = identifier;
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_KEYCHAIN_SERVICE, service_or_default};
@@ -265,11 +285,11 @@ mod tests {
     fn the_keychain_service_is_the_bundle_identifier() {
         let app = identifier(include_str!("../tauri.conf.json"));
         let preview = identifier(include_str!("../tauri.preview.conf.json"));
-        assert_ne!(app, preview, "a preview installs next to Instabox");
-        // Before startup sets it, the service is Instabox's identifier.
+        assert_ne!(app, preview, "a preview installs next to InstaADE");
+        // Before startup sets it, the service is InstaADE's identifier.
         assert_eq!(service_or_default(None), app);
         assert_eq!(DEFAULT_KEYCHAIN_SERVICE, app);
-        // Instabox Preview sets its own identifier, so its secrets live apart.
+        // InstaADE Preview sets its own identifier, so its secrets live apart.
         let set: &'static String = Box::leak(Box::new(preview.clone()));
         assert_eq!(service_or_default(Some(set)), preview);
     }

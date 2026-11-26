@@ -22,6 +22,7 @@ describe("AppState fixture", () => {
         "snapshots",
         "mcp",
         "progress",
+        "oldApp",
         "error",
         "startAtLogin",
         "update",

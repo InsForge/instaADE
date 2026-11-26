@@ -41,6 +41,7 @@ const sample: AppState = {
   snapshots: [{ id: "s1", name: "snap-s1" }],
   mcp: { claudeCode: true, codex: false },
   progress: null,
+  oldApp: null,
   error: null,
   startAtLogin: false,
   update: null,
@@ -133,6 +134,7 @@ test("fixture and sample have the same nested keys", () => {
     ...sample,
     sandboxes: [box],
     progress: { kind: "create", step: "x", machineId: null, ade: "t3", error: null },
+    oldApp: { paths: [""] },
     error: { kind: "other", message: "" },
     update: { current: "", enabled: true, step: "idle", version: null, percent: null, error: null },
   };
@@ -906,9 +908,9 @@ test("settings: no section for agents on this Mac, whatever their MCP state", as
   expect(calls("add_mcp").length).toBe(0);
 });
 
-// ---- updates of InstaBox ----
+// ---- updates of InstaADE ----
 
-/** The updates of InstaBox 0.1.7, a build that updates itself. */
+/** The updates of InstaADE 0.1.7, a build that updates itself. */
 const updates = (over: Partial<UpdateView> = {}): UpdateView => ({
   current: "0.1.7",
   enabled: true,
@@ -1639,4 +1641,52 @@ test("details without T3 Code on this computer say so instead of Open", async ()
   const section = screen.getByRole("region", { name: "Connected ADE" });
   expect(within(section).queryByRole("button", { name: "Open in T3 Code" })).toBeNull();
   expect(within(section).getByText("Not installed on this Mac")).toBeTruthy();
+});
+
+// ---- the old app ----
+
+const oldApp = { paths: ["/Applications/Instabox.app"] };
+const oldAppText = "Instabox is still in Applications. InstaADE replaces it.";
+
+test("old app: no notice without one", async () => {
+  show({}, [{}]);
+  await screen.findByText("dev-1");
+  expect(screen.queryByText(oldAppText)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Move to Trash" })).toBeNull();
+});
+
+test("old app: Move to Trash asks the back end, which clears the notice", async () => {
+  const { state } = show({ oldApp }, [{}]);
+  const notice = (await screen.findByText(oldAppText)).closest(".banner") as HTMLElement;
+  expect(notice.getAttribute("role")).toBe("status");
+  await userEvent.click(within(notice).getByRole("button", { name: "Move to Trash" }));
+  expect(invoke).toHaveBeenCalledWith("trash_old_app");
+  act(() => emit({ ...state, oldApp: null }));
+  expect(screen.queryByText(oldAppText)).toBeNull();
+  expect(calls("dismiss_old_app").length).toBe(0);
+});
+
+test("old app: Not now hides it for this run", async () => {
+  const { state } = show({ oldApp }, [{}]);
+  const notice = (await screen.findByText(oldAppText)).closest(".banner") as HTMLElement;
+  await userEvent.click(within(notice).getByRole("button", { name: "Not now" }));
+  expect(invoke).toHaveBeenCalledWith("dismiss_old_app");
+  act(() => emit({ ...state, oldApp: null }));
+  expect(screen.queryByText(oldAppText)).toBeNull();
+  expect(calls("trash_old_app").length).toBe(0);
+});
+
+test("old app: a failed move shows why and keeps the notice", async () => {
+  const error = { kind: "other" as const, message: "Quit Instabox, then click Move to Trash again." };
+  show({ oldApp }, [{}], { trash_old_app: () => Promise.reject(error) });
+  await userEvent.click(await screen.findByRole("button", { name: "Move to Trash" }));
+  // The rejection and state.error carry the same text: it shows once.
+  expect((await screen.findByText(error.message)).closest(".banner")?.getAttribute("role")).toBe("alert");
+  expect(screen.getByText(oldAppText)).toBeTruthy();
+});
+
+test("old app: the notice shows on the other screens too, sign-in included", async () => {
+  show({ oldApp, signedIn: false });
+  await screen.findByRole("button", { name: "Sign in with GitHub" });
+  expect(screen.getByText(oldAppText)).toBeTruthy();
 });

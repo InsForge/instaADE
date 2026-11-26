@@ -11,6 +11,7 @@ import MainHeader from "./MainHeader";
 import { useMode } from "./mode";
 import NewSandbox from "./NewSandbox";
 import type { CreateArgs } from "./NewSandbox";
+import OldAppNotice from "./OldAppNotice";
 import SandboxList from "./SandboxList";
 import type { PendingCreate } from "./SandboxList";
 import SandboxMenu from "./SandboxMenu";
@@ -189,7 +190,7 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
     );
   }
 
-  const banners = (showError || showNotice) && (
+  const banners = (showError || showNotice || state.oldApp) && (
     <div className="banners">
       {showError && <ErrorNotice error={error!} state={state} mode={mode} onConnect={connect} onRetry={onRetry} />}
       {showNotice && (
@@ -197,6 +198,7 @@ export default function App({ showHero = false }: { showHero?: boolean }) {
           <span className="banner-text">{notice}</span>
         </div>
       )}
+      {state.oldApp && <OldAppNotice run={run} />}
     </div>
   );
 

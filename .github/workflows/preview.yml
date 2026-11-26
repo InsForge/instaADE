@@ -1,7 +1,7 @@
 name: Preview build
 
 # Stage one of a preview. When a pull request gets the preview-build label, this builds
-# Instabox Preview from it. It has no secrets and signs nothing. Preview publish (stage two)
+# InstaADE Preview from it. It has no secrets and signs nothing. Preview publish (stage two)
 # runs only main's code: it checks the author, signs and notarizes the build, and publishes it.
 on:
   pull_request:
@@ -63,7 +63,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           bun tauri build --target ${{ matrix.target }} --bundles app --no-sign --config src-tauri/tauri.preview.conf.json
-          ditto -c -k --keepParent "src-tauri/target/${{ matrix.target }}/release/bundle/macos/Instabox Preview.app" "$RUNNER_TEMP/preview.zip"
+          ditto -c -k --keepParent "src-tauri/target/${{ matrix.target }}/release/bundle/macos/InstaADE Preview.app" "$RUNNER_TEMP/preview.zip"
       # The Windows installer is not signed yet: SmartScreen asks once before it runs.
       - name: Build the Windows installer
         if: runner.os == 'Windows'

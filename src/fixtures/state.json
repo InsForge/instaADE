@@ -144,6 +144,11 @@
     "claudeCode": true,
     "codex": false
   },
+  "oldApp": {
+    "paths": [
+      "/Applications/Instabox.app"
+    ]
+  },
   "progress": {
     "kind": "create",
     "step": "installing",

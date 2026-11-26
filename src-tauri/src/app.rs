@@ -24,6 +24,7 @@ use crate::connected::ConnectedStore;
 use crate::errors::ErrorView;
 use crate::gate::{Gate, guarded};
 use crate::mcp::{self, KeyStore, McpClient};
+use crate::old_app::OldAppView;
 use crate::sandbox::connect::{Connected, NewSandbox, Source, Step};
 use crate::sandbox::sync::{Decision, SyncOutcome};
 use crate::sandbox::view::{
@@ -35,7 +36,7 @@ use crate::ssh_config;
 use crate::updater::UpdateView;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
-/// A sandbox with an InstaBox SSH host (Orca) gets a new token once the stored one has fewer days
+/// A sandbox with an InstaADE SSH host (Orca) gets a new token once the stored one has fewer days
 /// left than this, so the host keeps working without a click.
 const HOST_TOKEN_RENEW_DAYS: i64 = 7;
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
@@ -141,6 +142,8 @@ pub struct AppState {
     pub snapshots: Vec<SnapshotView>,
     pub mcp: McpStatus,
     pub progress: Option<ProgressView>,
+    /// The old app (Instabox.app) left next to this one, offered to move to the Trash.
+    pub old_app: Option<OldAppView>,
     pub error: Option<ErrorView>,
     pub start_at_login: bool,
     /// This build's version and its updates (see `updater`). Set once the app starts.
@@ -546,6 +549,7 @@ impl AppState {
         AppState {
             t3: self.t3.clone(),
             ades: self.ades.clone(),
+            old_app: self.old_app.clone(),
             start_at_login: self.start_at_login,
             update: self.update.clone(),
             ..AppState::default()
@@ -759,7 +763,7 @@ fn account_changed() -> ErrorView {
 
 fn unknown_ade() -> ErrorView {
     ErrorView::other(
-        "A newer version of InstaBox connected this sandbox to another ADE. Update InstaBox to use it.",
+        "A newer version of InstaADE connected this sandbox to another ADE. Update InstaADE to use it.",
     )
 }
 
@@ -780,7 +784,7 @@ fn not_signed_in() -> ErrorView {
 type Res<T> = Result<T, ErrorView>;
 
 /// What the user does next in an ADE's app after an action opened it, when opening it does not
-/// finish the job (Orca: connect the host InstaBox wrote). None for every other ADE.
+/// finish the job (Orca: connect the host InstaADE wrote). None for every other ADE.
 pub type Notice = Option<String>;
 
 /// The ids of every sandbox in an account's whole machine list.
@@ -1109,6 +1113,11 @@ impl Core {
         self.update(|i| i.state.update = update);
     }
 
+    /// The old copies of the app to offer, or None once they are gone or dismissed.
+    pub fn set_old_app(&self, old: Option<OldAppView>) {
+        self.update(|i| i.state.old_app = old);
+    }
+
     pub fn open_url(&self, url: &str) -> Res<()> {
         let r = if allowed_url(url) {
             (self.open)(url, None).map_err(ErrorView::other)
@@ -1312,7 +1321,7 @@ impl Core {
         })
     }
 
-    /// The sandbox ids of the SSH hosts InstaBox wrote; None when the file cannot be read.
+    /// The sandbox ids of the SSH hosts InstaADE wrote; None when the file cannot be read.
     async fn host_ids(&self) -> Option<Vec<String>> {
         let home = self.home.clone();
         match tokio::task::spawn_blocking(move || ssh_config::aliases(&home)).await {
@@ -1335,7 +1344,7 @@ impl Core {
             .push(line);
     }
 
-    /// Keeps every SSH host InstaBox wrote (Orca) working without a click. For each sandbox
+    /// Keeps every SSH host InstaADE wrote (Orca) working without a click. For each sandbox
     /// with a host, a stored token with fewer than 7 days left, or none, is renewed the way
     /// `ssh::token` makes one, and the token store rewrites the host's `User` as it saves it.
     /// A token with 7 days or more is left alone. Tokens are made over the API only, so no
@@ -1662,7 +1671,8 @@ impl Core {
 
     /// Open in the ADE's app. A pairing ADE (T3) on a sandbox connected from here and marked
     /// with it: wake it, sync the ADE, then open a new pairing link (no setup, no mark change),
-    /// so the app gets the sandbox back even when it lost it. A link ADE (cmux) on a sandbox
+    /// so the app gets the sandbox back even when it lost it. No link when the sync left a setup
+    /// that would refuse the pairing (`sync_before_pairing`). A link ADE (cmux) on a sandbox
     /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
     /// host ADE (Orca) on a sandbox marked with it: wake it, write its host and start the app.
     /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
@@ -1707,8 +1717,11 @@ impl Core {
                 .await
                 .map_err(ErrorView::from)?;
             if let Some(v) = &version {
-                let out = sandbox::sync::sync(&client, ade, id, v).await;
+                let (out, pairing) = sandbox::sync::sync_before_pairing(&client, ade, id, v).await;
                 self.record_sync(id, v, out.as_ref().ok(), account);
+                // A sandbox whose old setup would refuse this pairing is not paired: T3 Code
+                // would only show "credential invalid".
+                pairing.map_err(ErrorView::from)?;
             }
             // The port URL stays the same, so the app updates the environment it saved.
             let link = connect::pair_link(&client, ade, id)
@@ -1885,15 +1898,21 @@ impl Core {
         Ok(Some(h.notice.to_string()))
     }
 
-    /// Makes a new pairing link for a connected sandbox and opens it.
+    /// Makes a new pairing link for a connected sandbox and opens it. Like Open, it makes none
+    /// when the sandbox's old setup would refuse the pairing and could not be brought up to date.
     pub async fn pair_again(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<()> {
         let (client, account) = self.signed_in()?;
         let linked = std::sync::atomic::AtomicBool::new(false);
         let r = async {
             let ade = self.ade_for(id, ade)?;
-            let link = connect::pair_again(&client, ade, id)
-                .await
-                .map_err(ErrorView::from)?;
+            // Like Open: a sandbox whose old setup would refuse this pairing is synced first,
+            // and gets no link when that could not bring its setup up to date.
+            let desktop = self.read_in(account, |i| i.sync_version(ade)).flatten();
+            let link = connect::pair_again(&client, ade, id, desktop.as_deref(), |v, out| {
+                self.record_sync(id, v, out, account)
+            })
+            .await
+            .map_err(ErrorView::from)?;
             linked.store(true, std::sync::atomic::Ordering::SeqCst);
             self.open_for(account, &link)
         };
@@ -2440,6 +2459,9 @@ mod tests {
             claude_code: Some(true),
             codex: Some(false),
         };
+        s.old_app = Some(OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        });
         s.progress = Some(ProgressView {
             kind: "create".into(),
             step: "installing".into(),
@@ -2492,6 +2514,7 @@ mod tests {
             "snapshots",
             "mcp",
             "progress",
+            "oldApp",
             "error",
             "startAtLogin",
             "update",
@@ -3054,9 +3077,13 @@ mod tests {
         assert_eq!(s.ades.len(), 1, "one entry per ADE");
         assert_eq!((s.t3.as_deref(), s.desktop(Ade::T3)), (None, None));
         s.set_desktop(Ade::T3, Some("0.1.11".into()));
+        s.old_app = Some(OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        });
         let out = s.signed_out();
         assert_eq!(out.ades, s.ades, "desktop facts stay");
         assert_eq!(out.t3.as_deref(), Some("0.1.11"));
+        assert_eq!(out.old_app, s.old_app, "the old app on this computer stays");
     }
 
     #[test]
@@ -3497,6 +3524,32 @@ mod tests {
         );
         core.open_url("https://github.com/x").unwrap();
         assert_eq!(core.state().error, None, "next success clears it");
+    }
+
+    #[test]
+    fn the_old_app_is_offered_until_cleared() {
+        let emitted = Arc::new(Mutex::new(Vec::<AppState>::new()));
+        let sink = emitted.clone();
+        let core = Core::new(
+            api_base(None),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            Arc::new(MemoryConnectedStore::default()),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(move |s| sink.lock().unwrap().push(s.clone())),
+            PathBuf::from("/nonexistent"),
+        );
+        assert_eq!(core.state().old_app, None);
+        let old = OldAppView {
+            paths: vec!["/Applications/Instabox.app".into()],
+        };
+        core.set_old_app(Some(old.clone()));
+        assert_eq!(core.state().old_app, Some(old.clone()));
+        assert_eq!(emitted.lock().unwrap().last().unwrap().old_app, Some(old));
+        // Moved to the Trash, or Not now.
+        core.set_old_app(None);
+        assert_eq!(core.state().old_app, None);
+        assert_eq!(emitted.lock().unwrap().last().unwrap().old_app, None);
     }
 
     #[test]
@@ -4358,8 +4411,9 @@ mod tests {
         // since, so each Open pairs again instead of only bringing T3 Code to the front.
         let (server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        let version = format!("t3 v0.1.11\n{}\n", crate::ade::t3::setup_line());
         for (cmd, stdout) in [
-            ("t3 --version", "t3 v0.1.11\n"),
+            ("t3 --version", version.as_str()),
             ("t3 pair", "Token: abc123\n"),
         ] {
             Mock::given(method("POST"))
@@ -4410,9 +4464,185 @@ mod tests {
         assert_eq!(pairs, 2, "a new code on each open");
         assert!(!execs.iter().any(|e| e.contains("v=0.1.11")), "no setup");
         assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains(r#""cmd":"set -eu\nprobe="#)),
+            "no refresh of a current setup"
+        );
+        assert!(
             !reqs.iter().any(|r| r.method.as_str() == "PATCH"),
             "no mark change"
         );
+    }
+
+    /// Open in T3 of a sandbox connected from here, with T3 Code `desktop` on this computer,
+    /// whose version script prints `found` (no current setup line) and whose setup refresh
+    /// exits `code` with `stderr`. The core, what Open returned and opened, and the exec bodies.
+    async fn open_after_refresh(
+        desktop: &str,
+        found: &str,
+        code: i32,
+        stderr: &str,
+    ) -> (
+        Arc<Core>,
+        Res<Notice>,
+        Vec<String>,
+        Vec<String>,
+        wiremock::MockServer,
+    ) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        // The refresh first: its comments name `t3 pair` too.
+        for (priority, cmd, stdout, code, stderr) in [
+            (1, "t3 --version", found, 0, ""),
+            (1, r#""cmd":"set -eu\nprobe="#, "", code, stderr),
+            (2, "t3 pair", "Token: abc123\n", 0, ""),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/exec"))
+                .and(body_string_contains(cmd))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"stdout": stdout, "stderr": stderr, "exitCode": code}),
+                ))
+                .with_priority(priority)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": "https://3774-m1.example.test", "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let (core, opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some(desktop.into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        let r = core.open_in_ade("m1", Some(Ade::T3)).await;
+        let execs = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let opened = opened.lock().unwrap().clone();
+        (core, r, opened, execs, server)
+    }
+
+    fn paired(execs: &[String]) -> bool {
+        execs.iter().any(|e| e.contains(r#""cmd":"t3 pair"#))
+    }
+
+    const BUSY: &str = "T3 is busy on this sandbox. Try again when the agent is idle.";
+
+    #[tokio::test]
+    async fn open_does_not_pair_a_busy_t3_at_the_desktop_version_whose_old_setup_refuses_dpop() {
+        let (core, r, opened, execs, _server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 3, "T3 is busy, update deferred").await;
+        let e = r.unwrap_err();
+        assert_eq!(
+            (e.kind, e.message.as_str()),
+            (crate::errors::ErrorKind::AdeBusy, BUSY)
+        );
+        assert!(opened.is_empty() && !paired(&execs), "{opened:?}");
+        // The sync is still recorded: Update is offered.
+        assert!(core.state().sandboxes[0].update_pending);
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+    }
+
+    #[tokio::test]
+    async fn open_from_the_tray_does_not_pair_a_busy_newer_t3_whose_old_setup_refuses_dpop() {
+        let (core, r, opened, execs, _server) = open_after_refresh(
+            "0.1.12",
+            "t3 v0.1.13-nightly.20261125.5258\n",
+            3,
+            "T3 is busy, update deferred",
+        )
+        .await;
+        assert_eq!(r.unwrap_err().kind, crate::errors::ErrorKind::AdeBusy);
+        assert!(opened.is_empty() && !paired(&execs));
+        // The tray's Open, which names no ADE, shows the same error in the popover.
+        crate::tray::run_action(&core, "open", "m1", |_| panic!("no notice")).await;
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+        assert!(
+            !core.state().sandboxes[0].update_pending,
+            "ahead: no Update"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_does_not_pair_after_a_failed_refresh_of_an_old_setup_with_dpop() {
+        let (_core, r, opened, execs, _server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 1, "T3 server did not start").await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind, crate::errors::ErrorKind::Setup);
+        assert!(e.message.contains("T3 server did not start"), "{e:?}");
+        assert!(opened.is_empty() && !paired(&execs));
+    }
+
+    #[tokio::test]
+    async fn pair_again_follows_the_same_rule_as_open() {
+        let pairs = |s: &[wiremock::Request]| {
+            s.iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#""cmd":"t3 pair"#))
+                .count()
+        };
+        // Both sides use DPoP and the old setup cannot be refreshed: no link, the busy error.
+        let (core, _, _, _, server) =
+            open_after_refresh("0.1.12", "t3 v0.1.12\n", 3, "T3 is busy, update deferred").await;
+        let e = core.pair_again("m1", None).await.unwrap_err();
+        assert_eq!(
+            (e.kind, e.message.as_str()),
+            (crate::errors::ErrorKind::AdeBusy, BUSY)
+        );
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+        assert_eq!(pairs(&server.received_requests().await.unwrap()), 0);
+        // T3 Code 0.1.10 pairs with a bearer token: Pair again pairs as before.
+        let (core, _, _, _, server) =
+            open_after_refresh("0.1.10", "t3 v0.1.10\n", 3, "T3 is busy, update deferred").await;
+        assert_eq!(core.pair_again("m1", None).await, Ok(()));
+        assert_eq!(pairs(&server.received_requests().await.unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn open_still_pairs_without_dpop_when_the_refresh_fails() {
+        // T3 Code 0.1.10, at the sandbox's version and behind it: a bearer pairing.
+        for found in ["t3 v0.1.10\n", "t3 v0.1.12\n"] {
+            let (core, r, opened, execs, _server) =
+                open_after_refresh("0.1.10", found, 1, "T3 server did not start").await;
+            assert_eq!(r, Ok(None), "{found}");
+            assert_eq!(opened.len(), 1, "{found}");
+            assert!(paired(&execs), "{found}");
+            assert_eq!(core.state().error, None, "{found}");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_still_pairs_a_busy_t3_without_dpop() {
+        // T3 Code 0.1.10 pairs with a bearer token, which the old setup takes.
+        let (core, r, opened, execs, _server) =
+            open_after_refresh("0.1.10", "t3 v0.1.10\n", 3, "T3 is busy, update deferred").await;
+        assert_eq!(r, Ok(None));
+        assert_eq!(
+            opened,
+            ["t3code://pair?pairingUrl=https%3A%2F%2F3774-m1.example.test%2Fpair%23token%3Dabc123"]
+        );
+        assert!(paired(&execs));
+        assert!(core.state().sandboxes[0].update_pending);
+        assert_eq!(core.state().error, None);
     }
 
     // ---- Paradev ----

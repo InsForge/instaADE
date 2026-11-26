@@ -6,6 +6,7 @@ let state: AppState = {
   ...(structuredClone(fixture) as AppState),
   login: "preview",
   progress: null,
+  oldApp: null,
   error: null,
   // Like a dev build: Settings shows the version and says updates are only for released builds.
   update: { current: fixture.update.current, enabled: false, step: "idle", version: null, percent: null, error: null },
@@ -84,8 +85,9 @@ export async function invokePreview(command: string, args: Record<string, unknow
     }
     case "set_start_at_login": state = { ...state, startAtLogin: Boolean(args.on) }; break;
     case "dismiss_progress": state = { ...state, progress: null }; break;
+    case "dismiss_old_app": state = { ...state, oldApp: null }; break;
     default:
-      throw { kind: "other", message: "This is a browser preview. Use the InstaBox menu bar app for this action." };
+      throw { kind: "other", message: "This is a browser preview. Use the InstaADE menu bar app for this action." };
   }
   for (const cb of listeners) cb(structuredClone(state));
   return result;

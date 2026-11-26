@@ -238,7 +238,7 @@ impl Ade {
     /// True when the app at `path` is the ADE's own, checked again right before the app hands
     /// it a secret. cmux: its bundle identifier and signature (an SSH token goes into its
     /// link). T3: the app gets no token from a link, so the path `locate` found stands. Orca:
-    /// on macOS its identifier and signature, as the app InstaBox starts. Paradev: its
+    /// on macOS its identifier and signature, as the app InstaADE starts. Paradev: its
     /// identifier and signature (it gets the sandbox's SSH address with a token).
     /// Blocks for a few seconds, so run it off the async runtime.
     pub fn verify(self, path: &Path) -> bool {
@@ -303,6 +303,41 @@ impl Ade {
             Ade::Cmux => cmux::PREP_SCRIPT.to_string(),
             Ade::Orca => String::new(),
             Ade::Paradev => paradev::HOST_SCRIPT.to_string(),
+        }
+    }
+
+    /// Brings the ADE's service on the sandbox to this build's setup without changing its
+    /// version, for a sandbox at the right version whose setup is older (`setup_current`). It
+    /// exits `SETUP_EXIT_BUSY` when the ADE is busy and its restart waits. None: the app runs
+    /// no service there.
+    pub fn refresh_script(self) -> Option<String> {
+        match self {
+            Ade::T3 => Some(t3::refresh_script()),
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
+        }
+    }
+
+    /// True when the output of `version_script` shows the sandbox runs this build's setup.
+    /// Always true for an ADE without `refresh_script`.
+    pub fn setup_current(self, version_output: &str) -> bool {
+        match self {
+            Ade::T3 => t3::setup_current(version_output),
+            Ade::Cmux => true,
+            Ade::Orca => true,
+            Ade::Paradev => true,
+        }
+    }
+
+    /// True when a pairing of the desktop app at `desktop` with the ADE at `server` on the
+    /// sandbox works only once the sandbox runs this build's setup (T3 with DPoP on both sides).
+    pub fn pairing_needs_setup(self, desktop: &str, server: Option<&str>) -> bool {
+        match self {
+            Ade::T3 => t3::pairs_with_dpop(desktop, server),
+            Ade::Cmux => false,
+            Ade::Orca => false,
+            Ade::Paradev => false,
         }
     }
 
@@ -436,10 +471,15 @@ mod tests {
         assert!(t3.pins_local_version());
         assert!(t3.reinstalls());
         assert_eq!(t3.port(), Some(3774));
-        assert_eq!(
-            t3.version_script(),
-            Some("t3 --version 2>/dev/null || true")
-        );
+        assert_eq!(t3.version_script(), Some(t3::VERSION_SCRIPT));
+        assert!(t3::VERSION_SCRIPT.starts_with("t3 --version 2>/dev/null || true;"));
+        assert_eq!(t3.refresh_script(), Some(t3::refresh_script()));
+        let current = format!("t3 v0.1.12\n{}\n", t3::setup_line());
+        assert!(t3.setup_current(&current));
+        assert!(!t3.setup_current("t3 v0.1.12\n"));
+        assert!(t3.pairing_needs_setup("0.1.12", Some("0.1.12")));
+        assert!(!t3.pairing_needs_setup("0.1.10", Some("0.1.12")));
+        assert_eq!(t3.parse_version(&current).as_deref(), Some("0.1.12"));
         assert_eq!(
             t3.stop_script()
                 .map(|s| s.contains("systemctl stop t3-instabox")),
@@ -473,6 +513,9 @@ mod tests {
         assert_eq!(c.stop_script(), None);
         assert_eq!(c.probe(), None);
         assert_eq!(c.parse_version("cmux 0.64.25"), None);
+        assert_eq!(c.refresh_script(), None);
+        assert!(c.setup_current(""));
+        assert!(!c.pairing_needs_setup("0.1.12", Some("0.1.12")));
         let Open::Link(l) = c.open() else {
             panic!("cmux opens by a link")
         };
@@ -497,6 +540,9 @@ mod tests {
         assert_eq!(o.stop_script(), None);
         assert_eq!(o.probe(), None);
         assert_eq!(o.parse_version("1.4.269"), None);
+        assert_eq!(o.refresh_script(), None);
+        assert!(o.setup_current(""));
+        assert!(!o.pairing_needs_setup("0.1.12", Some("0.1.12")));
         assert_eq!(o.setup_script("ignored"), "");
         let Open::SshHost(h) = o.open() else {
             panic!("Orca opens through an SSH host")
@@ -518,7 +564,7 @@ mod tests {
             "https://github.com/paradevai/paradev/releases/latest"
         );
         assert_eq!(p.url_scheme(), "superset");
-        // InstaBox installs, keeps in step and probes nothing: Paradev's app sets its host up.
+        // InstaADE installs, keeps in step and probes nothing: Paradev's app sets its host up.
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(p.port(), None);
@@ -526,6 +572,9 @@ mod tests {
         assert_eq!(p.stop_script(), None);
         assert_eq!(p.probe(), None);
         assert_eq!(p.parse_version("2.0.11"), None);
+        assert_eq!(p.refresh_script(), None);
+        assert!(p.setup_current(""));
+        assert!(!p.pairing_needs_setup("0.1.12", Some("0.1.12")));
         let Open::Host(h) = p.open() else {
             panic!("Paradev runs the sandbox as a host")
         };

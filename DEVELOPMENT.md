@@ -1,4 +1,4 @@
-# Developing InstaBox
+# Developing InstaADE
 
 Read this before you change the code, open a pull request, build a preview or cut a release. The README covers setup and running the app.
 
@@ -9,17 +9,18 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `api/`: the instabox API client. `auth.rs`: device sign-in and token storage.
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
   - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`).
-  - `ssh_config.rs`: the SSH hosts InstaBox writes for Orca, and the one line it adds to `~/.ssh/config`.
+  - `ssh_config.rs`: the SSH hosts InstaADE writes for Orca, and the one line it adds to `~/.ssh/config`.
   - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
+  - `old_app.rs`: finds a copy of the app from before it was InstaADE, and moves it to the Trash (see [The old app](#the-old-app)).
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
-  - `updater.rs`: checks for a new version of InstaBox and installs it when the user clicks Update in Settings (see [In-app updates](#in-app-updates)).
+  - `updater.rs`: checks for a new version of InstaADE and installs it when the user clicks Update in Settings (see [In-app updates](#in-app-updates)).
 - `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 
 The UI never calls the instabox API itself. Every action on a sandbox, the account or this computer is a Rust command, and is tested in Rust. The UI owns what it shows, such as the picked ADE, and is tested with Vitest.
 
 ## Run it
 
-1. Quit any installed InstaBox. Only one instance runs at a time.
+1. Quit any installed InstaADE, or Instabox (its old name). Only one instance runs at a time.
 2. `bun install`, then `bun tauri dev`.
 3. UI changes reload at once. Rust changes rebuild and restart the app.
 
@@ -47,18 +48,18 @@ cargo test
 
 ## ADEs and the sandbox mark
 
-[How InstaBox works with each ADE](docs/ades.md) describes what each ADE does on the sandbox and on this computer. [Adding an ADE](#adding-an-ade) lists the files to touch. A sandbox's metadata marks which ADEs it has, and the mark must stay compatible with older releases:
+[How InstaADE works with each ADE](docs/ades.md) describes what each ADE does on the sandbox and on this computer. [Adding an ADE](#adding-an-ade) lists the files to touch. A sandbox's metadata marks which ADEs it has, and the mark must stay compatible with older releases:
 
 - `instabox-ades` lists every ADE id on the sandbox, comma separated, in the order they were added, such as `t3,cmux`.
 - `instabox-bridge` holds one id, the key v0.1.x reads and writes. It is `t3` whenever T3 is on the sandbox, so v0.1.x keeps treating the sandbox as connected. Else it is the first id of `instabox-ades`.
-- InstaBox reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it, since v0.1.x writes only that key.
+- InstaADE reads the ids in `instabox-ades`, then the `instabox-bridge` id when the list lacks it, since v0.1.x writes only that key.
 - A sandbox with no mark, such as one made in plain InstaBox, has no ADEs, so each ADE offers Install on it. An action that must pick an ADE and was given none uses T3.
 - An id this build does not know is kept when writing and never treated as T3.
 - `paradev` joins the mark only once Paradev's host service runs on the sandbox, since the user sets the host up in Paradev.
 
 ## Adding an ADE
 
-Pull requests that add an ADE are welcome. Read [How InstaBox works with each ADE](docs/ades.md) first to see how the four current ADEs differ.
+Pull requests that add an ADE are welcome. Read [How InstaADE works with each ADE](docs/ades.md) first to see how the four current ADEs differ.
 
 - Registry: `src-tauri/src/ade/mod.rs` defines `Ade` and lists every ADE in `ALL`. Add a variant and fill in its match arms.
 - ADE modules: `src-tauri/src/ade/t3.rs` finds T3 Code and reads its version, and holds the install, version and pairing scripts. `src-tauri/assets/t3-probe` is the idle probe. `src-tauri/src/ade/cmux.rs` finds cmux, reads its version from its app bundle, and builds its link. `src-tauri/src/ade/orca.rs` finds Orca and reads its version, from its app bundle on macOS and from `Orca.exe` on Windows. `src-tauri/src/ade/paradev.rs` finds Paradev like cmux, and holds its host check, host id and links.
@@ -71,9 +72,19 @@ A pairing ADE needs an install script, a version check, a pairing step, and an i
 
 An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca and Paradev do.
 
+## The old app
+
+InstaADE was called Instabox until v0.1.6. The bundle identifier `sh.instabox.bridge`, the executable `instabox-bridge`, the sandbox mark and the keychain entries keep that name, so an update keeps the sign-in and the sandboxes. On macOS, installing InstaADE from its `.dmg` leaves `Instabox.app` next to it.
+
+- At launch, a release build with that identifier looks for `Instabox.app` in `/Applications` and `~/Applications`. It counts only a folder, not a link, whose `Info.plist` has the identifier and that the app does not run from. The popover then offers **Move to Trash** and **Not now**. Not now lasts until the next launch.
+- **Move to Trash** checks each copy again and moves nothing while one runs. When the app starts at login, it turns the login item off before the move, while the old copy can still be recognized, and on again after it, so the item names InstaADE and not the copy in the Trash.
+- The LaunchAgent that v0.1.5 and earlier wrote keeps its label, `Instabox` (`login::agent_label`), so it still moves to SMAppService on macOS 13 and later, and stays the login item before macOS 13.
+- Only one copy runs at a time, since both have the same identifier, and the single-instance plugin hands a launch to the copy that runs. So a launch first asks a running `Instabox.app` to quit the normal way (`old_app::quit_running`, before the plugins in `lib.rs`) and waits up to 5 seconds. When it still runs, an alert tells the user to quit it, and the launch goes to it as before. Another launch of InstaADE itself is never asked to quit.
+- On Windows, the installer would leave the Instabox install next to InstaADE, since it finds an install by the product name. So in the release build, the installer hook `src-tauri/windows/hooks.nsh` first runs Instabox's uninstaller, silently. It does so only when the `Instabox` uninstall key has this app's publisher (`instabox`) and executable. Silent, the uninstaller closes a running Instabox and never deletes the app data. When Instabox started at login (its `Instabox` Run entry, not turned off in Task Manager), InstaADE gets its own `InstaADE` Run entry. Without an Instabox install, the hook does nothing.
+
 ## Preview builds
 
-A pull request can get a signed Instabox Preview, which installs next to InstaBox with its own sign-in (identifier `sh.instabox.bridge.preview`).
+A pull request can get a signed InstaADE Preview, which installs next to InstaADE with its own sign-in (identifier `sh.instabox.bridge.preview`).
 
 1. Add the `preview-build` label. The pull request's author must be in `.github/PREVIEW_AUTHORS`.
 2. **Preview build** (`.github/workflows/preview.yml`) builds the app from the pull request without secrets.
@@ -98,8 +109,8 @@ The signing secrets live in two environments: `release`, which only `v*` tags ma
 The app reads `https://github.com/InsForge/instaADE/releases/latest/download/latest.json` 15 seconds after launch, every 4 hours, and when the user clicks **Check for updates** in Settings. A check never downloads, and only one runs at a time. A check fails after 30 seconds and a download after 15 minutes, and Settings then offers to try again. A newer version puts a dot on the Settings button and **Update** in Settings, under Updates. Only **Update** downloads, checks the signature, installs and restarts.
 
 - **Updater key**: the release build signs the updater files with the secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the `release` environment. Without them it fails. The public key is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Keep the private key safe: installed apps accept only updates signed with it.
-- **Updater files** on each release, each with a `.sig`: `Instabox_<version>_aarch64.app.tar.gz` and `Instabox_<version>_x64.app.tar.gz` hold the same signed, notarized and stapled app as the `.dmg` files. On Windows the updater runs `Instabox_<version>_x64-setup.exe` without questions (passive mode), then starts the app again.
+- **Updater files** on each release, each with a `.sig`: `InstaADE_<version>_aarch64.app.tar.gz` and `InstaADE_<version>_x64.app.tar.gz` hold the same signed, notarized and stapled app as the `.dmg` files. On Windows the updater runs `InstaADE_<version>_x64-setup.exe` without questions (passive mode), then starts the app again.
 - **`latest.json`** names the version, the release notes, the date and, for `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`, the file's URL on this release and the text of its `.sig`. The tag must match the app's version, since each signature names it.
 - `latest` is the newest release that is not a prerelease. The `instabox-preview` prerelease must never become latest.
-- Instabox Preview never updates: its config builds no updater files, so it needs no key, and the app checks only in a release build with InstaBox's identifier. CI builds the Windows installer with `--no-sign`, as it has no key either. Dev builds never check. In both, Settings shows the version and says updates are only for released builds.
+- InstaADE Preview never updates: its config builds no updater files, so it needs no key, and the app checks only in a release build with InstaADE's identifier. CI builds the Windows installer with `--no-sign`, as it has no key either. Dev builds never check. In both, Settings shows the version and says updates are only for released builds.
 - 0.1.6 and earlier have no updater. Their users update by hand once, to the first release with it.

@@ -1,7 +1,7 @@
-//! Updates of InstaBox itself. A check reads the update manifest of the latest release and
+//! Updates of InstaADE itself. A check reads the update manifest of the latest release and
 //! never downloads. The app checks on a timer, and Settings has Check for updates. A newer
 //! version puts a dot on the Settings button and an Update button in Settings. Only that click
-//! downloads the update, checks its signature, installs it and restarts the app. Instabox
+//! downloads the update, checks its signature, installs it and restarts the app. InstaADE
 //! Preview and dev builds never check.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -87,8 +87,8 @@ pub trait Source: Send + Sync {
     async fn install(&self, version: &Version, progress: OnProgress) -> Result<(), String>;
 }
 
-/// Whether this build updates itself: only a release build of InstaBox. Instabox Preview has
-/// its own identifier and must never take InstaBox's releases. A dev build is not installed
+/// Whether this build updates itself: only a release build of InstaADE. InstaADE Preview has
+/// its own identifier and must never take InstaADE's releases. A dev build is not installed
 /// where an update could replace it.
 pub fn enabled(identifier: &str, release: bool) -> bool {
     release && identifier == crate::APP_IDENTIFIER
@@ -554,7 +554,7 @@ mod tests {
 
     type Shown = Arc<Mutex<Vec<UpdateView>>>;
 
-    /// InstaBox 0.1.7 on `source`: the updater, what it showed and how often it restarted.
+    /// InstaADE 0.1.7 on `source`: the updater, what it showed and how often it restarted.
     fn updater_on(
         enabled: bool,
         source: Arc<dyn Source>,
@@ -576,7 +576,7 @@ mod tests {
         (updater, shown, restarts)
     }
 
-    /// A launch of InstaBox 0.1.7 whose manifest offers `offered`.
+    /// A launch of InstaADE 0.1.7 whose manifest offers `offered`.
     fn launch(enabled: bool, offered: Option<&str>) -> Run {
         let source = Arc::new(Fake::default());
         *source.offered.lock().unwrap() = offered.map(v);
@@ -596,7 +596,7 @@ mod tests {
         }
     }
 
-    /// The view of InstaBox 0.1.7, a build that updates itself.
+    /// The view of InstaADE 0.1.7, a build that updates itself.
     fn view(step: UpdateStep, version: Option<&str>, percent: Option<u8>) -> UpdateView {
         UpdateView {
             current: "0.1.7".into(),
@@ -633,11 +633,11 @@ mod tests {
     }
 
     #[test]
-    fn only_release_builds_of_instabox_update_themselves() {
+    fn only_release_builds_of_instaade_update_themselves() {
         assert!(enabled("sh.instabox.bridge", true));
         assert!(
             !enabled("sh.instabox.bridge.preview", true),
-            "Instabox Preview never takes InstaBox's releases"
+            "InstaADE Preview never takes InstaADE's releases"
         );
         assert!(!enabled("sh.instabox.bridge", false), "a dev build");
         assert!(!enabled("sh.instabox.bridge.preview", false));
@@ -681,9 +681,9 @@ mod tests {
             "notes": "## What's Changed\n* Update from the app",
             "pub_date": "2026-11-25T21:24:33Z",
             "platforms": {
-                "darwin-aarch64": { "url": format!("{base}/Instabox_0.1.8_aarch64.app.tar.gz"), "signature": "c2ln" },
-                "darwin-x86_64": { "url": format!("{base}/Instabox_0.1.8_x64.app.tar.gz"), "signature": "c2ln" },
-                "windows-x86_64": { "url": format!("{base}/Instabox_0.1.8_x64-setup.exe"), "signature": "c2ln" }
+                "darwin-aarch64": { "url": format!("{base}/InstaADE_0.1.8_aarch64.app.tar.gz"), "signature": "c2ln" },
+                "darwin-x86_64": { "url": format!("{base}/InstaADE_0.1.8_x64.app.tar.gz"), "signature": "c2ln" },
+                "windows-x86_64": { "url": format!("{base}/InstaADE_0.1.8_x64-setup.exe"), "signature": "c2ln" }
             }
         });
         let release: tauri_plugin_updater::RemoteRelease =
@@ -691,9 +691,9 @@ mod tests {
         assert!(is_newer(&v("0.1.7"), &release.version));
         assert!(release.pub_date.is_some());
         for (target, file) in [
-            ("darwin-aarch64", "Instabox_0.1.8_aarch64.app.tar.gz"),
-            ("darwin-x86_64", "Instabox_0.1.8_x64.app.tar.gz"),
-            ("windows-x86_64", "Instabox_0.1.8_x64-setup.exe"),
+            ("darwin-aarch64", "InstaADE_0.1.8_aarch64.app.tar.gz"),
+            ("darwin-x86_64", "InstaADE_0.1.8_x64.app.tar.gz"),
+            ("windows-x86_64", "InstaADE_0.1.8_x64-setup.exe"),
         ] {
             assert_eq!(
                 release.download_url(target).unwrap().as_str(),
@@ -992,7 +992,7 @@ mod tests {
         })
     }
 
-    /// An app whose updater plugin reads `server`'s /latest.json, with InstaBox's key.
+    /// An app whose updater plugin reads `server`'s /latest.json, with InstaADE's key.
     fn plugin_app(server: &MockServer) -> tauri::App<tauri::test::MockRuntime> {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
