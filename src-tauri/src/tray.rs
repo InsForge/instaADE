@@ -344,7 +344,8 @@ fn build_menu(app: &AppHandle, rows: &[TrayRow]) -> tauri::Result<Menu<tauri::Wr
 }
 
 /// The event that hands the popover a notice after a tray action: what to do next in the ADE
-/// (Orca: the host to connect). The UI shows it as it shows the notice of its own actions.
+/// (Orca: the host to connect; Paseo: the host to add). The UI shows it as it shows the notice
+/// of its own actions.
 pub const NOTICE_EVENT: &str = "notice";
 
 /// Runs a sandbox action picked in the tray menu: `pause`, `resume` or `open`. A failure shows

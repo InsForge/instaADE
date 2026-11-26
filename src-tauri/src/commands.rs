@@ -1,9 +1,9 @@
 //! The commands the UI calls. Each one parses its arguments and hands off to `Core`.
 //! Errors are `ErrorView` values the UI can branch on.
 //!
-//! An optional `ade` argument picks the ADE (`"t3"`, `"cmux"`, `"orca"`, `"paradev"`). Without
-//! it a command uses the sandbox's own ADE (the first in its mark), else the default (T3);
-//! `create_sandbox` without it creates a plain sandbox, with no ADE.
+//! An optional `ade` argument picks the ADE (`"t3"`, `"cmux"`, `"orca"`, `"paradev"`,
+//! `"paseo"`). Without it a command uses the sandbox's own ADE (the first in its mark), else
+//! the default (T3); `create_sandbox` without it creates a plain sandbox, with no ADE.
 
 use std::sync::Arc;
 
@@ -77,7 +77,8 @@ pub fn dismiss_progress(core: Shared<'_>) {
     core.dismiss_progress();
 }
 
-/// Looks for the ADEs' desktop apps (T3 Code, cmux, Paradev) on this computer again, now.
+/// Looks for the ADEs' desktop apps (T3 Code, cmux, Orca, Paradev, Paseo) on this computer
+/// again, now.
 #[tauri::command]
 pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
     core.inner().clone().refresh_ades().await
@@ -85,8 +86,9 @@ pub async fn refresh_t3(core: Shared<'_>) -> Res<()> {
 
 /// Opens the sandbox in the ADE's app: T3 Code (a connected sandbox is woken, synced and
 /// paired again), cmux (its link, with an SSH token), Orca (its SSH host, then the app; the
-/// answer says what to do next in Orca) or Paradev (the sandbox is woken, then its host
-/// opens). A sandbox without the ADE gets it first.
+/// answer says what to do next in Orca), Paradev (the sandbox is woken, then its host
+/// opens) or Paseo (like Orca, and its address is copied). A sandbox without the ADE gets it
+/// first.
 #[tauri::command]
 pub async fn open_in_t3(core: Shared<'_>, id: String, ade: Option<Ade>) -> Res<Notice> {
     core.inner().clone().open_in_ade(&id, ade).await

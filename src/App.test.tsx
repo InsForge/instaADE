@@ -1329,6 +1329,102 @@ test("Windows has no Paradev: not in the switcher, a Paradev pick falls back, de
   }
 });
 
+// ---- Paseo ----
+
+const paseoAde: AdeView = {
+  id: "paseo",
+  name: "Paseo",
+  shortName: "Paseo",
+  version: "0.17.4",
+  downloadUrl: "https://github.com/getpaseo/paseo/releases/latest",
+};
+
+const paseoNotice = (name: string) =>
+  `In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter ssh://instabox-${name}.`;
+
+test("Paseo in the switcher: its own entry, look and saved pick", async () => {
+  show({ ades: [t3Ade, cmuxAde, orcaAde, paradevAde, paseoAde] }, [{}, { id: "b", name: "web", ades: ["paseo"], connected: false }]);
+  await screen.findByText("dev-1");
+  await userEvent.click(switcher());
+  const items = within(screen.getByRole("menu", { name: "Open sandboxes in" })).getAllByRole("menuitemradio");
+  expect(items.map((b) => b.textContent)).toEqual([
+    "InstaBox" + "Sandboxes only, no ADE",
+    "T3 Code" + "0.1.10 on this Mac · on 1 sandbox",
+    "cmux" + "0.64.25 on this Mac",
+    "Orca" + "1.4.269 on this Mac",
+    "Paradev" + "2.0.11 on this Mac",
+    "Paseo" + "0.17.4 on this Mac · on 1 sandbox",
+  ]);
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /Paseo/ }));
+  expect(localStorage.getItem(modeKey("alex"))).toBe("paseo");
+  expect(popover().dataset.mode).toBe("paseo");
+  expect(theme()).toBe("paseo");
+  expect(switcher().getAttribute("aria-label")).toBe("ADE: Paseo. Switch ADE");
+});
+
+test("Paseo rows: Connect sets it up and says where to add the host, Open says it again", async () => {
+  picked("paseo");
+  show(
+    { ades: [t3Ade, paseoAde] },
+    [
+      { id: "a", name: "dev-1", ades: ["t3"] },
+      // Paseo pairs nothing from here, so a sandbox with it is not "connected".
+      { id: "b", name: "web", ades: ["paseo"], connected: false },
+    ],
+    { connect_sandbox: () => paseoNotice("dev-1"), open_in_t3: () => paseoNotice("web") },
+  );
+  await screen.findByText("dev-1");
+  const connect = within(rowOf("dev-1")).getByRole("button", { name: "Connect" });
+  expect(connect.title).toBe("Connect to Paseo");
+  const web = within(rowOf("web"));
+  expect(web.getByRole("img", { name: "Paseo" })).toBeTruthy();
+  expect(web.getByText("connected")).toBeTruthy();
+  expect(web.queryByRole("button", { name: "Connect" })).toBeNull();
+  await userEvent.click(connect);
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "a", ade: "paseo" });
+  expect((await screen.findByRole("status")).textContent).toBe(paseoNotice("dev-1"));
+
+  // Details open it in Paseo and say again where to add it. Reconnect runs the setup again.
+  await userEvent.click(screen.getByText("web"));
+  expect(screen.queryByRole("status")).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Open in Paseo" }));
+  expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "paseo" });
+  expect((await screen.findByRole("status")).textContent).toBe(paseoNotice("web"));
+  expect(screen.queryByRole("button", { name: /Reinstall|Pair again/ })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(invoke).toHaveBeenCalledWith("connect_sandbox", { id: "b", ade: "paseo" });
+  await userEvent.click(screen.getByRole("button", { name: "Back to sandboxes" }));
+  await openMenu("dev-1");
+  expect(menuItems()[0]).toBe("Install Paseo");
+});
+
+test("a new sandbox in Paseo mode says InstaADE runs the daemon and Paseo adds the host", async () => {
+  picked("paseo");
+  show({ ades: [t3Ade, paseoAde], tier: "pro" }, [{}], { create_sandbox: () => paseoNotice("dev-2") });
+  await userEvent.click(await screen.findByRole("button", { name: "New sandbox" }));
+  expect(screen.getByText("Installs the Paseo daemon on the sandbox and opens Paseo, where you add the sandbox once.")).toBeTruthy();
+  await userEvent.type(screen.getByLabelText("Name"), "dev-2");
+  await userEvent.click(screen.getByRole("button", { name: "Create sandbox" }));
+  expect(invoke).toHaveBeenCalledWith("create_sandbox", expect.objectContaining({ ade: "paseo" }));
+  expect((await screen.findByRole("status")).textContent).toBe(paseoNotice("dev-2"));
+});
+
+test("a Paseo pick holds on Windows too, where the back end lists Paseo", async () => {
+  const ua = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(windowsAgent);
+  try {
+    picked("paseo");
+    show({ ades: [t3Ade, orcaAde, paseoAde] }, [{}]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: Paseo. Switch ADE");
+    // Without Paseo on this computer, the pick falls back to plain InstaBox.
+    cleanup();
+    picked("paseo");
+    show({ ades: [t3Ade, orcaAde] }, [{}]);
+    expect((await screen.findByRole("button", { name: /Switch ADE/ })).getAttribute("aria-label")).toBe("ADE: InstaBox. Switch ADE");
+  } finally {
+    ua.mockRestore();
+  }
+});
+
 // ---- first run and the default mode ----
 
 test("first run after sign-in lands in plain Instabox with a Connect an ADE card", async () => {

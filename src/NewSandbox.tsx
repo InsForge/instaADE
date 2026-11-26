@@ -26,6 +26,7 @@ function setupText(state: AppState, mode: Mode): string | null {
   }
   const name = adeName(state, mode);
   if (mode === "paradev") return `Copies the SSH address of the new sandbox and opens ${name}, where you set it up as a host.`;
+  if (mode === "paseo") return `Installs the ${name} daemon on the sandbox and opens ${name}, where you add the sandbox once.`;
   return `Sets the sandbox up for ${name}. Then it opens in ${name}.`;
 }
 

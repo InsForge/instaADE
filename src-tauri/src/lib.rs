@@ -90,8 +90,8 @@ pub fn run() {
             let core = Arc::new(Core::new(
                 api_base(std::env::var("INSTABOX_API_URL").ok()),
                 Arc::new(KeyringKeyStore),
-                // A new token also rewrites the sandbox's SSH host (Orca), and a sign-out removes
-                // every host.
+                // A new token also rewrites the sandbox's SSH host (Orca, Paseo), and a sign-out
+                // removes every host.
                 Arc::new(SyncedStore::new(
                     KeyringSshStore,
                     dirs::home_dir().unwrap_or_default(),

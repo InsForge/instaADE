@@ -23,7 +23,7 @@ export function AdeBadge({ id, size = 20 }: { id: Mode | SoonId; size?: number }
   );
 }
 
-const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux", orca: "Orca", paradev: "Paradev" };
+const NAMES: Record<AdeId, string> = { t3: "T3 Code", cmux: "cmux", orca: "Orca", paradev: "Paradev", paseo: "Paseo" };
 
 /** The desktop app's name, such as "T3 Code". */
 export const adeName = (state: AppState, id: AdeId) => state.ades.find((a) => a.id === id)?.name ?? NAMES[id];
@@ -38,7 +38,8 @@ export const modeName = (state: AppState, mode: Mode) => (mode === "instabox" ? 
 export const hasAde = (s: SandboxView, id: AdeId) => s.ades.includes(id);
 
 /** T3 pairs with a server it installs, and keeps its version in step; cmux opens a link; Orca
- * connects an SSH host InstaADE writes; Paradev runs the sandbox as a host it sets up. */
+ * connects an SSH host InstaADE writes; Paradev runs the sandbox as a host it sets up; Paseo
+ * connects to a daemon InstaADE runs, through an SSH host the user adds once. */
 export const pairs = (id: AdeId) => id === "t3";
 
 /** True when the ADE's app is on this computer, so it can open sandboxes here. */

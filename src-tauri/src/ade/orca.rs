@@ -24,7 +24,11 @@ pub const DOWNLOAD_URL: &str = "https://github.com/stablyai/orca/releases/latest
 /// Orca takes no links, so the app opens none for it.
 pub const URL_SCHEME: &str = "";
 
-pub const SSH_HOST: SshHost = SshHost { notice };
+pub const SSH_HOST: SshHost = SshHost {
+    notice,
+    address: None,
+    setup: None,
+};
 
 /// The sandbox's home, which the user opens in Orca once the host is connected.
 const SANDBOX_HOME: &str = "/data/home";
@@ -177,14 +181,19 @@ const EXE_PRODUCT_NAME: &str = "Orca";
 /// `Orca` and holds a version. It reads the file each time and runs nothing. It checks no
 /// signature, so another program built to look like Orca would pass.
 pub fn verify_exe(exe: &Path) -> bool {
+    exe_is_product(exe, EXE_PRODUCT_NAME)
+}
+
+/// True when `exe` is a PE file whose version resource names the product `product` exactly and
+/// holds a version. Read from the file each time; nothing runs. Paseo's check uses it too.
+pub fn exe_is_product(exe: &Path, product: &str) -> bool {
     let Ok(mut f) = File::open(exe) else {
         return false;
     };
     let Ok(resources) = resource_section(&mut f) else {
         return false;
     };
-    product_name(&resources).as_deref() == Some(EXE_PRODUCT_NAME)
-        && fixed_version(&resources).is_some()
+    product_name(&resources).as_deref() == Some(product) && fixed_version(&resources).is_some()
 }
 
 /// The `ProductName` string of the version resource in `resources`: the UTF-16 text after the

@@ -94,6 +94,13 @@
     radial-gradient(ellipse var(--paradev-light-width, 55%) var(--paradev-light-reach, 100%) at 50% -24%, #60666b 0%, #282c3066 50%, transparent 85%);
 }
 
+/* Paseo's dark surface, lit from above in its brand green. */
+.hero-atmosphere[data-theme='paseo'] {
+  background:
+    radial-gradient(ellipse 70% 90% at 50% -20%, #20744a66 0%, #20744a1f 45%, transparent 80%),
+    linear-gradient(#101615 0%, #0a0f0e 65%, #000 100%);
+}
+
 .paradev-pixels {
   position: relative;
   width: 100%;

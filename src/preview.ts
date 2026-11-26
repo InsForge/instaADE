@@ -10,10 +10,11 @@ let state: AppState = {
   error: null,
   update: null,
   startAtLogin: false,
-  // Every ADE a Mac can have. The shared fixture has no Paradev.
+  // Every ADE a Mac can have. The shared fixture has no Paradev or Paseo.
   ades: [
     ...fixture.ades,
     { id: "paradev", name: "Paradev", shortName: "Paradev", version: "2.0.11", downloadUrl: "https://github.com/paradevai/paradev/releases/latest" },
+    { id: "paseo", name: "Paseo", shortName: "Paseo", version: "0.17.4", downloadUrl: "https://github.com/getpaseo/paseo/releases/latest" },
   ] as AdeView[],
   sandboxes: [
     ...fixture.sandboxes.slice(0, 3).map((s, i) => ({
@@ -23,7 +24,7 @@ let state: AppState = {
     ...[
       { id: "preview-api", name: "api-server", state: "running", connected: true, ades: ["t3", "cmux"] },
       { id: "preview-mobile", name: "mobile-app", state: "paused", connected: false, ades: ["orca", "paradev"] },
-      { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux"] },
+      { id: "preview-design", name: "design-system", state: "running", connected: false, ades: ["cmux", "paseo"] },
       { id: "preview-staging", name: "staging", state: "paused", connected: true, ades: ["t3"] },
     ].map((machine) => ({
       ...fixture.sandboxes[2],
@@ -63,7 +64,7 @@ export async function invokePreview(command: string, args: Record<string, unknow
     case "connect_sandbox": {
       const sandbox = state.sandboxes.find((s) => s.id === args.id);
       const ade = args.ade;
-      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca" && ade !== "paradev")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
+      if (!sandbox || (ade !== "t3" && ade !== "cmux" && ade !== "orca" && ade !== "paradev" && ade !== "paseo")) throw { kind: "other", message: "Unknown sandbox or ADE in this preview." };
       // Paradev sets the host up itself, so the app hands the setup over and marks nothing yet.
       if (ade === "paradev") {
         result = "The SSH address is copied. In Paradev, click Set up a host over SSH and paste it.";
@@ -72,6 +73,7 @@ export async function invokePreview(command: string, args: Record<string, unknow
       patchSandbox({ ades: [...new Set<AdeId>([...sandbox.ades, ade])],
         ...(ade === "t3" ? { connected: true, t3Version: state.t3 } : {}) });
       if (ade === "orca") result = `In Orca, connect instabox-${sandbox.name} from the SSH menu, then open /data/home.`;
+      if (ade === "paseo") result = `In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter ssh://instabox-${sandbox.name}.`;
       break;
     }
     case "reinstall_t3": patchSandbox({ updatePending: false, t3Version: state.t3 }); break;
