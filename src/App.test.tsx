@@ -1245,13 +1245,15 @@ test("a new sandbox in cmux mode sets cmux up", async () => {
   expect(screen.queryByText(/Confirm the/)).toBeNull();
 });
 
-const ORCA_NEXT = "In Orca, connect instabox-dev-1 from the SSH menu, then open /data/home.";
+const orcaNotice = (name: string) =>
+  `In Orca, open Settings, then SSH Hosts. Click Import if instabox-${name} is not listed, then connect it and open /data/home.`;
+const ORCA_NEXT = orcaNotice("dev-1");
 
 test("Orca mode: Connect writes the host and says where to connect it in Orca", async () => {
   picked("orca");
   show({ ades: [t3Ade, cmuxAde, orcaAde] }, [{ id: "a", name: "dev-1", ades: ["t3"] }, { id: "b", name: "web", ades: ["orca"] }], {
     connect_sandbox: () => ORCA_NEXT,
-    open_in_t3: () => "In Orca, connect instabox-web from the SSH menu, then open /data/home.",
+    open_in_t3: () => orcaNotice("web"),
   });
   await screen.findByText("dev-1");
   expect(switcher().getAttribute("aria-label")).toBe("ADE: Orca. Switch ADE");
@@ -1271,7 +1273,7 @@ test("Orca mode: Connect writes the host and says where to connect it in Orca", 
   expect(screen.queryByRole("status")).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Open in Orca" }));
   expect(invoke).toHaveBeenCalledWith("open_in_t3", { id: "b", ade: "orca" });
-  expect((await screen.findByRole("status")).textContent).toBe("In Orca, connect instabox-web from the SSH menu, then open /data/home.");
+  expect((await screen.findByRole("status")).textContent).toBe(orcaNotice("web"));
   // Orca pairs nothing: no T3 pairing or reinstall.
   for (const name of ["Pair again", "Reinstall T3"]) expect(screen.queryByRole("button", { name })).toBeNull();
 });
@@ -1304,8 +1306,8 @@ test("a notice from a tray action shows in the popover like its own", async () =
   await screen.findByText("web");
   expect(screen.queryByRole("status")).toBeNull();
   // The tray's Open in Orca ran in the back end.
-  act(() => emitNotice("In Orca, connect instabox-web from the SSH menu, then open /data/home."));
-  expect(screen.getByRole("status").textContent).toBe("In Orca, connect instabox-web from the SSH menu, then open /data/home.");
+  act(() => emitNotice(orcaNotice("web")));
+  expect(screen.getByRole("status").textContent).toBe(orcaNotice("web"));
   // The next action clears it, as it clears the popover's own notices.
   await userEvent.click(screen.getByText("web"));
   expect(screen.queryByRole("status")).toBeNull();
@@ -1452,7 +1454,7 @@ const paseoAde: AdeView = {
 };
 
 const paseoNotice = (name: string) =>
-  `In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter ssh://instabox-${name}.`;
+  `In Paseo, finish or skip its setup if it shows one. Then add this sandbox once: open Settings, click Switch host, Add host, then Remote SSH, and enter ssh://instabox-${name}.`;
 
 test("Paseo in the switcher: its own entry, look and saved pick", async () => {
   show({ ades: [t3Ade, cmuxAde, orcaAde, paradevAde, paseoAde] }, [{}, { id: "b", name: "web", ades: ["paseo"], connected: false }]);

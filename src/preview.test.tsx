@@ -62,6 +62,19 @@ test("preview shows every ADE: all six in the switcher, Orca, Paradev, Paseo and
   expect(names).toEqual(["InstaBox", "T3 Code", "cmux", "Orca", "Paradev", "Paseo", "Herdr"]);
 });
 
+test("preview: Connect in Orca mode marks the sandbox and says where to connect it in Orca", async () => {
+  render(<App />);
+  await screen.findByText("experiment");
+  await userEvent.click(screen.getByRole("button", { name: /Switch ADE/ }));
+  await userEvent.click(screen.getByRole("menuitemradio", { name: /Orca/ }));
+  const row = within(screen.getByText("experiment").closest("li")!);
+  await userEvent.click(row.getByRole("button", { name: "Connect" }));
+  expect((await screen.findByRole("status")).textContent).toBe(
+    "In Orca, open Settings, then SSH Hosts. Click Import if instabox-experiment is not listed, then connect it and open /data/home.",
+  );
+  expect(row.getByRole("img", { name: "Orca" })).toBeTruthy();
+});
+
 test("preview: Connect in Paseo mode marks the sandbox and says where to add it in Paseo", async () => {
   render(<App />);
   await screen.findByText("experiment");
@@ -70,7 +83,7 @@ test("preview: Connect in Paseo mode marks the sandbox and says where to add it 
   const row = within(screen.getByText("experiment").closest("li")!);
   await userEvent.click(row.getByRole("button", { name: "Connect" }));
   expect((await screen.findByRole("status")).textContent).toBe(
-    "In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter ssh://instabox-experiment.",
+    "In Paseo, finish or skip its setup if it shows one. Then add this sandbox once: open Settings, click Switch host, Add host, then Remote SSH, and enter ssh://instabox-experiment.",
   );
   expect(row.getByRole("img", { name: "Paseo" })).toBeTruthy();
 });

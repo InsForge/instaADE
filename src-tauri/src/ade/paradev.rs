@@ -5,7 +5,7 @@
 //! an SSH address without the user, so InstaADE copies the address and opens the app's host
 //! settings, and the user finishes there.
 //! On this computer: find the real Paradev app (its identifier and its signature, not only its
-//! name) and read its version from its bundle.
+//! name), the newest when there are several, and read its version from its bundle.
 
 use anyhow::{Context, Result, bail};
 use ring::hmac;
@@ -26,8 +26,9 @@ pub const URL_SCHEME: &str = "superset";
 
 // ---- this computer ----
 
-/// The bundle keeps Superset's name; Finder shows it as Paradev.
-const BUNDLE: &str = "Superset.app";
+/// The names of the bundle: newer releases are `Paradev.app`, older ones kept Superset's name.
+/// Both have `BUNDLE_ID`, and a Mac can have both.
+const BUNDLES: &[&str] = &["Paradev.app", "Superset.app"];
 const VERSION_KEY: &str = "CFBundleShortVersionString";
 const ID_KEY: &str = "CFBundleIdentifier";
 
@@ -41,12 +42,14 @@ pub const REQUIREMENT: &str = r#"identifier "com.superset.desktop" and anchor ap
 /// A signature check that takes longer counts as failed.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The Paradev app bundle in the first of `dirs` that has one `verify` accepts.
+/// The newest Paradev app bundle in `dirs`, by either name, that `verify` accepts
+/// (`ade::newest_app`). The links open in that bundle, so the version shown is the app that opens.
 pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|d| d.join(BUNDLE))
-        .filter(|app| app.join("Contents").join("Info.plist").is_file())
-        .find(|app| verify(app))
+    let apps = dirs
+        .iter()
+        .flat_map(|d| BUNDLES.iter().map(move |b| d.join(b)))
+        .filter(|app| app.join("Contents").join("Info.plist").is_file());
+    crate::ade::newest_app(apps, |app| plist_string(app, VERSION_KEY).ok(), verify)
 }
 
 /// The Paradev app in `/Applications` or `~/Applications`, if one there is the real Paradev
@@ -115,10 +118,22 @@ pub fn version(app: &Path) -> Result<String> {
 /// in XML or binary form. It has no code and no signature.
 #[cfg(test)]
 pub(crate) fn test_bundle(dir: &Path, id: &str, version: &str, binary: bool) -> PathBuf {
+    test_bundle_named(dir, "Superset.app", id, version, binary)
+}
+
+/// Test only: `test_bundle` with the bundle name `name`.
+#[cfg(test)]
+pub(crate) fn test_bundle_named(
+    dir: &Path,
+    name: &str,
+    id: &str,
+    version: &str,
+    binary: bool,
+) -> PathBuf {
     let mut d = plist::Dictionary::new();
     d.insert(ID_KEY.into(), id.into());
     d.insert(VERSION_KEY.into(), version.into());
-    let app = dir.join(BUNDLE);
+    let app = dir.join(name);
     std::fs::create_dir_all(app.join("Contents")).unwrap();
     let path = app.join("Contents").join("Info.plist");
     let value = plist::Value::Dictionary(d);
@@ -334,14 +349,16 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_first_real_app_and_skips_lookalikes() {
+    fn finds_the_real_app_and_skips_lookalikes() {
         let system = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
         let real = |p: &Path| verify_with(p, signed(true));
         assert_eq!(locate_in(&dirs, real), None, "not installed");
-        // A folder named Superset.app without a bundle is not the app.
-        std::fs::create_dir_all(user.path().join(BUNDLE)).unwrap();
+        // A folder named Superset.app or Paradev.app without a bundle is not the app.
+        for name in BUNDLES {
+            std::fs::create_dir_all(user.path().join(name)).unwrap();
+        }
         assert_eq!(locate_in(&dirs, real), None);
         let app = test_bundle(user.path(), BUNDLE_ID, "2.0.11", false);
         assert_eq!(locate_in(&dirs, real), Some(app.clone()), "~/Applications");
@@ -352,6 +369,50 @@ mod tests {
         assert_eq!(locate_in(&dirs, real), Some(app), "/Applications first");
         // The right identifier without the signature counts as not installed.
         assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
+    }
+
+    /// Paradev was Superset: a Mac can have the old Superset.app and the new Paradev.app, both
+    /// with Paradev's identifier and signature. The newest is the one found, shown and opened.
+    #[test]
+    fn of_superset_app_and_paradev_app_the_newest_wins() {
+        let system = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
+        let real = |p: &Path| verify_with(p, signed(true));
+        let old = test_bundle_named(system.path(), "Superset.app", BUNDLE_ID, "2.0.11", false);
+        assert_eq!(
+            locate_in(&dirs, real),
+            Some(old.clone()),
+            "Superset.app alone"
+        );
+        let new = test_bundle_named(system.path(), "Paradev.app", BUNDLE_ID, "2.0.12", true);
+        assert_eq!(
+            locate_in(&dirs, real),
+            Some(new.clone()),
+            "the newer Paradev.app"
+        );
+        assert_eq!(version(&new).unwrap(), "2.0.12", "the version shown");
+        // Newer is by version, not by name or folder.
+        let newest = test_bundle_named(user.path(), "Superset.app", BUNDLE_ID, "2.0.13", false);
+        assert_eq!(locate_in(&dirs, real), Some(newest.clone()));
+        // A newer copy that fails the check does not hide an older real one.
+        let not = |p: &Path| p != newest && real(p);
+        assert_eq!(locate_in(&dirs, not), Some(new.clone()));
+        // A newer Canary is not Paradev.
+        test_bundle_named(
+            user.path(),
+            "Paradev.app",
+            "com.superset.desktop.canary",
+            "3.0.0",
+            false,
+        );
+        assert_eq!(locate_in(&dirs, real), Some(newest));
+        assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
+        // The same version under both names: Paradev.app.
+        let dir = tempfile::tempdir().unwrap();
+        test_bundle_named(dir.path(), "Superset.app", BUNDLE_ID, "2.0.12", false);
+        let new = test_bundle_named(dir.path(), "Paradev.app", BUNDLE_ID, "2.0.12", false);
+        assert_eq!(locate_in(&[dir.path().to_path_buf()], real), Some(new));
     }
 
     #[test]
@@ -390,14 +451,32 @@ mod tests {
         assert!(!verify(&fake));
     }
 
-    /// The real check against the installed Paradev, when this Mac has it. It runs codesign
-    /// only; it does not open the app.
+    /// The real check against each installed Paradev, under either name, when this Mac has one,
+    /// and `locate` finds the newest. It runs codesign only; it does not open the app.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_installed_paradev_passes_the_real_check() {
-        let app = Path::new("/Applications/Superset.app");
-        if app.join("Contents").join("Info.plist").is_file() {
+        let apps: Vec<PathBuf> = BUNDLES
+            .iter()
+            .map(|b| Path::new("/Applications").join(b))
+            .filter(|app| app.join("Contents").join("Info.plist").is_file())
+            .collect();
+        for app in &apps {
             assert!(verify(app), "{} did not verify", app.display());
+        }
+        if apps.is_empty() {
+            return;
+        }
+        let found = locate().expect("an installed Paradev");
+        for app in apps {
+            let newest =
+                crate::ade::newest_app([found.clone(), app], |a| version(a).ok(), |_| true);
+            assert_eq!(
+                newest.as_ref(),
+                Some(&found),
+                "{} is not the newest",
+                found.display()
+            );
         }
     }
 
@@ -414,7 +493,10 @@ mod tests {
     #[test]
     fn a_missing_or_odd_version_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(version(&dir.path().join(BUNDLE)).is_err(), "no bundle");
+        assert!(
+            version(&dir.path().join("Paradev.app")).is_err(),
+            "no bundle"
+        );
         let app = test_bundle(dir.path(), BUNDLE_ID, "1.0; rm -rf /", false);
         assert!(version(&app).is_err());
     }

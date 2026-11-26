@@ -477,6 +477,40 @@ pub fn local() -> Vec<Ade> {
     ALL.iter().copied().filter(|a| a.runs_here()).collect()
 }
 
+/// Of the apps at `paths`, the one with the newest `version` that `verify` accepts, so that with
+/// several copies installed the app finds, shows and opens the newest. An app whose version does
+/// not read comes last, and of two with the same version the one first in `paths` wins. The
+/// newest is checked first, so `verify` runs only until one passes.
+pub fn newest_app(
+    paths: impl IntoIterator<Item = PathBuf>,
+    version: impl Fn(&Path) -> Option<String>,
+    verify: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut found: Vec<_> = paths
+        .into_iter()
+        .map(|p| (version(&p).as_deref().and_then(version_order), p))
+        .collect();
+    // A stable sort, newest first: the same version keeps the order of `paths`.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, p)| p).find(|p| verify(p))
+}
+
+/// How an app's version sorts: its numbers, then a release after its pre-releases. So
+/// `2.0.12` > `2.0.11`, `0.65.2.2` > `0.65.2` and `2.1.0` > `2.1.0-beta.1`. None when its numbers
+/// are not all digits.
+fn version_order(v: &str) -> Option<(Vec<u64>, bool)> {
+    let v = v.split('+').next().unwrap_or_default();
+    let (numbers, release) = match v.split_once('-') {
+        Some((n, _)) => (n, false),
+        None => (v, true),
+    };
+    let numbers = numbers
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    Some((numbers, release))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProbeAnswer {
     pub busy: bool,
@@ -828,6 +862,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn versions_sort_by_their_numbers_then_a_release_after_its_pre_releases() {
+        let order = |v: &str| version_order(v);
+        assert!(order("2.0.12") > order("2.0.11"));
+        assert!(order("2.0.10") > order("2.0.9"), "numbers, not text");
+        assert!(order("0.65.2.2") > order("0.65.2"));
+        assert!(order("2.1.0") > order("2.1.0-beta.1"));
+        assert!(order("2.1.0-beta.1") > order("2.0.12"));
+        assert_eq!(order("1.4.269+build.7"), order("1.4.269"));
+        for bad in ["", "abc", "1..2", "1.x", "v1.0"] {
+            assert_eq!(order(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_newest_app_that_passes_the_check_wins() {
+        let (a, b, c) = (
+            PathBuf::from("/a/X.app"),
+            PathBuf::from("/b/X.app"),
+            PathBuf::from("/c/X.app"),
+        );
+        let versions = |list: &'static [(&'static str, &'static str)]| {
+            move |p: &Path| {
+                list.iter()
+                    .find(|(dir, _)| p.starts_with(dir))
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let all = || [a.clone(), b.clone(), c.clone()];
+        let any = |_: &Path| true;
+        let v = versions(&[("/a", "2.0.11"), ("/b", "2.0.12"), ("/c", "2.0.9")]);
+        assert_eq!(newest_app(all(), v, any), Some(b.clone()));
+        // A newer copy that fails the check does not hide an older real one.
+        assert_eq!(newest_app(all(), v, |p: &Path| p != b), Some(a.clone()));
+        assert_eq!(newest_app(all(), v, |_: &Path| false), None);
+        assert_eq!(newest_app(Vec::new(), v, any), None);
+        // The same version: the first in the list. No version: after every one that has one.
+        let v = versions(&[("/a", "1.0.0"), ("/b", "1.0.0")]);
+        assert_eq!(newest_app(all(), v, any), Some(a.clone()));
+        assert_eq!(newest_app([c.clone(), b.clone()], v, any), Some(b.clone()));
+        assert_eq!(newest_app([c.clone()], v, any), Some(c.clone()));
+        // The newest is checked first, and the check stops at the first that passes.
+        let checked = std::cell::RefCell::new(Vec::new());
+        let v = versions(&[("/a", "1.0.0"), ("/b", "3.0.0"), ("/c", "2.0.0")]);
+        let check = |p: &Path| {
+            checked.borrow_mut().push(p.to_path_buf());
+            p != b
+        };
+        assert_eq!(newest_app(all(), v, check), Some(c.clone()));
+        assert_eq!(*checked.borrow(), [b, c]);
     }
 
     #[test]

@@ -37,12 +37,13 @@ pub const REQUIREMENT: &str = r#"identifier "com.cmuxterm.app" and anchor apple 
 /// A signature check that takes longer counts as failed.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The cmux app bundle in the first of `dirs` that has one `verify` accepts.
+/// The newest cmux app bundle in `dirs` that `verify` accepts (`ade::newest_app`).
 pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    dirs.iter()
+    let apps = dirs
+        .iter()
         .map(|d| d.join(BUNDLE))
-        .filter(|app| app.join("Contents").join("Info.plist").is_file())
-        .find(|app| verify(app))
+        .filter(|app| app.join("Contents").join("Info.plist").is_file());
+    crate::ade::newest_app(apps, |app| plist_string(app, VERSION_KEY).ok(), verify)
 }
 
 /// The cmux app in `/Applications` or `~/Applications`, if one there is the real cmux
@@ -293,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_first_real_app_and_skips_lookalikes() {
+    fn finds_the_newest_real_app_and_skips_lookalikes() {
         let system = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
@@ -313,6 +314,9 @@ mod tests {
         );
         let app = test_bundle(system.path(), BUNDLE_ID, "0.64.25", false);
         assert_eq!(locate_in(&dirs, real), Some(app), "/Applications first");
+        // An older copy in /Applications does not hide a newer one in ~/Applications.
+        test_bundle(system.path(), BUNDLE_ID, "0.64.9", false);
+        assert_eq!(locate_in(&dirs, real), Some(user.path().join(BUNDLE)));
         // The right identifier without the signature counts as not installed.
         assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
     }
