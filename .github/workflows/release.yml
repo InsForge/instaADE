@@ -183,8 +183,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           version=${TAG#v}
-          # Each signature names the app's version, and the app rejects an update whose
-          # manifest names another.
+          # The app takes an update only when its signature names the version that
+          # latest.json announces (requireSignedVersion).
           app=$(jq -r .version src-tauri/tauri.conf.json)
           if [ "$app" != "$version" ]; then
             echo "$TAG does not match the app's version $app" >&2
@@ -194,6 +194,10 @@ jobs:
           platforms='{}'
           for p in darwin-aarch64 darwin-x86_64 windows-x86_64; do
             name=$(cat "updater/$p.name")
+            if ! base64 -d < "updater/$p.sig" | grep '^trusted comment:' | tr '\t' '\n' | grep -qx "version:$version"; then
+              echo "the $p signature does not name version $version" >&2
+              exit 1
+            fi
             platforms=$(jq --arg p "$p" --arg url "$base/$name" --rawfile sig "updater/$p.sig" \
               '.[$p] = {url: $url, signature: ($sig | gsub("\\s"; ""))}' <<<"$platforms")
           done

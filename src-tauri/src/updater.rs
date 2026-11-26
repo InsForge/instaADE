@@ -985,8 +985,22 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// A manifest that offers `version` for every computer, with its file at `package`.
+        /// A throwaway updater key, not the release key.
+        const TEST_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzMjkzODZDODY0OTQ2RDMKUldUVFJrbUdiRGdwODVCQy9Qc0drZUZrZ0hHVElOYlU5SlJYYXRsaVR4bDFqdW9vTWNRYnpzamEK";
+        /// The test key's signature of `payload` for version 1.0.0
+        /// (`tauri signer sign --app-version 1.0.0`).
+        const SIGNED_FOR_1_0_0: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUVFJrbUdiRGdwOHdiOWtYYWxHbjhkQ1JBRDNIVnZSdUFxeDg1UXpNVG03ZzA0OUlHYXl4bjhPUHV6Q3dNeVdpc3FId1ZYdTRPRGlVMkt2L0lId1NibGQrSVJmaW5LbWdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NjU4MDQ1CWZpbGU6cGF5bG9hZC12CXZlcnNpb246MS4wLjAKM1I1eHcxcFM3QldvVzVqZk9nblFWRXNmWWhOWktOdFIxcUtGWDRmZHMwbGtEcldQcEJUZ3NYVXhiM3NSQUk0ODMwT1BLa1ovZ3g0aFpKNDZ3UVJGQkE9PQo=";
+        /// The test key's signature of `payload` with no version, as older Tauri CLIs signed.
+        const SIGNED_WITHOUT_VERSION: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUVFJrbUdiRGdwODZabm1LQ29GaHlHdzdQdGwwRkovbkViQzdqTTdYZVp0WlVORmpFYno5NldGdEdNNE1STjUwMStoVDZtMzgyemVZVThXN3NnM0htUEw5U21CczRGRlFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NjU4MDQ2CWZpbGU6cGF5bG9hZAowS2IxWE9YOTdvQmN3UGFGeFE1Vk5QN3QyaFdoTDJVbmhjM3R4L3ZSY2xYRndzOFRHWTFSNjZPVjd1MzJOUDJjMVljaGF5NzZCRXoyT2NqTldQWmVBZz09Cg==";
+
         fn manifest(version: &str, package: &str) -> serde_json::Value {
-            let file = serde_json::json!({ "url": package, "signature": "c2ln" });
+            signed_manifest(version, package, "c2ln")
+        }
+
+        /// A manifest that offers `version` for every computer, with its file at `package`
+        /// and this signature.
+        fn signed_manifest(version: &str, package: &str, signature: &str) -> serde_json::Value {
+            let file = serde_json::json!({ "url": package, "signature": signature });
             serde_json::json!({
                 "version": version,
                 "pub_date": "2026-11-25T21:24:33Z",
@@ -997,7 +1011,8 @@ mod tests {
             })
         }
 
-        /// An app whose updater plugin reads `server`'s /latest.json, with InstaADE's key.
+        /// An app whose updater plugin reads `server`'s /latest.json, with the test key and
+        /// InstaADE's other updater settings.
         fn plugin_app(server: &MockServer) -> tauri::App<tauri::test::MockRuntime> {
             let conf: serde_json::Value =
                 serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
@@ -1005,7 +1020,8 @@ mod tests {
             context.config_mut().plugins.0.insert(
                 "updater".into(),
                 serde_json::json!({
-                    "pubkey": conf["plugins"]["updater"]["pubkey"],
+                    "pubkey": TEST_PUBKEY,
+                    "requireSignedVersion": conf["plugins"]["updater"]["requireSignedVersion"],
                     "endpoints": [format!("{}/latest.json", server.uri())],
                     // The test server speaks plain HTTP.
                     "dangerousInsecureTransportProtocol": true
@@ -1087,6 +1103,52 @@ mod tests {
             assert_eq!(last.step, UpdateStep::Failed, "with Retry");
             assert_eq!(last.error, Some(e));
             assert_eq!(restarts.load(Ordering::SeqCst), 0);
+        }
+
+        /// Offers 9.0.0 with `signature` of `payload`, clicks Update and returns the error.
+        async fn install_payload_signed(signature: &str) -> ErrorView {
+            let server = MockServer::start().await;
+            let package = format!("{}/package", server.uri());
+            let offer = signed_manifest("9.0.0", &package, signature);
+            serve(
+                &server,
+                "/latest.json",
+                ResponseTemplate::new(200).set_body_json(offer),
+            )
+            .await;
+            let payload = ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec());
+            serve(&server, "/package", payload).await;
+            let app = plugin_app(&server);
+            let source = PluginSource::new(app.handle().clone(), Arc::new(|| {}));
+            let (updater, shown, restarts) = updater_on(true, Arc::new(source));
+            updater.check().await;
+
+            let e = updater.install().await.unwrap_err();
+            let last = shown.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last.step, UpdateStep::Failed, "with Retry");
+            assert_eq!(restarts.load(Ordering::SeqCst), 0);
+            e
+        }
+
+        #[tokio::test]
+        async fn a_package_signed_for_another_version_is_not_installed() {
+            let e = install_payload_signed(SIGNED_FOR_1_0_0).await;
+            assert!(
+                e.message.contains(
+                    "signed for version 1.0.0 but the update endpoint announced version 9.0.0"
+                ),
+                "{e:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_package_signed_without_a_version_is_not_installed() {
+            let e = install_payload_signed(SIGNED_WITHOUT_VERSION).await;
+            assert!(
+                e.message
+                    .contains("does not specify the version it was signed for"),
+                "{e:?}"
+            );
         }
     }
 }

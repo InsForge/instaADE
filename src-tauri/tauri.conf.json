@@ -50,6 +50,7 @@
       "endpoints": [
         "https://github.com/InsForge/instaADE/releases/latest/download/latest.json"
       ],
+      "requireSignedVersion": true,
       "windows": {
         "installMode": "passive"
       }
