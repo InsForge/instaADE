@@ -5,7 +5,7 @@
 //! on the sandbox and runs its daemon as a service on 127.0.0.1:6767. On this computer it
 //! writes the sandbox as a host in the SSH config (`ssh_config`, as for Orca), copies
 //! `ssh://<alias>` and starts Paseo. Paseo has no link that adds a host, so the user adds it
-//! once, under Settings, Add host, Remote SSH.
+//! once, under Settings, Switch host, Add host, Remote SSH.
 //! On this computer: find the real Paseo app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Paseo.exe` and the
 //! version in its file header, read as for Orca.
@@ -42,10 +42,11 @@ pub fn address(alias: &str) -> String {
     format!("ssh://{alias}")
 }
 
-/// What the user does in Paseo once InstaADE wrote the host `alias` and started Paseo.
+/// What the user does in Paseo once InstaADE wrote the host `alias` and started Paseo. On its
+/// first start, Paseo shows its setup (Welcome to Paseo) before its window.
 pub fn notice(alias: &str) -> String {
     format!(
-        "In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter {}.",
+        "In Paseo, finish or skip its setup if it shows one. Then add this sandbox once: open Settings, click Switch host, Add host, then Remote SSH, and enter {}.",
         address(alias)
     )
 }
@@ -79,12 +80,13 @@ pub fn locate() -> Option<PathBuf> {
     }
 }
 
-/// The Paseo bundle in the first of `dirs` that has one `verify` accepts.
+/// The newest Paseo bundle in `dirs` that `verify` accepts (`ade::newest_app`).
 pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    dirs.iter()
+    let apps = dirs
+        .iter()
         .map(|d| d.join(BUNDLE))
-        .filter(|app| app.join("Contents").join("Info.plist").is_file())
-        .find(|app| verify(app))
+        .filter(|app| app.join("Contents").join("Info.plist").is_file());
+    crate::ade::newest_app(apps, |app| plist_string(app, VERSION_KEY).ok(), verify)
 }
 
 /// True when the app at `app` is the real Paseo, read from disk each time. macOS: its
@@ -271,8 +273,9 @@ mod tests {
         assert_eq!(address("instabox-dev-1"), "ssh://instabox-dev-1");
         assert_eq!(
             notice("instabox-dev-1"),
-            "In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, \
-             and enter ssh://instabox-dev-1."
+            "In Paseo, finish or skip its setup if it shows one. Then add this sandbox once: \
+             open Settings, click Switch host, Add host, then Remote SSH, and enter \
+             ssh://instabox-dev-1."
         );
         assert_eq!((SSH_HOST.notice)("x"), notice("x"));
         assert_eq!(SSH_HOST.address.map(|a| a("x")).as_deref(), Some("ssh://x"));
@@ -283,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_first_real_app_and_skips_lookalikes() {
+    fn finds_the_newest_real_app_and_skips_lookalikes() {
         let system = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
@@ -301,6 +304,9 @@ mod tests {
         );
         let app = test_bundle(system.path(), BUNDLE_ID, "0.17.4");
         assert_eq!(locate_in(&dirs, real), Some(app), "/Applications first");
+        // An older copy in /Applications does not hide a newer one in ~/Applications.
+        test_bundle(system.path(), BUNDLE_ID, "0.17.3");
+        assert_eq!(locate_in(&dirs, real), Some(user.path().join(BUNDLE)));
         assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
     }
 

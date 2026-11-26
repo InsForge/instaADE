@@ -2,6 +2,8 @@
 
 The README's [Supported ADEs](../README.md#supported-ades) says what you need and what to click. This page says what InstaADE does on the sandbox and on your computer for each ADE. To add an ADE, see [Adding an ADE](../DEVELOPMENT.md#adding-an-ade).
 
+When an ADE's app is installed more than once, such as in both `/Applications` and `~/Applications`, InstaADE uses the real copy with the newest version. The version it shows is the copy it opens.
+
 ## T3 Code
 
 InstaADE installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
@@ -29,7 +31,7 @@ cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
 ## Orca
 
-Orca connects over SSH by itself and installs its own server on the sandbox under `~/.orca-remote`, so InstaADE installs nothing and no versions must match. Orca has no link that adds a host, but it imports the hosts in `~/.ssh/config`. So **Install Orca** and **Open in Orca** wake the sandbox, write it as a host to `~/.ssh/instabox/config` and start Orca. Then connect the host from Orca's SSH menu and open `/data/home`.
+Orca connects over SSH by itself and installs its own server on the sandbox under `~/.orca-remote`, so InstaADE installs nothing and no versions must match. Orca has no link that adds a host, but it imports the hosts in `~/.ssh/config`. So **Install Orca** and **Open in Orca** wake the sandbox, write it as a host to `~/.ssh/instabox/config` and start Orca. Then open **Settings**, then **SSH Hosts** in Orca, connect the host and open `/data/home`. Orca imports the hosts when it starts, and else only when you click **Import** there. So when Orca was already running, click **Import** first.
 
 ```
 # instabox-sandbox <sandbox id>
@@ -62,7 +64,7 @@ Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the hos
 
 **Open in Paradev** wakes the sandbox, since Paradev does not wake a sleeping one, reads its machine id, and opens `superset://new-workspace?host=<host id>`, with the host id Paradev derives from that machine id. **Reconnect** checks the host again.
 
-The address holds an SSH token, so InstaADE copies it, and opens Paradev's links, only for the real Paradev app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaADE checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler.
+The address holds an SSH token, so InstaADE copies it, and opens Paradev's links, only for the real Paradev app in `/Applications` or `~/Applications`, named `Paradev.app` or, before the rename, `Superset.app`. Its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaADE checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler. A Mac can have both `Paradev.app` and `Superset.app`, with the same identifier. InstaADE then uses the newest, and opens the links in it by its path, never in the copy macOS would pick.
 
 Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
@@ -73,7 +75,7 @@ Paseo runs a daemon on every machine it works on, and its desktop app connects t
 1. **Install Paseo** wakes the sandbox. When the sandbox has no `paseo`, InstaADE installs the Paseo CLI at your app's version, with `npm install -g @getpaseo/cli@<version>`. The standard sandbox has Node.js and npm, and its global npm folder needs no sudo.
 2. It runs the daemon as the `paseo-instabox` service. The service runs `paseo daemon run` in a login shell, so the daemon finds Claude Code, Codex and the other agent CLIs on your PATH. The daemon listens on `127.0.0.1:6767` only, starts at boot and restarts when it fails. Once it answers, the sandbox gets `paseo` in its mark.
 3. InstaADE writes the sandbox as a host in `~/.ssh/instabox/config`, the same host as for [Orca](#orca), with the same `Include` line, token renewal and cleanup. Then it copies `ssh://instabox-<name>` and starts Paseo. The address holds no token: ssh reads the login from the host.
-4. In Paseo, open **Settings**, click **Add host**, then **Remote SSH**, paste the address and click **Connect**. Paseo keeps the host.
+4. In Paseo, open **Settings**, click **Switch host**, then **Add host** and **Remote SSH**. Paste the address as the **SSH host** and click **Connect**. Paseo keeps the host. The first time Paseo starts, it shows its setup (**Welcome to Paseo**) before its window: finish it or click **Skip setup**.
 
 **Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. It runs nothing on the sandbox. **Reconnect** runs the setup again, which starts a stopped daemon.
 

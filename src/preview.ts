@@ -74,8 +74,8 @@ export async function invokePreview(command: string, args: Record<string, unknow
       }
       patchSandbox({ ades: [...new Set<AdeId>([...sandbox.ades, ade])],
         ...(ade === "t3" ? { connected: true, t3Version: state.t3 } : {}) });
-      if (ade === "orca") result = `In Orca, connect instabox-${sandbox.name} from the SSH menu, then open /data/home.`;
-      if (ade === "paseo") result = `In Paseo, add this sandbox once: open Settings, click Add host, then Remote SSH, and enter ssh://instabox-${sandbox.name}.`;
+      if (ade === "orca") result = `In Orca, open Settings, then SSH Hosts. Click Import if instabox-${sandbox.name} is not listed, then connect it and open /data/home.`;
+      if (ade === "paseo") result = `In Paseo, finish or skip its setup if it shows one. Then add this sandbox once: open Settings, click Switch host, Add host, then Remote SSH, and enter ssh://instabox-${sandbox.name}.`;
       break;
     }
     case "reinstall_t3": patchSandbox({ updatePending: false, t3Version: state.t3 }); break;

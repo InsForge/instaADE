@@ -2,7 +2,8 @@
 //! its own server there under `~/.orca-remote` on the first connect, so InstaADE installs
 //! nothing and no versions must match. Orca has no link or command that adds an SSH host, but
 //! it imports the `Host` blocks of `~/.ssh/config`. So InstaADE writes the sandbox as a host
-//! there (`ssh_config`), starts Orca, and the user connects the host from Orca's SSH menu.
+//! there (`ssh_config`), starts Orca, and the user connects the host under Orca's Settings, SSH
+//! Hosts, after Import when Orca was already running.
 //! On this computer: find the real Orca app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Orca.exe` and the
 //! version in its file header.
@@ -33,9 +34,13 @@ pub const SSH_HOST: SshHost = SshHost {
 /// The sandbox's home, which the user opens in Orca once the host is connected.
 const SANDBOX_HOME: &str = "/data/home";
 
-/// What the user does in Orca once InstaADE wrote the host `alias` and started Orca.
+/// What the user does in Orca once InstaADE wrote the host `alias` and started Orca. Orca
+/// imports the hosts when it starts, and else only when the user clicks Import under Settings,
+/// SSH Hosts, so an Orca that already ran does not list a new host yet.
 pub fn notice(alias: &str) -> String {
-    format!("In Orca, connect {alias} from the SSH menu, then open {SANDBOX_HOME}.")
+    format!(
+        "In Orca, open Settings, then SSH Hosts. Click Import if {alias} is not listed, then connect it and open {SANDBOX_HOME}."
+    )
 }
 
 // ---- this computer: macOS ----
@@ -66,12 +71,13 @@ pub fn locate() -> Option<PathBuf> {
     }
 }
 
-/// The Orca bundle in the first of `dirs` that has one `verify` accepts.
+/// The newest Orca bundle in `dirs` that `verify` accepts (`ade::newest_app`).
 pub fn locate_in(dirs: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    dirs.iter()
+    let apps = dirs
+        .iter()
         .map(|d| d.join(BUNDLE))
-        .filter(|app| app.join("Contents").join("Info.plist").is_file())
-        .find(|app| verify(app))
+        .filter(|app| app.join("Contents").join("Info.plist").is_file());
+    crate::ade::newest_app(apps, |app| plist_string(app, VERSION_KEY).ok(), verify)
 }
 
 /// True when the app at `app` is the real Orca, read from disk each time. macOS: its
@@ -169,9 +175,11 @@ fn exe_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// The first of `paths` that is a file `verify` accepts.
+/// The newest of `paths` by its version resource that is a file `verify` accepts
+/// (`ade::newest_app`). Paseo uses it too.
 pub fn locate_exe_in(paths: &[PathBuf], verify: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    paths.iter().find(|p| p.is_file() && verify(p)).cloned()
+    let exes = paths.iter().filter(|p| p.is_file()).cloned();
+    crate::ade::newest_app(exes, |exe| exe_version(exe).ok(), verify)
 }
 
 /// The product name Orca's `Orca.exe` (and its installer) has in its version resource.
@@ -371,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_first_real_app_and_skips_lookalikes() {
+    fn finds_the_newest_real_app_and_skips_lookalikes() {
         let system = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
@@ -389,6 +397,9 @@ mod tests {
         );
         let app = test_bundle(system.path(), BUNDLE_ID, "1.4.269");
         assert_eq!(locate_in(&dirs, real), Some(app), "/Applications first");
+        // An older copy in /Applications does not hide a newer one in ~/Applications.
+        test_bundle(system.path(), BUNDLE_ID, "1.4.31");
+        assert_eq!(locate_in(&dirs, real), Some(user.path().join(BUNDLE)));
         assert_eq!(locate_in(&dirs, |p| verify_with(p, signed(false))), None);
     }
 
@@ -484,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_exe_for_the_user_before_the_one_for_everyone() {
+    fn finds_the_newest_exe_and_on_a_tie_the_one_for_the_user() {
         let user = tempfile::tempdir().unwrap();
         let all = tempfile::tempdir().unwrap();
         let paths = [user.path().join("Orca.exe"), all.path().join("Orca.exe")];
@@ -496,6 +507,9 @@ mod tests {
         assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[1].clone()));
         std::fs::write(&paths[0], test_exe([1, 4, 269, 0])).unwrap();
         assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[0].clone()));
+        // A newer one for every user wins over an older one for the user.
+        std::fs::write(&paths[1], test_exe([1, 4, 270, 0])).unwrap();
+        assert_eq!(locate_exe_in(&paths, verify_exe), Some(paths[1].clone()));
     }
 
     #[test]
@@ -531,7 +545,8 @@ mod tests {
     fn the_notice_names_the_host_and_the_sandbox_home() {
         assert_eq!(
             notice("instabox-dev-1"),
-            "In Orca, connect instabox-dev-1 from the SSH menu, then open /data/home."
+            "In Orca, open Settings, then SSH Hosts. Click Import if instabox-dev-1 is not \
+             listed, then connect it and open /data/home."
         );
         assert_eq!((SSH_HOST.notice)("x"), notice("x"));
     }

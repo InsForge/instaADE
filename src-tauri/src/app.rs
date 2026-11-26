@@ -4954,6 +4954,51 @@ mod tests {
         assert!(!core.lock().data.connected.contains("m1"));
     }
 
+    /// A Mac with the old Superset.app 2.0.11 and the new Paradev.app 2.0.12: the version shown
+    /// is Paradev.app's, and the links open in it, never in Superset.app or whatever handles
+    /// superset:// links. Both bundles are fakes in a temporary folder, and the lookup and the
+    /// version shown come from there, not from this computer's Applications.
+    #[tokio::test]
+    async fn paradev_opens_in_the_newest_of_superset_app_and_paradev_app() {
+        let (_server, base) =
+            paradev_server(serde_json::json!({"instabox-bridge": "t3"}), "active").await;
+        let dir = tempfile::tempdir().unwrap();
+        let id = ade::paradev::BUNDLE_ID;
+        ade::paradev::test_bundle_named(dir.path(), "Superset.app", id, "2.0.11", false);
+        let new = ade::paradev::test_bundle_named(dir.path(), "Paradev.app", id, "2.0.12", false);
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        let dirs = [dir.path().to_path_buf()];
+        let real = |p: &Path| ade::paradev::verify_with(p, |_| true);
+        assert_eq!(ade::paradev::locate_in(&dirs, real), Some(new.clone()));
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| {
+                (ade == Ade::Paradev)
+                    .then(|| ade::paradev::locate_in(&dirs, real))
+                    .flatten()
+            }),
+            Arc::new(move |ade, path| ade == Ade::Paradev && real(path)),
+        ));
+        sign_in_as(&core, &base, 7);
+        // What the app's detection shows: the version of the bundle the lookup found. Set here,
+        // so nothing looks at this computer's Applications.
+        let found = (core.locate)(Ade::Paradev).unwrap();
+        let shown = ade::paradev::version(&found).unwrap();
+        core.update(|i| i.state.set_desktop(Ade::Paradev, Some(shown)));
+        core.refresh(false).await;
+        let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
+        assert_eq!(r, Ok(None));
+        assert_eq!(core.state().desktop(Ade::Paradev), Some("2.0.12"));
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!("{PARADEV_LINK} in {}", new.display())]
+        );
+    }
+
     #[tokio::test]
     async fn open_in_paradev_wakes_the_sandbox_then_opens_its_host() {
         use wiremock::matchers::{method, path};
@@ -6015,8 +6060,8 @@ mod tests {
         }
     }
 
-    const ORCA_NOTICE: &str =
-        "In Orca, connect instabox-dev-1 from the SSH menu, then open /data/home.";
+    const ORCA_NOTICE: &str = "In Orca, open Settings, then SSH Hosts. Click Import if \
+                               instabox-dev-1 is not listed, then connect it and open /data/home.";
 
     fn hosts_of(home: &Path) -> String {
         std::fs::read_to_string(ssh_config::hosts_path(home)).unwrap_or_default()
@@ -6603,7 +6648,8 @@ mod tests {
         }
     }
 
-    const PASEO_NOTICE: &str = "In Paseo, add this sandbox once: open Settings, click Add host, \
+    const PASEO_NOTICE: &str = "In Paseo, finish or skip its setup if it shows one. Then add \
+                                this sandbox once: open Settings, click Switch host, Add host, \
                                 then Remote SSH, and enter ssh://instabox-dev-1.";
 
     /// The commands the sandbox ran.
