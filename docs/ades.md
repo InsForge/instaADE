@@ -80,9 +80,11 @@ Then Herdr opens, as with **Open in Herdr**. **Reconnect** runs the same command
 **Open in Herdr** wakes the sandbox, since the SSH gateway refuses a paused one. Then it opens your terminal with this command:
 
 ```
-ssh -t -o StrictHostKeyChecking=accept-new -p 2222 <SSH token>@ssh.instabox.sh herdr
+<OpenSSH client> -t -o StrictHostKeyChecking=accept-new -p 2222 <SSH token>@ssh.instabox.sh herdr
 ```
 
+- The OpenSSH client is the one InstaADE found, by its full path, such as `/usr/bin/ssh` or `C:\Windows\System32\OpenSSH\ssh.exe`. InstaADE looks for it again right before it makes or loads the token, and the one it finds then is the one that runs.
+- InstaADE builds the command from the host, port and token the API answers, not from the SSH command it shows. When the host or the token holds anything but letters, digits, `.`, `_` and `-`, or starts with `-`, nothing opens. **Open in Terminal** builds and checks its login the same way, and runs `ssh`.
 - On macOS the terminal is Terminal, as for **Open in Terminal**: the command goes into a temporary `.command` file that only you can read, and InstaADE removes it 10 seconds later. On Windows it is Windows Terminal, else a console window.
 - The token is the one the SSH command in the sandbox's details uses: the stored one while it has more than a day left, else a new 30-day one.
 - The first time, ssh adds the gateway's host key to `~/.ssh/known_hosts` without asking.

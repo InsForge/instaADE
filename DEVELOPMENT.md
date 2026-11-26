@@ -69,7 +69,7 @@ Pull requests that add an ADE are welcome. Read [How InstaADE works with each AD
 
 A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host. A terminal ADE needs an install script that prints its version, a version check, and the command the SSH session runs.
 
-An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca and Paradev do. A terminal ADE gives the token to the OpenSSH client only, on its command line, as Open in Terminal does, so it has no app to check.
+An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca and Paradev do. A terminal ADE gives the token to the OpenSSH client only, on its command line, as Open in Terminal does, so it has no app to check. It runs the client `locate` found, by its path, and builds the arguments with `ssh::terminal_args`, which refuses a host or token with anything a shell could run. `ssh::open_in_terminal` checks every argument again before any of it reaches a terminal.
 
 ## The old app
 

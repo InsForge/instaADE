@@ -52,8 +52,9 @@ pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
 /// Opens a URL. With an app (the path of an app bundle), in that app only; without one, in the
 /// default handler (browser, or an ADE's app for its links, such as T3 Code for `t3code://`).
 pub type Opener = Arc<dyn Fn(&str, Option<&Path>) -> Result<(), String> + Send + Sync>;
-/// Opens a login command in the user's terminal (`ssh::open_in_terminal`).
-pub type TerminalOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Opens a login in the user's terminal: the ssh client to run and its arguments
+/// (`ssh::open_in_terminal`).
+pub type TerminalOpener = Arc<dyn Fn(&Path, &[String]) -> Result<(), String> + Send + Sync>;
 /// Finds an ADE's desktop app on this computer (`Ade::locate`).
 pub type Locator = Arc<dyn Fn(Ade) -> Option<PathBuf> + Send + Sync>;
 /// Checks that the app at a path is the ADE's own (`Ade::verify`).
@@ -711,8 +712,8 @@ pub struct Core {
     ssh: Arc<dyn SshTokenStore>,
     connected: Arc<dyn ConnectedStore>,
     open: Opener,
-    /// Opens a login command in the user's terminal, for Open in Terminal and a terminal ADE
-    /// (Herdr); a test puts its own in place.
+    /// Opens a login in the user's terminal, for Open in Terminal and a terminal ADE (Herdr);
+    /// a test puts its own in place.
     terminal: TerminalOpener,
     /// `Ade::locate` and `Ade::verify`; a test puts its own in place.
     locate: Locator,
@@ -857,7 +858,7 @@ impl Core {
             ssh,
             connected,
             open,
-            terminal: Arc::new(ssh::open_in_terminal),
+            terminal: Arc::new(|ssh: &Path, args: &[String]| ssh::open_in_terminal(ssh, args)),
             locate: Arc::new(Ade::locate),
             verify: Arc::new(|ade: Ade, app: &Path| ade.verify(app)),
             clipboard: Arc::new(SecretClipboard::system()),
@@ -888,7 +889,7 @@ impl Core {
         self
     }
 
-    /// Test only: opens login commands with `terminal` instead of in a terminal.
+    /// Test only: opens logins with `terminal` instead of in a terminal.
     #[cfg(test)]
     fn with_terminal(mut self, terminal: TerminalOpener) -> Core {
         self.terminal = terminal;
@@ -1966,9 +1967,12 @@ impl Core {
 
     /// Opens a terminal ADE (Herdr) on sandbox `id`: the user's terminal opens with an SSH
     /// session that runs the ADE on the sandbox. The OpenSSH client is looked for first, then
-    /// the sandbox wakes, since the SSH gateway refuses a paused one. The token comes from
-    /// `ssh::token`, and goes to the OpenSSH client only, on its command line, as with Open in
-    /// Terminal.
+    /// the sandbox wakes, since the SSH gateway refuses a paused one. The client is looked for
+    /// again right before the token, since the wake can take minutes, and the one found then is
+    /// the one that runs: its exact path goes to the terminal, never a bare `ssh` the terminal
+    /// would look up. The token comes from `ssh::token`, and goes to that client only, on its
+    /// command line, as with Open in Terminal. A host or token that is not plain opens nothing
+    /// (`ssh::terminal_args`).
     async fn open_terminal(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let Open::Terminal(t) = ade.open() else {
             return Err(ErrorView::other(format!(
@@ -1984,11 +1988,12 @@ impl Core {
         sandbox::ensure_running(&client, id)
             .await
             .map_err(ErrorView::from)?;
+        let ssh_client = self.checked_app(ade).await?;
         let tok = ssh::token(&client, &*self.ssh, id, &self.gate(account))
             .await
             .map_err(ErrorView::from)?;
-        let cmd = ssh::terminal_command(&tok, t.command);
-        guarded(&self.gate(account), || (self.terminal)(&cmd))
+        let args = ssh::terminal_args(&tok, t.command).map_err(ErrorView::other)?;
+        guarded(&self.gate(account), || (self.terminal)(&ssh_client, &args))
             .ok_or_else(account_changed)?
             .map_err(ErrorView::other)?;
         Ok(None)
@@ -2369,16 +2374,24 @@ impl Core {
         Ok(ssh::display_command(&t))
     }
 
+    /// Opens the sandbox's SSH login in a terminal, built from the token's fields
+    /// (`ssh::login_args`), never from the command string the server formats. A host or token
+    /// that is not plain opens nothing.
     pub async fn open_ssh(self: &Arc<Self>, id: &str) -> Res<()> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
         let r = async {
-            let cmd = self.login_command(&client, id, account).await?;
-            guarded(&self.gate(account), || (self.terminal)(&cmd))
-                .ok_or_else(account_changed)?
-                .map_err(ErrorView::other)
+            let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+                .await
+                .map_err(ErrorView::from)?;
+            let args = ssh::login_args(&t).map_err(ErrorView::other)?;
+            guarded(&self.gate(account), || {
+                (self.terminal)(Path::new("ssh"), &args)
+            })
+            .ok_or_else(account_changed)?
+            .map_err(ErrorView::other)
         };
         self.settle_in(account, r.await)
     }
@@ -4059,8 +4072,8 @@ mod tests {
     }
 
     /// A core on `base` with a recording opener and the given stores and home, not yet shared.
-    /// The opener also writes down each login command opened in a terminal, as
-    /// `terminal: <command>`, so no test opens a real one.
+    /// The opener also writes down each login opened in a terminal, as
+    /// `terminal: <ssh client> <arguments>`, so no test opens a real one.
     fn recording_core(
         base: Url,
         keys: Arc<MemoryKeyStore>,
@@ -4082,8 +4095,9 @@ mod tests {
             Arc::new(|_| {}),
             home,
         )
-        .with_terminal(Arc::new(move |cmd: &str| {
-            terminal.lock().unwrap().push(format!("terminal: {cmd}"));
+        .with_terminal(Arc::new(move |ssh: &Path, args: &[String]| {
+            let line = format!("terminal: {} {}", ssh.display(), args.join(" "));
+            terminal.lock().unwrap().push(line);
             Ok(())
         }));
         (core, opened)
@@ -5080,8 +5094,13 @@ mod tests {
 
     // ---- Herdr: a terminal that runs it on the sandbox ----
 
-    /// The terminal Open in Herdr opens: an SSH session that runs `herdr`, with the token.
-    const HERDR_TERMINAL: &str = "terminal: ssh -t -o StrictHostKeyChecking=accept-new -p 2222 ibssh_new@ssh.example.test herdr";
+    /// The OpenSSH client the test computer has: where Windows installs it, the place found
+    /// when no `ssh.exe` is on the PATH.
+    const HERDR_SSH: &str = r"C:\Windows\System32\OpenSSH\ssh.exe";
+
+    /// The terminal Open in Herdr opens: that exact client, in an SSH session that runs
+    /// `herdr`, with the token.
+    const HERDR_TERMINAL: &str = r"terminal: C:\Windows\System32\OpenSSH\ssh.exe -t -o StrictHostKeyChecking=accept-new -p 2222 ibssh_new@ssh.example.test herdr";
 
     /// `cmux_server`, whose exec answers Herdr's setup with `answer`.
     async fn herdr_server(
@@ -5116,7 +5135,7 @@ mod tests {
             PathBuf::from("/nonexistent"),
         );
         let core = Arc::new(core.with_apps(
-            Arc::new(move |ade| (ssh && ade == Ade::Herdr).then(|| PathBuf::from("/usr/bin/ssh"))),
+            Arc::new(move |ade| (ssh && ade == Ade::Herdr).then(|| PathBuf::from(HERDR_SSH))),
             Arc::new(|ade, path| ade.verify(path)),
         ));
         sign_in_as(&core, base, 7);
@@ -5284,7 +5303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_in_terminal_opens_the_login_command() {
+    async fn open_in_terminal_opens_the_login_from_the_token_fields() {
         let (_server, base) = cmux_server(serde_json::json!({})).await;
         let (core, opened) = herdr_core(&base, true);
         core.open_ssh("m1").await.unwrap();
@@ -5292,6 +5311,81 @@ mod tests {
             *opened.lock().unwrap(),
             ["terminal: ssh -p 2222 ibssh_new@ssh.example.test"]
         );
+    }
+
+    /// Answers every new SSH token of `m1` with `host` and `token`, ahead of `cmux_server`'s.
+    async fn hostile_token(server: &wiremock::MockServer, host: &str, token: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "k1", "name": "Instabox", "host": host, "port": 2222,
+                "token": token, "command": format!("ssh -p 2222 {token}@{host}"),
+                "expiresAt": Utc::now() + chrono::Duration::days(30)
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_hostile_ssh_login_opens_no_terminal_for_herdr_or_open_in_terminal() {
+        let hostile = [
+            ("ssh.example.test;open -a Calculator", "ibssh_x"),
+            ("ssh.example.test", "ibssh_x$(touch /tmp/pwned)"),
+            ("ssh.example.test", "ibssh_x`touch /tmp/pwned`"),
+            ("ssh.example.test", "ibssh_x'\"y"),
+            ("ssh.example.test\ntouch /tmp/pwned", "ibssh_x"),
+            ("ssh example test", "ibssh_x"),
+            ("ssh.example.test", "-oProxyCommand=calc"),
+        ];
+        for (host, token) in hostile {
+            let md = serde_json::json!({"instabox-bridge": "herdr", "instabox-ades": "herdr"});
+            let (server, base) = herdr_server(md, herdr_installed()).await;
+            hostile_token(&server, host, token).await;
+            let (core, opened) = herdr_core(&base, true);
+            core.refresh(false).await;
+            let herdr = core.open_in_ade("m1", Some(Ade::Herdr)).await.unwrap_err();
+            assert_eq!(herdr.message, ssh::NOT_PLAIN, "{host:?} {token:?}");
+            let terminal = core.open_ssh("m1").await.unwrap_err();
+            assert_eq!(terminal.message, ssh::NOT_PLAIN, "{host:?} {token:?}");
+            assert!(opened.lock().unwrap().is_empty(), "{host:?} {token:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ssh_client_checked_right_before_the_token_is_the_one_that_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let md = serde_json::json!({"instabox-bridge": "herdr", "instabox-ades": "herdr"});
+        let (_server, base) = herdr_server(md, herdr_installed()).await;
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        // The first look (before the wake) finds one client, the next look another.
+        let looks = Arc::new(AtomicUsize::new(0));
+        let seen = looks.clone();
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| {
+                (ade == Ade::Herdr).then(|| match seen.fetch_add(1, SeqCst) {
+                    0 => PathBuf::from(r"C:\Program Files\Git\usr\bin\ssh.exe"),
+                    _ => PathBuf::from(HERDR_SSH),
+                })
+            }),
+            Arc::new(|ade, path| ade.verify(path)),
+        ));
+        sign_in_as(&core, &base, 7);
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Herdr)).await.unwrap();
+        assert_eq!(
+            looks.load(SeqCst),
+            2,
+            "before the wake and before the token"
+        );
+        assert_eq!(*opened.lock().unwrap(), [HERDR_TERMINAL]);
     }
 
     #[tokio::test]

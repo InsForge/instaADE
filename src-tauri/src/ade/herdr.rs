@@ -35,21 +35,33 @@ pub const MISSING: &str = "Herdr opens in a terminal over SSH, and this computer
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The OpenSSH client the terminal runs: `/usr/bin/ssh` on macOS; on Windows the first
-/// `ssh.exe` on PATH, else the one Windows installs in `System32\OpenSSH`.
+/// `ssh.exe` on PATH, else the one Windows installs in `System32\OpenSSH`. The app opens the
+/// terminal with this exact path (`Core::open_terminal`), so the client found here is the one
+/// that runs and gets the token.
 pub fn locate() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         Some(PathBuf::from("/usr/bin/ssh")).filter(|p| p.is_file())
     } else if cfg!(windows) {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let system = std::env::var_os("SystemRoot")
-            .map(|root| PathBuf::from(root).join("System32").join("OpenSSH"));
-        std::env::split_paths(&path)
-            .chain(system)
-            .map(|dir| dir.join("ssh.exe"))
-            .find(|p| p.is_file())
+        ssh_exe_in(
+            std::env::split_paths(&path),
+            std::env::var_os("SystemRoot").map(PathBuf::from),
+        )
     } else {
         None
     }
+}
+
+/// The first `ssh.exe` in `dirs` (the PATH), else in `<system_root>\System32\OpenSSH`.
+pub fn ssh_exe_in(
+    dirs: impl IntoIterator<Item = PathBuf>,
+    system_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let system = system_root.map(|root| root.join("System32").join("OpenSSH"));
+    dirs.into_iter()
+        .chain(system)
+        .map(|dir| dir.join("ssh.exe"))
+        .find(|p| p.is_file())
 }
 
 /// Parses `OpenSSH_10.3p1, LibreSSL 3.3.6` (macOS) or `OpenSSH_for_Windows_9.5p1, LibreSSL
@@ -191,6 +203,32 @@ mod tests {
         let ssh = locate().expect("macOS has /usr/bin/ssh");
         assert_eq!(ssh, PathBuf::from("/usr/bin/ssh"));
         assert!(version(&ssh).unwrap().starts_with("OpenSSH "));
+    }
+
+    #[test]
+    fn windows_finds_ssh_on_the_path_first_then_where_windows_installs_it() {
+        let put = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("ssh.exe"), b"").unwrap();
+            dir.join("ssh.exe")
+        };
+        let d = tempfile::tempdir().unwrap();
+        let (empty, git, root) = (
+            d.path().join("bin"),
+            d.path().join("git"),
+            d.path().join("win"),
+        );
+        std::fs::create_dir_all(&empty).unwrap();
+        let system = put(&root.join("System32").join("OpenSSH"));
+        // Not on the PATH: the one in System32\OpenSSH, by its full path.
+        assert_eq!(
+            ssh_exe_in([empty.clone()], Some(root.clone())),
+            Some(system)
+        );
+        // On the PATH: that one first.
+        let on_path = put(&git);
+        assert_eq!(ssh_exe_in([empty.clone(), git], Some(root)), Some(on_path));
+        assert_eq!(ssh_exe_in([empty], None), None);
     }
 
     #[test]
