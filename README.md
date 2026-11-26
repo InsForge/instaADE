@@ -49,6 +49,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 - Copy the SSH command or open it in a terminal
 - Sign in to Claude Code or Codex on the sandbox
 - Starts at login (turn it off in Settings)
+- Updates itself when you click **Update** in Settings. A dot on the Settings button means a new version is out
 
 ## Supported ADEs
 

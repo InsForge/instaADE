@@ -17,6 +17,7 @@ import unfold from "./assets/main-view/unfold.svg";
 import Progress, { ProgressBar, stepText } from "./Progress";
 import SelectMenu from "./SelectMenu";
 import type { AdeId, AppState, SandboxView } from "./types";
+import { updateOffered } from "./UpdatesSection";
 
 const DASHBOARD_URL = "https://dashboard.instabox.sh/dashboard/machines";
 
@@ -215,6 +216,7 @@ interface Props extends ListActions {
 export default function SandboxList(props: Props) {
   const { header, showHero = false, state, run, mode, agents, pending, menuFor, firstRun } = props;
   const { onNew, onSettings, onPickAde, onNotNow, onConnect } = props;
+  const offered = updateOffered(state.update);
   const p = state.progress;
   const showPending = p !== null && !state.sandboxes.some((s) => s.id === p.machineId);
   const empty = state.sandboxes.length === 0 && !showPending;
@@ -311,9 +313,14 @@ export default function SandboxList(props: Props) {
           >
             <ExternalLink />
           </button>
-          <button className="icon-btn hd" aria-label="Settings" title={state.update ? "Update available" : undefined} onClick={onSettings}>
+          <button
+            className="icon-btn hd"
+            aria-label={offered ? "Settings, update available" : "Settings"}
+            title={offered ? "Update available" : undefined}
+            onClick={onSettings}
+          >
             <Gear />
-            {state.update && <span className="badge" aria-hidden="true" />}
+            {offered && <span className="badge" aria-hidden="true" />}
           </button>
         </div>
       </div>

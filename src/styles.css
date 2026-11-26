@@ -1199,15 +1199,18 @@ pre.banner-text {
   color: var(--muted);
 }
 
-.update {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 6px 10px 10px;
-  background: var(--raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+/* Settings > Updates: what a check found, or how the update goes */
+.update-status > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.update-status.update-progress {
+  padding: 10px 10px;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 6px;
 }
 
 .switch {

@@ -16,7 +16,7 @@ See the canonical development guide at [DEVELOPMENT.md](../../../DEVELOPMENT.md)
 4. **ADEs and the sandbox mark**: the `instabox-ades` and `instabox-bridge` keys and the compatibility rules.
 5. **Adding an ADE**: the registry, the ADE modules, the four ways an ADE opens, the flow and UI files, and what each kind of ADE needs.
 6. **Preview builds**: the `preview-build` label, `.github/PREVIEW_AUTHORS`, and the two stage signing flow.
-7. **Releases**: the version bump, the `v*` tag, and where the signing secrets live.
+7. **Releases**: the version bump, the `v*` tag, where the signing secrets live, and in-app updates (the updater key, the updater files and `latest.json`).
 
 What each ADE does on the sandbox and on the user's computer is in [docs/ades.md](../../../docs/ades.md).
 
