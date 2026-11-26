@@ -8,7 +8,8 @@ let state: AppState = {
   progress: null,
   oldApp: null,
   error: null,
-  update: null,
+  // Like a dev build: Settings shows the version and says updates are only for released builds.
+  update: { current: fixture.update.current, enabled: false, step: "idle", version: null, percent: null, error: null },
   startAtLogin: false,
   // Every ADE a Mac can have. The shared fixture has no Paradev or Herdr.
   ades: [

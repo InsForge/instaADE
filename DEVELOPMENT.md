@@ -13,6 +13,7 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later.
   - `old_app.rs`: finds a copy of the app from before it was InstaADE, and moves it to the Trash (see [The old app](#the-old-app)).
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
+  - `updater.rs`: checks for a new version of InstaADE and installs it when the user clicks Update in Settings (see [In-app updates](#in-app-updates)).
 - `src/` is the React UI. `api.ts` wraps the Rust commands and `types.ts` mirrors the Rust state. `mode.ts` keeps the ADE the user picked.
 
 The UI never calls the instabox API itself. Every action on a sandbox, the account or this computer is a Rust command, and is tested in Rust. The UI owns what it shows, such as the picked ADE, and is tested with Vitest.
@@ -98,6 +99,18 @@ Repository admins cut releases.
 
 1. Bump the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`, and merge that through a pull request.
 2. Push a `vX.Y.Z` tag on `main`. Only admins may push `v*` tags.
-3. **Release** (`.github/workflows/release.yml`) builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signature, and uploads them to the GitHub release.
+3. **Release** (`.github/workflows/release.yml`) makes a draft GitHub release. It builds the signed and notarized `.dmg` files for Apple silicon and Intel and the Windows installer, checks the signatures, and uploads them to the draft with the updater files.
+4. When all three builds are done, it uploads `latest.json` and publishes the release. From then on, the app offers the release. When a build fails, the release stays a draft and the app keeps offering the release before. Re-run the failed jobs to finish it.
 
 The signing secrets live in two environments: `release`, which only `v*` tags may use, and `preview`, which only `main` may use. Never add them at the repository level.
+
+### In-app updates
+
+The app reads `https://github.com/InsForge/instaADE/releases/latest/download/latest.json` 15 seconds after launch, every 4 hours, and when the user clicks **Check for updates** in Settings. A check never downloads, and only one runs at a time. A check fails after 30 seconds and a download after 15 minutes, and Settings then offers to try again. A newer version puts a dot on the Settings button and **Update** in Settings, under Updates. Only **Update** downloads, checks the signature, installs and restarts.
+
+- **Updater key**: the release build signs the updater files with the secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the `release` environment. Without them it fails. The public key is `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Keep the private key safe: installed apps accept only updates signed with it.
+- **Updater files** on each release, each with a `.sig`: `InstaADE_<version>_aarch64.app.tar.gz` and `InstaADE_<version>_x64.app.tar.gz` hold the same signed, notarized and stapled app as the `.dmg` files. On Windows the updater runs `InstaADE_<version>_x64-setup.exe` without questions (passive mode), then starts the app again.
+- **`latest.json`** names the version, the release notes, the date and, for `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`, the file's URL on this release and the text of its `.sig`. The tag must match the app's version, since each signature names it. The app installs an update only when its signature names the version that `latest.json` announces (`requireSignedVersion`), and the release checks each signature before it uploads `latest.json`.
+- `latest` is the newest release that is not a prerelease. The `instabox-preview` prerelease must never become latest.
+- InstaADE Preview never updates: its config builds no updater files, so it needs no key, and the app checks only in a release build with InstaADE's identifier. CI builds the Windows installer with `--no-sign`, as it has no key either. Dev builds never check. In both, Settings shows the version and says updates are only for released builds.
+- 0.1.6 and earlier have no updater. Their users update by hand once, to the first release with it.

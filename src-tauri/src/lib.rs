@@ -16,6 +16,7 @@ pub mod sandbox;
 pub mod ssh;
 pub mod ssh_config;
 pub mod tray;
+pub mod updater;
 
 use std::sync::{Arc, OnceLock};
 
@@ -29,9 +30,12 @@ use crate::connected::FileConnectedStore;
 use crate::mcp::KeyringKeyStore;
 use crate::ssh::KeyringSshStore;
 use crate::ssh_config::SyncedStore;
+use crate::updater::{PluginSource, Updater};
 
+/// InstaBox's bundle identifier. Instabox Preview has its own.
+pub(crate) const APP_IDENTIFIER: &str = "sh.instabox.bridge";
 /// The keychain service before startup sets one: Instabox's identifier.
-const DEFAULT_KEYCHAIN_SERVICE: &str = "sh.instabox.bridge";
+const DEFAULT_KEYCHAIN_SERVICE: &str = APP_IDENTIFIER;
 static KEYCHAIN_SERVICE: OnceLock<String> = OnceLock::new();
 
 /// The keychain service that holds the app's secrets: the identifier the app was bundled
@@ -56,6 +60,8 @@ pub fn run() {
             tray::show_popover(app, None);
         }))
         .plugin(tauri_plugin_opener::init())
+        // Only Rust uses it (`updater`): the popover gets no updater permissions.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // The login item on Windows and before macOS 13. `login` uses SMAppService instead on
         // macOS 13 and later.
         .plugin(autostart(&context.config().identifier))
@@ -156,6 +162,26 @@ pub fn run() {
             }
             core.set_start_at_login(starts_at_login);
             app.manage(core.clone());
+            let updates = Arc::new(Updater::new(
+                handle.package_info().version.clone(),
+                updater::enabled(&app.config().identifier, release),
+                Arc::new(PluginSource::new(handle.clone(), {
+                    let c = core.clone();
+                    Arc::new(move || c.on_quit())
+                })),
+                {
+                    let c = core.clone();
+                    Arc::new(move |u| c.set_update(Some(u)))
+                },
+                // Through the app's exit, so `on_quit` runs before the new version starts.
+                {
+                    let h = handle.clone();
+                    Arc::new(move || h.request_restart())
+                },
+            ));
+            updates.publish();
+            app.manage(updates.clone());
+            tauri::async_runtime::spawn(updates.run());
             tray::build(&handle, core.clone())?;
             // Opened by hand: show where the app lives. Started at login: stay in the menu bar.
             if !at_login {
@@ -212,6 +238,8 @@ pub fn run() {
             commands::trash_old_app,
             commands::dismiss_old_app,
             commands::open_url,
+            commands::check_for_updates,
+            commands::install_update,
         ])
         .build(context)
         .expect("error while building InstaADE");
@@ -221,7 +249,8 @@ pub fn run() {
         if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_popover(app, None);
         }
-        // A copied SSH address whose minute is not up yet does not outlive the app.
+        // A copied SSH address whose minute is not up yet does not outlive the app, nor an
+        // update's restart.
         if let tauri::RunEvent::Exit = event
             && let Some(core) = app.try_state::<Arc<Core>>()
         {

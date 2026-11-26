@@ -1,28 +1,19 @@
 import { setStartAtLogin, signOut } from "./api";
 import { CheckAdesButton } from "./AdeCards";
 import { AdeBadge, COMING_SOON } from "./ades";
-import { cap, openExternal, thisComputer } from "./common";
+import { cap, thisComputer } from "./common";
 import type { Run } from "./common";
 import type { AppState } from "./types";
+import UpdatesSection from "./UpdatesSection";
 
 /** Settings. The organization is picked in the list's footer. */
 export default function Settings({ state, run }: { state: AppState; run: Run }) {
-  const update = state.update;
   const name = state.login ?? "Signed in";
   const initials = name.trim().charAt(0).toUpperCase();
 
   return (
     <div className="scroll settings-view">
       <div className="stack">
-        {update && (
-          <div className="update">
-            <span className="small soft">A new version of InstaADE is ready.</span>
-            <button className="btn primary" onClick={() => openExternal(update.url)}>
-              Download
-            </button>
-          </div>
-        )}
-
         <section className="section">
           <h2 className="section-label">Account</h2>
           <div className="group">
@@ -82,6 +73,8 @@ export default function Settings({ state, run }: { state: AppState; run: Run }) 
             </div>
           </div>
         </section>
+
+        {state.update && <UpdatesSection update={state.update} />}
       </div>
     </div>
   );

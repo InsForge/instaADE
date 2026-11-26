@@ -15,6 +15,7 @@ use crate::app::{AppState, Core, CreateArgs, Notice, parse_mcp_client, parse_pro
 use crate::errors::ErrorView;
 use crate::login;
 use crate::old_app;
+use crate::updater::Updater;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 type Res<T> = Result<T, ErrorView>;
@@ -234,4 +235,19 @@ pub fn dismiss_old_app(core: Shared<'_>) {
 #[tauri::command]
 pub fn open_url(core: Shared<'_>, url: String) -> Res<()> {
     core.open_url(&url)
+}
+
+/// Check for updates: reads the update manifest now and shows what it found in
+/// `state.update`. Never downloads. Async, like `install_update`, so it never runs on the main
+/// thread (see `Updater`).
+#[tauri::command]
+pub async fn check_for_updates(updater: State<'_, Arc<Updater>>) -> Res<()> {
+    updater.check_now().await
+}
+
+/// Update: downloads the update on offer, checks its signature, installs it and restarts the
+/// app. A failure shows in `state.update`, with Retry.
+#[tauri::command]
+pub async fn install_update(updater: State<'_, Arc<Updater>>) -> Res<()> {
+    updater.inner().clone().install().await
 }

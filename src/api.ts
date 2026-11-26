@@ -61,6 +61,10 @@ export const trashOldApp = () => invoke<void>("trash_old_app");
 /** Stops offering the old app until the next launch. */
 export const dismissOldApp = () => invoke<void>("dismiss_old_app");
 export const openUrl = (url: string) => invoke<void>("open_url", { url });
+/** Reads the update manifest now. Never downloads. The result shows in state.update. */
+export const checkForUpdates = () => invoke<void>("check_for_updates");
+/** Downloads, installs and restarts the app. A failure shows in state.update. */
+export const installUpdate = () => invoke<void>("install_update");
 
 export const T3_DOWNLOAD_URL = "https://github.com/pingdotgg/t3code/releases/latest";
 

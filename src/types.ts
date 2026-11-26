@@ -110,6 +110,26 @@ export interface ProgressView {
   error: ErrorView | null;
 }
 
+/**
+ * idle: nothing to say yet. checking, upToDate, checkFailed: Check for updates. available: offer
+ * Update. downloading, installing: the app restarts when done. failed: offer Retry.
+ */
+export type UpdateStep = "idle" | "checking" | "upToDate" | "checkFailed" | "available" | "downloading" | "installing" | "failed";
+
+/** This build's version and its updates (Rust: `updater::UpdateView`). */
+export interface UpdateView {
+  current: string;
+  /** False in dev and preview builds: they never update. */
+  enabled: boolean;
+  step: UpdateStep;
+  /** The newer version on offer, from available on. */
+  version: string | null;
+  /** downloading: how far, once the size is known. */
+  percent: number | null;
+  /** checkFailed, failed: why. */
+  error: ErrorView | null;
+}
+
 export interface AppState {
   signedIn: boolean;
   login: string | null;
@@ -129,5 +149,5 @@ export interface AppState {
   oldApp: OldAppView | null;
   error: ErrorView | null;
   startAtLogin: boolean;
-  update: { version: string; url: string } | null;
+  update: UpdateView | null;
 }

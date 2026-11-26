@@ -9,7 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  # One job makes the release, so the build jobs never race to create it.
+  # One job makes the release, so the build jobs never race to create it. It starts as a draft:
+  # releases/latest stays on the release before, whose latest.json still works, until the
+  # manifest job publishes this one.
   release:
     runs-on: ubuntu-latest
     steps:
@@ -21,7 +23,7 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG exists"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --generate-notes
           fi
 
   build:
@@ -32,18 +34,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # platform: the key of its files in latest.json.
           - target: aarch64-apple-darwin
             os: macos-latest
             bundle: dmg
             ext: dmg
+            platform: darwin-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
             bundle: dmg
             ext: dmg
+            platform: darwin-x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             bundle: nsis
             ext: exe
+            platform: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,10 +67,12 @@ jobs:
         env:
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
-      # Tauri signs with the Developer ID certificate, then notarizes and staples the app.
-      - name: Build the signed .dmg
+      # Tauri signs the app with the Developer ID certificate, then notarizes and staples it.
+      # Only then does it put that app in the .dmg and in the updater archive (.app.tar.gz),
+      # and sign the archive with the updater key (.sig).
+      - name: Build the signed .dmg and updater archive
         if: runner.os == 'macOS'
-        run: bun tauri build --target ${{ matrix.target }} --bundles dmg
+        run: bun tauri build --target ${{ matrix.target }} --bundles app,dmg
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -72,10 +80,16 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/notary.p8
-      # The Windows installer is not signed yet: SmartScreen asks once before it runs.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # The Windows installer is not signed yet: SmartScreen asks once before it runs. The
+      # updater installs the same installer, signed with the updater key (.sig).
       - name: Build the Windows installer
         if: runner.os == 'Windows'
         run: bun tauri build --target ${{ matrix.target }} --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       # A missing secret builds an unsigned app, which macOS reports as damaged. Never publish one.
       - name: Check the app is signed and notarized
         if: runner.os == 'macOS'
@@ -97,16 +111,102 @@ jobs:
             xcrun stapler validate "${apps[0]}"
             hdiutil detach "$mnt" >/dev/null
           done
-      - name: Upload the .${{ matrix.ext }}
+          # The updater installs the app in this archive, so it must be the same signed,
+          # notarized and stapled app.
+          archives=(src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz)
+          if [ ${#archives[@]} -ne 1 ]; then
+            echo "expected one updater archive, found ${#archives[@]}" >&2
+            exit 1
+          fi
+          dir=$(mktemp -d)
+          tar -xzf "${archives[0]}" -C "$dir"
+          apps=("$dir"/*.app)
+          codesign --verify --strict "${apps[0]}"
+          info=$(codesign -dvv "${apps[0]}" 2>&1)
+          grep -q "^Authority=Developer ID Application" <<<"$info"
+          xcrun stapler validate "${apps[0]}"
+      - name: Upload the .${{ matrix.ext }} and the updater files
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           shopt -s nullglob
-          files=(src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/*.${{ matrix.ext }})
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no .${{ matrix.ext }} was built" >&2
+          bundle=src-tauri/target/${{ matrix.target }}/release/bundle
+          files=("$bundle"/${{ matrix.bundle }}/*.${{ matrix.ext }})
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "expected one .${{ matrix.ext }}, found ${#files[@]}" >&2
             exit 1
           fi
-          gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          # What the updater downloads. On Windows it is the installer itself. On macOS it is
+          # the app archive, which has the same name for both architectures, so it takes the
+          # .dmg's name.
+          if [ "$RUNNER_OS" = macOS ]; then
+            archives=("$bundle"/macos/*.app.tar.gz)
+            update="$RUNNER_TEMP/$(basename "${files[0]}" .dmg).app.tar.gz"
+            cp "${archives[0]}" "$update"
+            cp "${archives[0]}.sig" "$update.sig"
+            uploads=("${files[0]}" "$update" "$update.sig")
+          else
+            update=${files[0]}
+            uploads=("$update" "$update.sig")
+          fi
+          if [ ! -s "$update.sig" ]; then
+            echo "no updater signature for $update" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${uploads[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          # For latest.json: the file's name on the release and its signature.
+          mkdir -p "$RUNNER_TEMP/updater"
+          basename "$update" > "$RUNNER_TEMP/updater/${{ matrix.platform }}.name"
+          cp "$update.sig" "$RUNNER_TEMP/updater/${{ matrix.platform }}.sig"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: updater-${{ matrix.platform }}
+          path: ${{ runner.temp }}/updater
+          if-no-files-found: error
+          retention-days: 1
+
+  # The manifest the app reads at releases/latest/download/latest.json. It goes up last, once
+  # every build has put its files on the release, and then the release is published, so the app
+  # never sees a half release. When a build fails, the release stays a draft.
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: updater-*
+          merge-multiple: true
+          path: updater
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          # The app takes an update only when its signature names the version that
+          # latest.json announces (requireSignedVersion).
+          app=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "$app" != "$version" ]; then
+            echo "$TAG does not match the app's version $app" >&2
+            exit 1
+          fi
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          platforms='{}'
+          for p in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+            name=$(cat "updater/$p.name")
+            if ! base64 -d < "updater/$p.sig" | grep '^trusted comment:' | tr '\t' '\n' | grep -qx "version:$version"; then
+              echo "the $p signature does not name version $version" >&2
+              exit 1
+            fi
+            platforms=$(jq --arg p "$p" --arg url "$base/$name" --rawfile sig "updater/$p.sig" \
+              '.[$p] = {url: $url, signature: ($sig | gsub("\\s"; ""))}' <<<"$platforms")
+          done
+          notes=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          jq -n --arg version "$version" --arg notes "$notes" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson platforms "$platforms" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms}' > latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

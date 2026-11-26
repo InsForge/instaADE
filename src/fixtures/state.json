@@ -163,7 +163,11 @@
   },
   "startAtLogin": true,
   "update": {
+    "current": "0.1.7",
+    "enabled": true,
+    "step": "downloading",
     "version": "0.2.0",
-    "url": "https://github.com/InsForge/instaADE/releases/tag/v0.2.0"
+    "percent": 42,
+    "error": null
   }
 }
