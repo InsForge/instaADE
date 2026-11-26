@@ -751,16 +751,13 @@ pre.banner-text {
   border-top: 1px solid var(--border);
   background: var(--page);
 }
+/* The text gets the full width, and the buttons go on the line below it. */
 .ade-install-notice .warn-card {
-  flex-direction: row;
-  align-items: center;
-}
-.ade-install-notice .warn-head {
-  flex: 1;
-  min-width: 0;
+  padding: 10px 12px;
+  gap: 8px;
 }
 .ade-install-notice .warn-buttons {
-  flex-shrink: 0;
+  gap: 4px;
 }
 .empty-copy {
   display: flex;

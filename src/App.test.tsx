@@ -1075,6 +1075,8 @@ test("T3 mode without T3 Code on this Mac shows the card above the list", async 
   show(noT3, [{}]);
   expect(await screen.findByText("T3 Code is not on this Mac")).toBeTruthy();
   expect(screen.getByText("dev-1")).toBeTruthy();
+  // Check again is a text button, so Download stays the one action that stands out.
+  expect(screen.getByRole("button", { name: "Check again" }).classList.contains("text")).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "Download T3 Code" }));
   expect(invoke).toHaveBeenCalledWith("open_url", { url: T3_DOWNLOAD_URL });
   await userEvent.click(screen.getByRole("button", { name: "Check again" }));
