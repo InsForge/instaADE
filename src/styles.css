@@ -1265,20 +1265,18 @@ pre.banner-text {
   gap: 16px;
   text-align: center;
 }
+/* The app's symbol and its name. The tagline under it names the cloud product, InstaBox. */
 .sign-in-logo {
-  position: relative;
-  width: 134.194px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   height: 32px;
 }
-.sign-in-symbol {
-  position: absolute;
-  top: 0.48%;
-  left: 1.26%;
-}
-.sign-in-wordmark {
-  position: absolute;
-  top: 28.22%;
-  left: 28.92%;
+.sign-in-name {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 32px;
 }
 .sign-in {
   display: flex;
