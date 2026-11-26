@@ -60,6 +60,8 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 | [Orca](docs/ades.md#orca) | macOS, Windows | Adds the sandbox as an SSH host that Orca imports |
 | [Paradev](docs/ades.md#paradev-macos) | macOS | Hands the host setup to Paradev, then opens a workspace on the host |
 
+Is your favorite ADE missing? Add it, or ask for it in an issue. See [CONTRIBUTING.md](CONTRIBUTING.md#add-an-ade).
+
 - **T3 Code**: You need the T3 Code desktop app. **Install T3 Code** installs T3 on the sandbox at your app's version and pairs the two. Every **Open in T3 Code** wakes the sandbox and pairs again, so T3 Code gets the sandbox back even if it lost it.
 - **cmux**: You need the cmux app in Applications. **Install cmux** and **Open in cmux** open the sandbox in cmux, which connects to it over SSH. InstaADE installs nothing on the sandbox for cmux.
 - **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then connect the host InstaADE names from Orca's SSH menu, and open `/data/home`.
@@ -76,7 +78,7 @@ For how InstaADE works with each ADE, see [docs/ades.md](docs/ades.md).
 
 ## Roadmap
 
-- More ADEs
+- More ADEs. Pull requests that add one are welcome.
 
 ## Development
 
@@ -145,9 +147,11 @@ To let others try a pull request, build InstaADE Preview in CI. It installs next
 
 ## Contributing
 
-**Pull requests**: Welcome, including ones that add an ADE. Start with [Adding an ADE](DEVELOPMENT.md#adding-an-ade).
+Contributions are welcome, from new ADEs to new features and fixes. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Issues**: Open an [issue](https://github.com/InsForge/instaADE/issues) for bugs or ideas.
+- **Add your favorite ADE**: start with [Add an ADE](CONTRIBUTING.md#add-an-ade).
+- **Add a feature or fix a bug**: open a pull request. For a large change, open an issue first.
+- **Issues**: open an [issue](https://github.com/InsForge/instaADE/issues) for a bug, an idea or an ADE you want.
 
 ## License
 
