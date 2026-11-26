@@ -11,7 +11,7 @@ export type ViewState =
   | "deleting";
 
 /** An ADE's id. */
-export type AdeId = "t3" | "cmux" | "orca" | "paradev" | "herdr";
+export type AdeId = "t3" | "cmux" | "orca" | "paradev" | "paseo" | "herdr";
 
 export type ErrorKind =
   | "freeLimit"
@@ -45,7 +45,7 @@ export interface SandboxView {
   name: string;
   state: ViewState;
   size: string;
-  /** T3 was paired with it from this computer. cmux, Orca, Paradev and Herdr never set it. */
+  /** T3 was paired with it from this computer. cmux, Orca, Paradev, Paseo and Herdr never set it. */
   connected: boolean;
   /** The ADEs set up on the sandbox (its mark), in the order they were added. */
   ades: AdeId[];

@@ -1,6 +1,7 @@
 //! This computer's clipboard, for a secret the user pastes once, such as the SSH address
 //! Paradev's host setup takes. The copy is cleared a minute later, but only while the clipboard
-//! still holds exactly that secret: whatever the user copied since stays.
+//! still holds exactly that secret: whatever the user copied since stays. Text that is no
+//! secret, such as Paseo's host address, is copied and left there.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,8 +23,8 @@ pub trait Clipboard: Send + Sync {
     fn write(&self, text: &str) -> Result<(), String>;
 }
 
-/// `pbpaste` and `pbcopy` on macOS. No other platform needs a clipboard yet: only Paradev, a
-/// macOS app, asks for it.
+/// `pbpaste` and `pbcopy` on macOS. No other platform has a clipboard here yet: Paradev, a
+/// macOS app, needs it, and Paseo on Windows shows its address without copying it.
 pub struct SystemClipboard;
 
 impl Clipboard for SystemClipboard {
@@ -96,6 +97,14 @@ impl SecretClipboard {
     /// Blocks for a moment. The clearing needs a tokio runtime; without one the secret stays.
     pub fn copy(&self, secret: &str) -> Result<(), String> {
         self.copy_then_clear(secret).map(drop)
+    }
+
+    /// Puts `text`, which is no secret (Paseo's host address), on the clipboard and leaves it
+    /// there. It waits for a clearing that runs, so the clearing cannot wipe it. A secret still
+    /// pending is no longer on the clipboard, so its clearing leaves the text alone.
+    pub fn copy_plain(&self, text: &str) -> Result<(), String> {
+        let _copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+        self.clipboard.write(text)
     }
 
     /// `copy`, with the task that clears the secret, so a test can wait for it.
@@ -340,6 +349,30 @@ mod tests {
         assert!(settled(&mut task).await);
         copy.join().unwrap();
         assert_eq!(board.inner.text().as_deref(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn plain_text_stays_and_no_clearing_wipes_it() {
+        let (board, clock, secret) = setup();
+        secret.copy_plain("ssh://instabox-dev-1").unwrap();
+        clock.advance(120);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some("ssh://instabox-dev-1"));
+        // Over a secret whose clearing is pending: the clearing and the quit leave it alone.
+        let (board, clock, secret) = setup();
+        let mut task = secret.copy_then_clear(ADDRESS).unwrap().unwrap();
+        clock.advance(30);
+        secret.copy_plain("ssh://instabox-dev-1").unwrap();
+        clock.advance(30);
+        assert!(settled(&mut task).await);
+        assert!(secret.clear_pending_within(QUIT_WAIT));
+        assert_eq!(board.text().as_deref(), Some("ssh://instabox-dev-1"));
+        assert_eq!(
+            *board.writes.lock().unwrap(),
+            [ADDRESS, "ssh://instabox-dev-1"],
+            "nothing cleared"
+        );
     }
 
     #[tokio::test]

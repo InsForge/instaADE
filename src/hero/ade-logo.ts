@@ -3,9 +3,10 @@ import t3Logo from '../assets/main-view/t3-logo.svg';
 import orcaLogo from '../assets/ade/orca.svg';
 import cmuxLogo from '../assets/ade/cmux.png';
 import paradevLogo from '../assets/ade/paradev.svg';
+import paseoLogo from '../assets/ade/paseo.svg';
 import herdrLogo from '../assets/ade/herdr.svg';
 
-const logoUrls: Partial<Record<Ade, string>> = { t3: t3Logo, orca: orcaLogo, cmux: cmuxLogo, paradev: paradevLogo, herdr: herdrLogo };
+const logoUrls: Partial<Record<Ade, string>> = { t3: t3Logo, orca: orcaLogo, cmux: cmuxLogo, paradev: paradevLogo, paseo: paseoLogo, herdr: herdrLogo };
 export const adeLogoUrl = (ade: Ade): string | undefined => logoUrls[ade];
 
 export type CubeLogo = { canvas: HTMLCanvasElement; pixels: Uint8ClampedArray; width: number; height: number };

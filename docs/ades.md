@@ -66,6 +66,28 @@ The address holds an SSH token, so InstaADE copies it, and opens Paradev's links
 
 Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
+## Paseo
+
+Paseo runs a daemon on every machine it works on, and its desktop app connects to that daemon. Over SSH, the app runs `ssh -W 127.0.0.1:6767 <host>` with your OpenSSH config, and it installs and starts nothing on the host. Paseo has no link that adds a host. So InstaADE runs the daemon on the sandbox and writes its host, and you add the host in Paseo once:
+
+1. **Install Paseo** wakes the sandbox. When the sandbox has no `paseo`, InstaADE installs the Paseo CLI at your app's version, with `npm install -g @getpaseo/cli@<version>`. The standard sandbox has Node.js and npm, and its global npm folder needs no sudo.
+2. It runs the daemon as the `paseo-instabox` service. The service runs `paseo daemon run` in a login shell, so the daemon finds Claude Code, Codex and the other agent CLIs on your PATH. The daemon listens on `127.0.0.1:6767` only, starts at boot and restarts when it fails. Once it answers, the sandbox gets `paseo` in its mark.
+3. InstaADE writes the sandbox as a host in `~/.ssh/instabox/config`, the same host as for [Orca](#orca), with the same `Include` line, token renewal and cleanup. Then it copies `ssh://instabox-<name>` and starts Paseo. The address holds no token: ssh reads the login from the host.
+4. In Paseo, open **Settings**, click **Add host**, then **Remote SSH**, paste the address and click **Connect**. Paseo keeps the host.
+
+**Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. It runs nothing on the sandbox. **Reconnect** runs the setup again, which starts a stopped daemon.
+
+InstaADE never updates or restarts a Paseo the sandbox already has: the daemon may be running agents, and Paseo's app and daemon work across versions. To update it, run `npm install -g @getpaseo/cli` on the sandbox, then `sudo systemctl restart paseo-instabox`.
+
+On Windows, InstaADE does not copy the address yet. Type it from the message InstaADE shows.
+
+Paseo reads the host, which holds an SSH token, so InstaADE starts only the real Paseo app:
+
+- On macOS, Paseo in `/Applications` or `~/Applications`. Its bundle identifier must be `sh.paseo.desktop`, and `codesign` must find it signed with Paseo's Developer ID (team `99ZMJMKU9Y`). InstaADE checks this when it looks for Paseo, again before it wakes, creates or marks a sandbox for Paseo, and again after the wake, right before it makes or loads the token.
+- On Windows, `Paseo.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Paseo` or `%ProgramFiles%\Paseo`). InstaADE starts it only when the file's version resource names the product Paseo and holds a version, read from the file each time. Paseo's Windows app is not signed, so there is no signature to check.
+
+Paseo has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+
 ## Herdr
 
 Herdr is a terminal workspace manager for coding agents, with no desktop app. It runs on the sandbox, and InstaADE opens it in your terminal over SSH. Nothing of Herdr runs on your computer, and no app gets an SSH token.

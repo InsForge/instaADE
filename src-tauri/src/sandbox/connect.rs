@@ -1,9 +1,10 @@
 //! Create a sandbox (or take an existing one), set an ADE up on it and mark it connected.
 //! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
-//! prep command, and the app opens its link afterwards. An SSH host ADE (Orca) gets only the
-//! mark, and the app writes its host afterwards. A host ADE (Paradev) is only checked: once
-//! its host runs, the sandbox is marked and gets its link. A terminal ADE (Herdr) is installed,
-//! and the app opens it in a terminal afterwards.
+//! prep command, and the app opens its link afterwards. An SSH host ADE gets its setup, if it
+//! has one (Paseo's daemon; Orca has none), then the mark, and the app writes its host
+//! afterwards. A host ADE (Paradev) is only checked: once its host runs, the sandbox is marked
+//! and gets its link. A terminal ADE (Herdr) is installed, and the app opens it in a terminal
+//! afterwards.
 
 use crate::ade::{Ade, Host, HostState, Open, SETUP_EXIT_BUSY};
 use crate::api::{
@@ -198,11 +199,14 @@ async fn install_and_pair(
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
     if let Open::Link(l) = ade.open() {
-        return prepare(client, ade, Some(l.prep), id, desktop_version, progress).await;
+        let prep = Some((l.prep.to_string(), PREP_TIMEOUT_SECS));
+        return prepare(client, ade, prep, id, desktop_version, progress).await;
     }
-    // An SSH host ADE (Orca) needs nothing on the sandbox: the app writes the host afterwards.
-    if let Open::SshHost(_) = ade.open() {
-        return prepare(client, ade, None, id, desktop_version, progress).await;
+    // An SSH host ADE needs nothing on the sandbox (Orca), or its server (Paseo's daemon): the
+    // app writes the host afterwards.
+    if let Open::SshHost(h) = ade.open() {
+        let setup = h.setup.map(|s| (s(desktop_version), SETUP_TIMEOUT_SECS));
+        return prepare(client, ade, setup, id, desktop_version, progress).await;
     }
     if let Open::Host(h) = ade.open() {
         return check_host(client, ade, h, id, progress).await;
@@ -275,30 +279,31 @@ async fn install_and_pair(
     })
 }
 
-/// Sets a link ADE up: one run of its prep command, if it has one, then the mark. Nothing is
-/// installed, so there is no version to compare and no link yet: the app makes it with an SSH
-/// token. An SSH host ADE (Orca) has no prep command: it only gets the mark.
+/// Sets a link ADE up: one run of its prep command, if it has one, then the mark. There is no
+/// version to compare and no link yet: the app makes it with an SSH token. An SSH host ADE gets
+/// the same: Orca has no command and only gets the mark, Paseo's setup installs and starts its
+/// daemon first. `prep` is the command with its timeout in seconds.
 async fn prepare(
     client: &Client,
     ade: Ade,
-    prep: Option<&str>,
+    prep: Option<(String, u32)>,
     id: &str,
     desktop_version: &str,
     progress: &impl Fn(Step),
 ) -> Result<Connected, SandboxError> {
     progress(Step::Installing(desktop_version.to_string()));
-    if let Some(prep) = prep {
+    if let Some((prep, secs)) = prep {
         let r = client
             .exec(
                 id,
                 &ExecRequest {
-                    cmd: prep.to_string(),
-                    timeout_seconds: Some(PREP_TIMEOUT_SECS),
+                    cmd: prep,
+                    timeout_seconds: Some(secs),
                 },
             )
             .await?;
         if r.timed_out || r.exit_code != 0 {
-            return Err(setup_failure(ade, &r, PREP_TIMEOUT_SECS));
+            return Err(setup_failure(ade, &r, secs));
         }
     }
     mark_connected(client, ade, id).await?;
@@ -1654,6 +1659,122 @@ mod tests {
         );
         let c = calls(&server).await;
         assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+    }
+
+    /// A running sandbox with `metadata`, whose exec answers Paseo's setup with `answer`.
+    async fn running_for_paseo(
+        server: &MockServer,
+        metadata: serde_json::Value,
+        answer: ResponseTemplate,
+    ) {
+        mock(
+            server,
+            "GET",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", metadata)),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .and(body_string_contains("@getpaseo/cli@"))
+            .respond_with(answer)
+            .expect(1)
+            .mount(server)
+            .await;
+        mock(
+            server,
+            "PATCH",
+            "/v1/machines/m1",
+            ResponseTemplate::new(200).set_body_json(machine("running", serde_json::json!({}))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn paseo_installs_its_daemon_then_adds_itself_to_the_mark() {
+        let server = MockServer::start().await;
+        running_for_paseo(
+            &server,
+            serde_json::json!({"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3,orca"}),
+            ok_setup(),
+        )
+        .await;
+        let steps = Mutex::new(Vec::new());
+        let out = connect_existing(&client(&server), Ade::Paseo, "m1", "0.17.4", |s| {
+            steps.lock().unwrap().push(s)
+        })
+        .await
+        .unwrap();
+        // No link: the app writes the host next. No version: the sandbox keeps the Paseo it has.
+        assert_eq!(
+            out,
+            Connected {
+                machine_id: "m1".into(),
+                link: None,
+                version: None,
+                update_pending: false,
+            }
+        );
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![Step::Installing("0.17.4".into()), Step::Done]
+        );
+        let reqs = server.received_requests().await.unwrap();
+        // One exec, the setup at the desktop version with the long timeout, then the mark. No
+        // port is published: Paseo reaches the daemon over SSH.
+        let execs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1);
+        let setup: serde_json::Value = serde_json::from_slice(&execs[0].body).unwrap();
+        assert_eq!(setup["cmd"], crate::ade::paseo::setup_script("0.17.4"));
+        assert_eq!(setup["timeoutSeconds"], SETUP_TIMEOUT_SECS);
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/ports")));
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"metadata": {"a": "1", "instabox-bridge": "t3", "instabox-ades": "t3,orca,paseo"}})
+        );
+        let setup_at = reqs
+            .iter()
+            .position(|r| r.url.path().ends_with("/exec"))
+            .unwrap();
+        let patch_at = reqs
+            .iter()
+            .position(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        assert!(setup_at < patch_at, "the mark goes last");
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_timed_out_paseo_setup_leaves_no_mark() {
+        for (answer, tail) in [
+            (
+                exec_answer(1, "Paseo needs Node.js and npm on the sandbox", false),
+                "Paseo needs Node.js and npm on the sandbox".to_string(),
+            ),
+            (
+                exec_answer(-1, "", true),
+                format!("Timed out after {SETUP_TIMEOUT_SECS} s"),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            running_for_paseo(&server, serde_json::json!({}), answer).await;
+            let e = connect_existing(&client(&server), Ade::Paseo, "m1", "0.17.4", |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(
+                e,
+                SandboxError::Setup {
+                    ade: Ade::Paseo,
+                    stderr_tail: tail
+                }
+            );
+            let c = calls(&server).await;
+            assert!(!c.iter().any(|x| x.starts_with("PATCH")), "{c:?}");
+        }
     }
 
     /// A running sandbox with `metadata`, whose exec answers Herdr's setup with `stdout`,

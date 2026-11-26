@@ -12,6 +12,7 @@ export const ADES: { id: Ade; name: string }[] = [
   { id: "cmux", name: "cmux" },
   { id: "orca", name: "Orca" },
   { id: "paradev", name: "Paradev" },
+  { id: "paseo", name: "Paseo" },
   { id: "herdr", name: "Herdr" },
 ];
 

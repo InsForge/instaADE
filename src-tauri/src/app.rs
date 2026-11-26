@@ -36,8 +36,8 @@ use crate::ssh_config;
 use crate::updater::UpdateView;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
-/// A sandbox with an InstaADE SSH host (Orca) gets a new token once the stored one has fewer days
-/// left than this, so the host keeps working without a click.
+/// A sandbox with an InstaADE SSH host (Orca, Paseo) gets a new token once the stored one has
+/// fewer days left than this, so the host keeps working without a click.
 const HOST_TOKEN_RENEW_DAYS: i64 = 7;
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
@@ -794,7 +794,8 @@ fn not_signed_in() -> ErrorView {
 type Res<T> = Result<T, ErrorView>;
 
 /// What the user does next in an ADE's app after an action opened it, when opening it does not
-/// finish the job (Orca: connect the host InstaADE wrote). None for every other ADE.
+/// finish the job (Orca: connect the host InstaADE wrote; Paseo: add it once). None for every
+/// other ADE.
 pub type Notice = Option<String>;
 
 /// The ids of every sandbox in an account's whole machine list.
@@ -1321,7 +1322,7 @@ impl Core {
         }
     }
 
-    /// `refresh` and its syncs. A full one also finds the SSH hosts (Orca) whose sandbox the
+    /// `refresh` and its syncs. A full one also finds the SSH hosts (Orca, Paseo) whose sandbox the
     /// account's whole machine list no longer has. Only hosts written before the list was read
     /// count: one written since may be of a sandbox made after it. None when the list failed,
     /// was not whole, or the account changed.
@@ -1362,7 +1363,7 @@ impl Core {
             .push(line);
     }
 
-    /// Keeps every SSH host InstaADE wrote (Orca) working without a click. For each sandbox
+    /// Keeps every SSH host InstaADE wrote (Orca, Paseo) working without a click. For each sandbox
     /// with a host, a stored token with fewer than 7 days left, or none, is renewed the way
     /// `ssh::token` makes one, and the token store rewrites the host's `User` as it saves it.
     /// A token with 7 days or more is left alone. Tokens are made over the API only, so no
@@ -1653,10 +1654,10 @@ impl Core {
     /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
     /// installed (never an older version) and paired, then its app opens with the pairing
     /// link; a link ADE (cmux) gets its prep command, then its link opens; an SSH host ADE
-    /// (Orca) gets its host written and its app started. A host ADE (Paradev) is checked:
-    /// once its host runs, the sandbox is marked and opens in it; else the user sets the host
-    /// up in the app (`open_host`). A terminal ADE (Herdr) is installed, then opens in a
-    /// terminal (`open_terminal`).
+    /// (Orca, Paseo) gets its setup (Paseo's daemon), then its host written and its app started.
+    /// A host ADE (Paradev) is checked: once its host runs, the sandbox is marked and opens in
+    /// it; else the user sets the host up in the app (`open_host`). A terminal ADE (Herdr) is
+    /// installed, then opens in a terminal (`open_terminal`).
     pub async fn connect_sandbox(self: &Arc<Self>, id: &str, ade: Option<Ade>) -> Res<Notice> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
@@ -1690,7 +1691,8 @@ impl Core {
     /// so the app gets the sandbox back even when it lost it. No link when the sync left a setup
     /// that would refuse the pairing (`sync_before_pairing`). A link ADE (cmux) on a sandbox
     /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
-    /// host ADE (Orca) on a sandbox marked with it: wake it, write its host and start the app.
+    /// host ADE (Orca, Paseo) on a sandbox marked with it: wake it, write its host and start the
+    /// app.
     /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
     /// its link. A terminal ADE (Herdr) on a sandbox marked with it: `open_terminal`. Anything
     /// else goes through the connect flow.
@@ -1760,10 +1762,11 @@ impl Core {
     /// The token comes from `ssh::token`: the stored one while it has more than a day left,
     /// else a new 30-day one.
     ///
-    /// An SSH host ADE (Orca) goes the same way. It checks the app, wakes the sandbox, checks
-    /// the app again (the wake can take minutes), makes or loads the token, writes it into the
-    /// sandbox's host in the user's SSH config, starts the app that passed the last check and
-    /// returns what the user does next there.
+    /// An SSH host ADE (Orca, Paseo) goes the same way. It checks the app, wakes the sandbox,
+    /// checks the app again (the wake can take minutes), makes or loads the token, writes it into
+    /// the sandbox's host in the user's SSH config, copies the host's address for an app that
+    /// adds hosts by it (Paseo), starts the app that passed the last check and returns what the
+    /// user does next there.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let open = ade.open();
         if let Open::Pair(_) = open {
@@ -1825,6 +1828,9 @@ impl Core {
                         "Could not add the sandbox to your SSH config: {e:#}"
                     ))
                 })?;
+                if let Some(address) = h.address {
+                    self.copy_address(ade, address(&alias)).await;
+                }
                 self.open_with(account, &app.to_string_lossy(), None)?;
                 Ok(Some((h.notice)(&alias)))
             }
@@ -1834,7 +1840,25 @@ impl Core {
         }
     }
 
-    /// The ADE's app on this computer, found and checked now (cmux, Orca and Paradev: its
+    /// Copies the address the user adds an SSH host by in `ade`'s app (Paseo's `ssh://<alias>`).
+    /// It holds no token, so it stays on the clipboard. The notice names it too, so a copy that
+    /// fails (no clipboard here yet, as on Windows) is only logged.
+    async fn copy_address(self: &Arc<Self>, ade: Ade, address: String) {
+        // pbcopy blocks for a moment, so off the async runtime.
+        let core = self.clone();
+        let copied = tokio::task::spawn_blocking(move || core.clipboard.copy_plain(&address))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+        if let Err(e) = copied {
+            self.log(format!(
+                "{}: the host address was not copied: {e}",
+                ade.name()
+            ));
+        }
+    }
+
+    /// The ADE's app on this computer, found and checked now (cmux, Orca, Paradev, Paseo: its
     /// identifier and signature), never the version found earlier. An error when there is no app or it fails
     /// the check.
     async fn checked_app(&self, ade: Ade) -> Res<PathBuf> {
@@ -1858,7 +1882,7 @@ impl Core {
         }
     }
 
-    /// For an ADE whose app reaches the sandbox over SSH (cmux, Orca, Paradev), the app is
+    /// For an ADE whose app reaches the sandbox over SSH (cmux, Orca, Paradev, Paseo), the app is
     /// checked before the sandbox is touched: with no app, or one that fails the check, nothing
     /// wakes, is created or is marked. `open_link` and `open_host` check it again right before
     /// the token. For a terminal ADE (Herdr), the OpenSSH client is looked for the same way.
@@ -2223,8 +2247,8 @@ impl Core {
                 i.rebuild();
             });
             self.forget(id, account).await;
-            // Its SSH host (Orca) goes too. The delete itself succeeded, so a failure here is
-            // only logged; the next full refresh removes a host whose sandbox is not listed.
+            // Its SSH host (Orca, Paseo) goes too. The delete itself succeeded, so a failure
+            // here is only logged; the next full refresh removes a host whose sandbox is not listed.
             let (home, gone) = (self.home.clone(), id.to_string());
             match tokio::task::spawn_blocking(move || ssh_config::remove_host(&home, &gone)).await {
                 Ok(Ok(_)) => {}
@@ -3117,6 +3141,7 @@ mod tests {
                     AdeView::new(Ade::Cmux, None),
                     AdeView::new(Ade::Orca, None),
                     AdeView::new(Ade::Paradev, None),
+                    AdeView::new(Ade::Paseo, None),
                     AdeView::new(Ade::Herdr, None)
                 ]
             );
@@ -3127,6 +3152,7 @@ mod tests {
                 vec![
                     AdeView::new(Ade::T3, None),
                     AdeView::new(Ade::Orca, None),
+                    AdeView::new(Ade::Paseo, None),
                     AdeView::new(Ade::Herdr, None)
                 ]
             );
@@ -6502,6 +6528,259 @@ mod tests {
         let r = requests(&server).await;
         assert!(r.is_empty(), "no prep, no mark: {r:?}");
         assert!(opened.lock().unwrap().is_empty());
+    }
+
+    // ---- Paseo: an SSH host the user adds by its address, to a daemon InstaADE runs ----
+
+    /// A signed-in core like `orca_core`, with a Paseo.app as `here` says, Paseo 0.17.4 found
+    /// earlier, and a clipboard that records what was copied (or refuses every copy, as there
+    /// is no clipboard on Windows yet).
+    struct PaseoCore {
+        core: Arc<Core>,
+        opened: Arc<Mutex<Vec<String>>>,
+        copied: Arc<Mutex<Vec<String>>>,
+        app: PathBuf,
+        home: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A clipboard that takes nothing.
+    struct NoClipboard;
+
+    impl crate::clipboard::Clipboard for NoClipboard {
+        fn read(&self) -> Option<String> {
+            None
+        }
+        fn write(&self, _: &str) -> Result<(), String> {
+            Err("Copying to the clipboard is only on macOS for now".to_string())
+        }
+    }
+
+    fn paseo_core(base: &Url, here: OrcaHere, clipboard: bool) -> PaseoCore {
+        let dir = tempfile::tempdir().unwrap();
+        let app = ade::paseo::test_bundle(dir.path(), ade::paseo::BUNDLE_ID, "0.17.4");
+        let home = tempfile::tempdir().unwrap();
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(ssh_config::SyncedStore::new(
+                MemorySshStore::default(),
+                home.path().to_path_buf(),
+            )),
+            home.path().to_path_buf(),
+        );
+        let copied = Arc::new(Mutex::new(Vec::<String>::new()));
+        let board: Arc<dyn crate::clipboard::Clipboard> = if clipboard {
+            Arc::new(RecordingClipboard(copied.clone()))
+        } else {
+            Arc::new(NoClipboard)
+        };
+        let found = app.clone();
+        let core = Arc::new(
+            core.with_apps(
+                Arc::new(move |ade| {
+                    (here != OrcaHere::Missing && ade == Ade::Paseo).then(|| found.clone())
+                }),
+                Arc::new(move |ade, path| {
+                    ade == Ade::Paseo
+                        && ade::paseo::verify_with(path, |_| here != OrcaHere::BadSignature)
+                }),
+            )
+            .with_clipboard(SecretClipboard::new(
+                board,
+                Arc::new(|_| Box::pin(std::future::pending())),
+            )),
+        );
+        sign_in_as(&core, base, 7);
+        core.update(|i| i.state.set_desktop(Ade::Paseo, Some("0.17.4".into())));
+        PaseoCore {
+            core,
+            opened,
+            copied,
+            app,
+            home,
+            _dir: dir,
+        }
+    }
+
+    const PASEO_NOTICE: &str = "In Paseo, add this sandbox once: open Settings, click Add host, \
+                                then Remote SSH, and enter ssh://instabox-dev-1.";
+
+    /// The commands the sandbox ran.
+    async fn exec_cmds(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/exec"))
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["cmd"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn installing_paseo_sets_up_its_daemon_then_writes_the_host_and_copies_its_address() {
+        let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        p.core.refresh(false).await;
+        let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        // The setup at the desktop's version, then the mark, then the host and the app.
+        assert_eq!(
+            exec_cmds(&server).await,
+            [ade::paseo::setup_script("0.17.4")]
+        );
+        let r = requests(&server).await;
+        let exec = r.iter().position(|x| x.ends_with("/exec")).unwrap();
+        let patch = r.iter().position(|x| x.starts_with("PATCH")).unwrap();
+        let token = r.iter().position(|x| x.ends_with("/ssh-tokens")).unwrap();
+        assert!(exec < patch && patch < token, "{r:?}");
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.method.as_str() == "PATCH")
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(body["metadata"]["instabox-bridge"], "t3");
+        assert_eq!(body["metadata"]["instabox-ades"], "t3,paseo");
+        assert!(
+            hosts_of(p.home.path()).contains(
+                "# instabox-sandbox m1\nHost instabox-dev-1\n  HostName ssh.example.test\n  \
+                 Port 2222\n  User ibssh_new\n"
+            ),
+            "{}",
+            hosts_of(p.home.path())
+        );
+        // The address holds no token: ssh takes the login from the host.
+        assert_eq!(*p.copied.lock().unwrap(), ["ssh://instabox-dev-1"]);
+        assert_eq!(*p.opened.lock().unwrap(), [p.app.display().to_string()]);
+        let s = p.core.state();
+        assert_eq!((s.progress, s.error), (None, None));
+        // Paseo pairs nothing, so the sandbox does not join the T3 pairings from here.
+        assert!(!p.core.lock().data.connected.contains("m1"));
+    }
+
+    #[tokio::test]
+    async fn open_in_paseo_runs_nothing_on_the_sandbox_and_copies_the_address_again() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        p.core.refresh(false).await;
+        for _ in 0..2 {
+            let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+            assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        }
+        assert!(
+            exec_cmds(&server).await.is_empty(),
+            "the daemon runs already"
+        );
+        let r = requests(&server).await;
+        assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
+        assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        assert!(hosts_of(p.home.path()).contains("Host instabox-dev-1\n"));
+        assert_eq!(
+            *p.copied.lock().unwrap(),
+            ["ssh://instabox-dev-1", "ssh://instabox-dev-1"]
+        );
+        assert_eq!(p.opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_new_sandbox_in_paseo_mode_gets_the_daemon_the_host_and_the_notice() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        let notice = p
+            .core
+            .create_sandbox(CreateArgs {
+                name: "dev 1".into(),
+                snapshot_id: None,
+                vcpus: 2,
+                mem_mib: 4096,
+                auto_suspend_after_seconds: Some(1800),
+                ade: Some(Ade::Paseo),
+            })
+            .await
+            .unwrap();
+        assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        assert_eq!(
+            exec_cmds(&server).await,
+            [ade::paseo::setup_script("0.17.4")]
+        );
+        assert!(hosts_of(p.home.path()).contains("Host instabox-dev-1\n"));
+        assert_eq!(*p.copied.lock().unwrap(), ["ssh://instabox-dev-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_fails_is_logged_and_paseo_still_opens() {
+        let (_server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        let p = paseo_core(&base, OrcaHere::Real, false);
+        p.core.refresh(false).await;
+        let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        // The notice names the address, so the user can type it.
+        assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        assert_eq!(*p.opened.lock().unwrap(), [p.app.display().to_string()]);
+        assert_eq!(p.core.state().error, None);
+        let logs = p.core.logs.lock().unwrap().clone();
+        assert!(
+            logs.contains(
+                &"Paseo: the host address was not copied: Copying to the clipboard is only on \
+                  macOS for now"
+                    .to_string()
+            ),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paseo_gets_no_setup_host_token_or_copy_without_its_verified_app() {
+        for (here, message) in [
+            (
+                OrcaHere::Missing,
+                "Paseo is not installed. Install it first.",
+            ),
+            (
+                OrcaHere::BadSignature,
+                "Could not verify the Paseo app. Install it again from its official download.",
+            ),
+        ] {
+            for metadata in [
+                serde_json::json!({}),
+                serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}),
+            ] {
+                let (server, base) = cmux_server(metadata).await;
+                let p = paseo_core(&base, here, true);
+                p.core.refresh(false).await;
+                let before = requests(&server).await.len();
+                let e = p
+                    .core
+                    .open_in_ade("m1", Some(Ade::Paseo))
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.message, message);
+                let r = requests(&server).await;
+                assert!(
+                    !r[before..].iter().any(|x| x.ends_with("/exec")
+                        || x.ends_with("/ssh-tokens")
+                        || x.starts_with("PATCH")),
+                    "nothing set up, marked or minted: {r:?}"
+                );
+                assert!(p.opened.lock().unwrap().is_empty(), "nothing started");
+                assert!(p.copied.lock().unwrap().is_empty(), "nothing copied");
+                assert!(
+                    !p.home.path().join(".ssh").exists(),
+                    "no SSH config written"
+                );
+            }
+        }
     }
 
     // ---- a host that cannot take a new token ----
