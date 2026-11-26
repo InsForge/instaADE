@@ -495,20 +495,25 @@ pub fn newest_app(
     found.into_iter().map(|(_, p)| p).find(|p| verify(p))
 }
 
-/// How an app's version sorts: its numbers, then a release after its pre-releases. So
-/// `2.0.12` > `2.0.11`, `0.65.2.2` > `0.65.2` and `2.1.0` > `2.1.0-beta.1`. None when its numbers
-/// are not all digits.
-fn version_order(v: &str) -> Option<(Vec<u64>, bool)> {
+/// How an app's version sorts, by semver precedence: its numbers, then its pre-release as
+/// `semver::Prerelease` orders it (numeric identifiers as numbers, others as text, a release
+/// after its pre-releases). So `2.0.12` > `2.0.11`, `0.65.2.2` > `0.65.2` (cmux has four numbers),
+/// `2.1.0-beta.10` > `2.1.0-beta.2` and `2.1.0` > `2.1.0-rc.1`. Build metadata does not count.
+/// None when the numbers are not all digits or the pre-release is not valid semver.
+fn version_order(v: &str) -> Option<(Vec<u64>, semver::Prerelease)> {
     let v = v.split('+').next().unwrap_or_default();
-    let (numbers, release) = match v.split_once('-') {
-        Some((n, _)) => (n, false),
-        None => (v, true),
+    let (numbers, pre) = match v.split_once('-') {
+        Some((n, p)) => (
+            n,
+            semver::Prerelease::new(p).ok().filter(|p| !p.is_empty())?,
+        ),
+        None => (v, semver::Prerelease::EMPTY),
     };
     let numbers = numbers
         .split('.')
         .map(|n| n.parse().ok())
         .collect::<Option<Vec<u64>>>()?;
-    Some((numbers, release))
+    Some((numbers, pre))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -865,17 +870,36 @@ mod tests {
     }
 
     #[test]
-    fn versions_sort_by_their_numbers_then_a_release_after_its_pre_releases() {
-        let order = |v: &str| version_order(v);
+    fn versions_sort_by_semver_precedence() {
+        let order = |v: &str| version_order(v).unwrap_or_else(|| panic!("{v} reads"));
         assert!(order("2.0.12") > order("2.0.11"));
         assert!(order("2.0.10") > order("2.0.9"), "numbers, not text");
         assert!(order("0.65.2.2") > order("0.65.2"));
         assert!(order("2.1.0") > order("2.1.0-beta.1"));
+        assert!(order("2.1.0") > order("2.1.0-rc.1"));
         assert!(order("2.1.0-beta.1") > order("2.0.12"));
+        // The whole pre-release counts: its numbers as numbers, its words as text.
+        assert!(order("2.1.0-beta.2") > order("2.1.0-beta.1"));
+        assert!(order("2.1.0-beta.10") > order("2.1.0-beta.2"));
+        assert!(order("2.1.0-rc.1") > order("2.1.0-beta.10"));
+        assert!(order("2.1.0-beta.1.1") > order("2.1.0-beta.1"));
         assert_eq!(order("1.4.269+build.7"), order("1.4.269"));
-        for bad in ["", "abc", "1..2", "1.x", "v1.0"] {
-            assert_eq!(order(bad), None, "{bad}");
+        // What does not read is None, without a panic, and sorts after every version that reads.
+        for bad in [
+            "",
+            "abc",
+            "1..2",
+            "1.x",
+            "v1.0",
+            "2.1.0-",
+            "2.1.0-beta..1",
+            "2.1.0-beta.01",
+            "-1",
+            "2.1.0-ü",
+        ] {
+            assert_eq!(version_order(bad), None, "{bad}");
         }
+        assert!(Some(order("0.0.1-a")) > version_order("2.1.0-beta..1"));
     }
 
     #[test]
@@ -905,6 +929,20 @@ mod tests {
         assert_eq!(newest_app(all(), v, any), Some(a.clone()));
         assert_eq!(newest_app([c.clone(), b.clone()], v, any), Some(b.clone()));
         assert_eq!(newest_app([c.clone()], v, any), Some(c.clone()));
+        // Pre-releases: the newer one wins wherever it is in the list.
+        let v = versions(&[
+            ("/a", "2.1.0-beta.1"),
+            ("/b", "2.1.0-beta.2"),
+            ("/c", "2.1.0-rc.1"),
+        ]);
+        assert_eq!(newest_app([a.clone(), b.clone()], v, any), Some(b.clone()));
+        assert_eq!(newest_app(all(), v, any), Some(c.clone()));
+        let v = versions(&[("/a", "2.1.0-beta.2"), ("/b", "2.1.0-beta.10")]);
+        assert_eq!(newest_app(all(), v, any), Some(b.clone()));
+        // A version that does not read neither panics nor wins.
+        let v = versions(&[("/a", "2.1.0-beta..1"), ("/b", "x"), ("/c", "0.0.1")]);
+        assert_eq!(newest_app(all(), v, any), Some(c.clone()));
+        assert_eq!(newest_app([a.clone(), b.clone()], v, any), Some(a.clone()));
         // The newest is checked first, and the check stops at the first that passes.
         let checked = std::cell::RefCell::new(Vec::new());
         let v = versions(&[("/a", "1.0.0"), ("/b", "3.0.0"), ("/c", "2.0.0")]);

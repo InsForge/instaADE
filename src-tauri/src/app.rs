@@ -4954,8 +4954,10 @@ mod tests {
         assert!(!core.lock().data.connected.contains("m1"));
     }
 
-    /// A Mac with the old Superset.app 2.0.11 and the new Paradev.app 2.0.12: the links open in
-    /// Paradev.app, the newest, never in Superset.app or whatever handles superset:// links.
+    /// A Mac with the old Superset.app 2.0.11 and the new Paradev.app 2.0.12: the version shown
+    /// is Paradev.app's, and the links open in it, never in Superset.app or whatever handles
+    /// superset:// links. Both bundles are fakes in a temporary folder, and the lookup and the
+    /// version shown come from there, not from this computer's Applications.
     #[tokio::test]
     async fn paradev_opens_in_the_newest_of_superset_app_and_paradev_app() {
         let (_server, base) =
@@ -4982,9 +4984,15 @@ mod tests {
             Arc::new(move |ade, path| ade == Ade::Paradev && real(path)),
         ));
         sign_in_as(&core, &base, 7);
+        // What the app's detection shows: the version of the bundle the lookup found. Set here,
+        // so nothing looks at this computer's Applications.
+        let found = (core.locate)(Ade::Paradev).unwrap();
+        let shown = ade::paradev::version(&found).unwrap();
+        core.update(|i| i.state.set_desktop(Ade::Paradev, Some(shown)));
         core.refresh(false).await;
         let r = core.connect_sandbox("m1", Some(Ade::Paradev)).await;
         assert_eq!(r, Ok(None));
+        assert_eq!(core.state().desktop(Ade::Paradev), Some("2.0.12"));
         assert_eq!(
             *opened.lock().unwrap(),
             [format!("{PARADEV_LINK} in {}", new.display())]
