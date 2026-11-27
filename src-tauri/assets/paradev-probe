@@ -19,6 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+START = time.monotonic()
+
 # Paradev's lifecycle events (host-service events/map-event-type.ts). These wait on a person
 # or end a turn, so they are idle. Every other event is busy: "Start" (a turn in progress),
 # "Attached" (an agent that is starting) and any event this probe does not know.
@@ -26,14 +28,14 @@ IDLE_EVENTS = {"PermissionRequest": "waiting", "Stop": "done", "Failed": "failed
 BUSY_LABELS = {"Start": "working", "Attached": "starting"}
 
 # A busy event counts only while it is this recent (ms). After that the agent is "stale",
-# which is idle.
+# which is idle, and so is an agent whose event has no time.
 # - "Attached" is an agent's launch. One launched with a prompt starts its turn within seconds;
 #   one still at "Attached" after this waits for its first prompt.
 STARTING_MS = 5 * 60_000
 # - A terminal agent reports through hooks, and some ends fire none: Claude Code fires no Stop
 #   hook on an interrupt, so a "Start" can outlive its turn. A working agent fires a hook after
 #   every tool call (Claude Code's longest shell call is 10 minutes by default), and the hooks
-#   of its subagents count too.
+#   of its running subagents count too.
 TERMINAL_MS = 30 * 60_000
 # - A chat agent's state comes from Paradev's chat runtime, interrupts included, but is stamped
 #   only when it changes, so its time is the start of the turn. This only bounds a stuck one.
@@ -41,7 +43,8 @@ CHAT_MS = 6 * 60 * 60_000
 
 APP_DIRS = (".paradev", ".superset")  # .superset: Paradev's folder before the rename
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
-TIMEOUT = 2  # seconds for each host; the probe has 5
+TIMEOUT = 2  # seconds for one host at most
+DEADLINE = 4  # seconds for all hosts: the guest agent stops the probe at 5
 MAX_BODY = 8 << 20
 
 secrets = []  # the tokens read, kept out of anything the probe prints
@@ -87,7 +90,14 @@ def alive(pid):
     return True
 
 
-def agents_of(manifest):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: urllib would send the token on to the new address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def agents_of(manifest, timeout):
     """The host's live agents, or None when nothing listens at its endpoint."""
     endpoint, token = manifest.get("endpoint"), manifest.get("authToken")
     if not isinstance(endpoint, str) or not isinstance(token, str) or not token:
@@ -99,10 +109,10 @@ def agents_of(manifest):
         endpoint.rstrip("/") + "/trpc/terminalAgents.list",
         headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
     )
-    # No proxy: the token goes to the loopback endpoint only.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # No proxy and no redirect: the token goes to the loopback endpoint only.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
     try:
-        with opener.open(req, timeout=TIMEOUT) as r:
+        with opener.open(req, timeout=timeout) as r:
             body = json.loads(r.read(MAX_BODY))
     except urllib.error.URLError as e:
         if isinstance(e.reason, ConnectionRefusedError):
@@ -119,20 +129,41 @@ def agents_of(manifest):
 
 
 def stamp(value):
+    """An event time in ms, or None when it is missing or not a number."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("agent without lastEventAt")
+        return None
     return int(value)
+
+
+def subagent_times(agent):
+    """When each running subagent was last heard from. Paradev drops a subagent it has not
+    heard from in 10 minutes."""
+    subs = agent.get("subagents")
+    if not isinstance(subs, list):
+        return []
+    running = [s for s in subs if isinstance(s, dict) and s.get("endedAt") is None]
+    return [t for t in (stamp(s.get("lastEventAt")) for s in running) if t is not None]
+
+
+def times(agent):
+    """Every event time of the agent: its own and its running subagents'."""
+    own = stamp(agent.get("lastEventAt"))
+    return ([own] if own is not None else []) + subagent_times(agent)
 
 
 def label(agent, now):
     """What the agent does: a label, and whether that is busy."""
     event = agent.get("lastEventType")
     if event in IDLE_EVENTS:
+        # A subagent can run on after its agent's turn ended (one sent to the background).
+        subs = subagent_times(agent)
+        if subs and now - max(subs) < TERMINAL_MS:
+            return "subagent", True
         return IDLE_EVENTS[event], False
-    last = stamp(agent.get("lastEventAt"))
-    for sub in agent.get("subagents") or []:
-        if isinstance(sub, dict) and sub.get("endedAt") is None:
-            last = max(last, stamp(sub.get("lastEventAt")))
+    heard = times(agent)
+    if not heard:
+        return "stale", False
+    last = max(heard)
     if event == "Attached":
         limit = STARTING_MS
     elif agent.get("chatSessionId"):
@@ -145,7 +176,7 @@ def label(agent, now):
 
 
 def tally(labels):
-    order = ("working", "starting", "other", "waiting", "done", "failed", "stale")
+    order = ("working", "starting", "subagent", "other", "waiting", "done", "failed", "stale")
     return ", ".join(f"{labels.count(k)} {k}" for k in order if k in labels)
 
 
@@ -158,8 +189,12 @@ def main():
     for m in found:
         if not alive(m.get("pid")):
             continue
+        left = DEADLINE - (time.monotonic() - START)
+        if left < 0.1:
+            errors.append(TimeoutError("no time left to ask another paradev host"))
+            continue
         try:
-            listed = agents_of(m)
+            listed = agents_of(m, min(TIMEOUT, left))
         except Exception as e:  # noqa: BLE001: one host's failure, raised below if it matters
             errors.append(e)
             continue
@@ -171,7 +206,7 @@ def main():
     names = [n for n, _ in labels]
     # Changes whenever an agent's state does: a turn that starts and ends between two
     # readings still moves it.
-    seq = max((stamp(a.get("lastEventAt")) for a in agents), default=0)
+    seq = max((t for a in agents for t in times(a)), default=0)
     busy = sum(1 for _, b in labels if b)
     if busy:
         say(True, f"{busy} agent{'s' if busy != 1 else ''} busy ({tally(names)})", seq)

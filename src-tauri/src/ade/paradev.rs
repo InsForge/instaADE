@@ -702,11 +702,12 @@ exec "$@"
 
     /// A stand-in for Paradev's host service: it answers every request with `answer` when the
     /// request carries `TOKEN`, else with 401 as the host does, and records each request in
-    /// `seen`.
+    /// `seen`. With `redirect` set, it answers every request with a redirect there instead.
     #[cfg(unix)]
     struct FakeHost {
         port: u16,
         answer: std::sync::Arc<std::sync::Mutex<String>>,
+        redirect: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         seen: Requests,
     }
 
@@ -718,8 +719,9 @@ exec "$@"
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let answer = Arc::new(Mutex::new(String::new()));
+            let redirect = Arc::new(Mutex::new(None::<String>));
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let (a, s) = (answer.clone(), seen.clone());
+            let (a, r, s) = (answer.clone(), redirect.clone(), seen.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
@@ -740,6 +742,13 @@ exec "$@"
                     }
                     let ok = auth.as_deref() == Some(format!("Bearer {TOKEN}").as_str());
                     s.lock().unwrap().push((line.trim_end().to_string(), auth));
+                    if let Some(to) = r.lock().unwrap().clone() {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
                     let (status, body) = if ok {
                         ("200 OK", a.lock().unwrap().clone())
                     } else {
@@ -756,7 +765,12 @@ exec "$@"
                     );
                 }
             });
-            FakeHost { port, answer, seen }
+            FakeHost {
+                port,
+                answer,
+                redirect,
+                seen,
+            }
         }
 
         /// Answers `terminalAgents.list` with `agents`, in the host's superjson envelope.
@@ -773,19 +787,23 @@ exec "$@"
     /// Writes the manifest Paradev's host writes at every start, under `home`.
     #[cfg(unix)]
     fn manifest(home: &Path, dir: &str, endpoint: &str, token: &str, pid: u32) {
-        let org = home
-            .join(dir)
-            .join("host")
-            .join("2f8e0c1a-4b7d-4e9a-9c3f-5d6b7a8e9f01");
-        std::fs::create_dir_all(&org).unwrap();
+        let org = "2f8e0c1a-4b7d-4e9a-9c3f-5d6b7a8e9f01";
+        manifest_of(home, dir, org, endpoint, token, pid);
+    }
+
+    /// `manifest`, of the org `org`.
+    #[cfg(unix)]
+    fn manifest_of(home: &Path, dir: &str, org: &str, endpoint: &str, token: &str, pid: u32) {
+        let path = home.join(dir).join("host").join(org);
+        std::fs::create_dir_all(&path).unwrap();
         let m = serde_json::json!({
             "pid": pid,
             "endpoint": endpoint,
             "authToken": token,
             "startedAt": 1_764_000_000_000_u64,
-            "organizationId": "2f8e0c1a-4b7d-4e9a-9c3f-5d6b7a8e9f01",
+            "organizationId": org,
         });
-        std::fs::write(org.join("manifest.json"), m.to_string()).unwrap();
+        std::fs::write(path.join("manifest.json"), m.to_string()).unwrap();
     }
 
     /// Runs the probe as instabox-guest-agent does: python3 with a cleared environment, in the
@@ -980,6 +998,46 @@ exec "$@"
         parent["subagents"] = serde_json::json!([sub(35 * MINUTE, false)]);
         assert!(!verdict(serde_json::json!([parent])).unwrap().0);
 
+        // A running subagent keeps an agent busy after its own turn ended (one sent to the
+        // background), or while it waits on the user; an ended one does not.
+        for (event, idle) in [
+            ("Stop", "done"),
+            ("PermissionRequest", "waiting"),
+            ("Failed", "failed"),
+        ] {
+            let mut a = agent(event, 10 * MINUTE);
+            a["subagents"] = serde_json::json!([sub(MINUTE, false), sub(2 * MINUTE, true)]);
+            assert_eq!(
+                verdict(serde_json::json!([a.clone()])).unwrap(),
+                (true, "1 agent busy (1 subagent)".to_string()),
+                "{event}"
+            );
+            a["subagents"] = serde_json::json!([sub(MINUTE, true)]);
+            assert_eq!(
+                verdict(serde_json::json!([a.clone()])).unwrap(),
+                (false, format!("no busy agents (1 {idle})")),
+                "{event}"
+            );
+            a["subagents"] = serde_json::json!([sub(31 * MINUTE, false)]);
+            assert!(!verdict(serde_json::json!([a])).unwrap().0, "{event}");
+        }
+
+        // An agent with no event time cannot be aged: it is stale, and the others still count.
+        let mut untimed = agent("Start", 1_000);
+        untimed["lastEventAt"] = serde_json::Value::Null;
+        assert_eq!(
+            verdict(serde_json::json!([untimed.clone()])).unwrap(),
+            (false, "no busy agents (1 stale)".to_string())
+        );
+        untimed["lastEventAt"] = "yesterday".into();
+        assert_eq!(
+            verdict(serde_json::json!([untimed.clone(), agent("Start", 1_000)])).unwrap(),
+            (true, "1 agent busy (1 working, 1 stale)".to_string())
+        );
+        // A running subagent's time is enough to age it.
+        untimed["subagents"] = serde_json::json!([sub(MINUTE, false)]);
+        assert!(verdict(serde_json::json!([untimed])).unwrap().0);
+
         // An ended agent does not count.
         let mut ended = agent("Start", 1_000);
         ended["endedAt"] = now_ms().into();
@@ -1045,8 +1103,21 @@ exec "$@"
         // Busy answers carry it too.
         let busy = agent("Start", 500);
         assert_eq!(
-            seq(serde_json::json!([a, busy.clone()])),
+            seq(serde_json::json!([a.clone(), busy.clone()])),
             busy["lastEventAt"].as_i64()
+        );
+        // A running subagent's hook moves it as well; an ended one's does not.
+        let at = now_ms() - 200;
+        let mut parent = agent("Start", 5 * MINUTE);
+        parent["subagents"] = serde_json::json!([{"id": "s", "startedAt": at, "lastEventAt": at}]);
+        assert_eq!(
+            seq(serde_json::json!([a.clone(), parent.clone()])),
+            Some(at)
+        );
+        parent["subagents"][0]["endedAt"] = at.into();
+        assert_eq!(
+            seq(serde_json::json!([parent.clone()])),
+            parent["lastEventAt"].as_i64()
         );
     }
 
@@ -1156,8 +1227,14 @@ exec "$@"
         fails("not JSON");
         *host.answer.lock().unwrap() = r#"{"result":{"data":{"json":{"agents":[]}}}}"#.to_string();
         fails("not a list");
-        host.agents(serde_json::json!([{"lastEventType": "Start"}]));
-        fails("an agent without lastEventAt");
+        // A redirect is not followed: urllib would send the token on to the new address.
+        let elsewhere = FakeHost::start();
+        elsewhere.agents(serde_json::json!([]));
+        *host.redirect.lock().unwrap() =
+            Some(format!("{}/trpc/terminalAgents.list", elsewhere.endpoint()));
+        fails("a redirect");
+        assert!(elsewhere.seen.lock().unwrap().is_empty());
+        *host.redirect.lock().unwrap() = None;
         // The token goes only to this machine: an endpoint elsewhere is never called.
         let asked = host.seen.lock().unwrap().len();
         for endpoint in [
@@ -1176,5 +1253,61 @@ exec "$@"
             fails(&endpoint);
         }
         assert_eq!(host.seen.lock().unwrap().len(), asked);
+    }
+
+    /// Hosts that never answer cannot run the probe past its 5 s: it stops asking at its
+    /// deadline and answers with what the hosts before them said.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_stops_asking_hosts_at_its_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        host.agents(serde_json::json!([agent("Start", 1_000)]));
+        manifest_of(
+            home.path(),
+            ".paradev",
+            "a-org",
+            &host.endpoint(),
+            TOKEN,
+            std::process::id(),
+        );
+        // Three hosts that take the connection and never answer (no one accepts it).
+        let hung: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        for (i, l) in hung.iter().enumerate() {
+            let endpoint = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+            let org = format!("b-org-{i}");
+            manifest_of(
+                home.path(),
+                ".paradev",
+                &org,
+                &endpoint,
+                TOKEN,
+                std::process::id(),
+            );
+        }
+        // Whether a host was asked: its listener holds the connection the probe made.
+        let asked = |l: &std::net::TcpListener| {
+            l.set_nonblocking(true).unwrap();
+            let got = l.accept().is_ok();
+            while l.accept().is_ok() {}
+            got
+        };
+        let Some(v) = answer(home.path()) else {
+            return;
+        };
+        assert_eq!(v["busy"], true, "{v}");
+        // Each hung host costs up to 2 s, and the probe asks no host once 4 s have passed
+        // since it started: the first is asked, the last never is. Without the deadline,
+        // the three would take 6 s and the guest agent would stop the probe at 5.
+        assert!(asked(&hung[0]));
+        assert!(!asked(&hung[2]), "a host asked after the deadline");
+        // With nothing busy, the hosts that did not answer make it a failure (idle).
+        host.agents(serde_json::json!([agent("Stop", 1_000)]));
+        let (code, _, err) = run_probe(home.path()).unwrap();
+        assert_eq!(code, Some(1));
+        assert!(err.starts_with("paradev probe: "), "{err}");
+        assert!(!asked(&hung[2]));
     }
 }

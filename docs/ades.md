@@ -70,14 +70,15 @@ The address holds an SSH token, so InstaADE copies it, and opens Paradev's links
 
 Paradev's host reaches Paradev through its relay, which the sandbox's idle check does not count, and Paradev's chat agents run without a terminal. So, by its terminals and CPU alone, the sandbox could sleep under a working agent. When `superset-host` is active, the command that checks the host also installs an activity probe in `/usr/local/lib/instabox/activity.d/paradev`, or brings it up to date. **Install Paradev**, **Reconnect** and **Open in Paradev** all run that command, so a sandbox set up before the probe existed gets it at its next **Open in Paradev**. When the probe cannot be installed, the check still answers as before.
 
-The probe reads the host's address and token from `~/.paradev/host/<org>/manifest.json`, which the host writes at every start (`~/.superset` before the rename), and asks the host for its agents. It sends the token only to an address on the sandbox, and never prints it.
+The probe reads the host's address and token from `~/.paradev/host/<org>/manifest.json`, which the host writes at every start (`~/.superset` before the rename), and asks the host for its agents. It sends the token only to an address on the sandbox, follows no redirect, and never prints it.
 
 - An agent keeps the sandbox awake while its last event is `Start` (a turn in progress) or `Attached` (an agent that is starting), or an event the probe does not know.
-- An agent that waits for you (`PermissionRequest`), is done (`Stop`) or failed (`Failed`) does not.
-- A terminal agent counts for at most 30 minutes after its last hook, or the last hook of one of its subagents. Claude Code fires no hook when you interrupt it, so its last event stays `Start`. A working agent fires a hook after every tool call.
+- An agent that waits for you (`PermissionRequest`), is done (`Stop`) or failed (`Failed`) does not, unless one of its subagents still runs (a subagent can run in the background after its agent's turn ends). Paradev drops a subagent it has not heard from in 10 minutes.
+- A terminal agent counts for at most 30 minutes after its last hook, or the last hook of one of its running subagents. Claude Code fires no hook when you interrupt it, so its last event stays `Start`. A working agent fires a hook after every tool call.
 - A chat agent counts for at most 6 hours after its turn started, since Paradev records a chat agent's state only when it changes.
-- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count.
+- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count. Nor does an agent whose event has no time.
 - Without a host, or when the host does not run, the probe says idle.
+- When the probe fails, for example when the host turns its token down or answers in a form the probe does not know, it exits with an error. The sandbox server counts that as idle.
 
 ## Paseo
 
