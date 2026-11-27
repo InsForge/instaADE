@@ -946,6 +946,60 @@ mod tests {
         assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn slow_servers_share_one_deadline_and_one_not_read_hides_no_work() {
+        let home = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let slow = |agents| format!("sleep 3\n{}", lists(agents, false));
+        // Two servers that take 3 s each: one after the other, past the guest agent's 5 s.
+        orcad(
+            home.path(),
+            ".orca",
+            me,
+            &slow(serde_json::json!([agent("done", 2)])),
+        );
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([agent("working", 5)])),
+        );
+        let Some(p) = run_probe(home.path()) else {
+            return;
+        };
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert_eq!(
+            p.answer(),
+            serde_json::json!({"busy": true, "reason": "1 agents active (working)", "seq": 5})
+        );
+        assert_eq!(cli_calls(home.path()), 2);
+        // A server that does not answer in time does not hide the other's work, read whole
+        // after the wait for the first, though it is larger than a pipe holds.
+        orcad(home.path(), ".orca", me, "exec sleep 30");
+        let mut long = agent("working", 5);
+        long["lastAssistantMessage"] = serde_json::json!("x".repeat(100_000));
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([long])),
+        );
+        let p = run_probe(home.path()).unwrap();
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert_eq!(p.answer()["busy"], true);
+        // When all that was read is idle, the server not read fails the probe (counted idle).
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([agent("done", 7)])),
+        );
+        let p = run_probe(home.path()).unwrap();
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert!(!p.ok && p.stdout.is_empty());
+    }
+
     #[test]
     fn locate_and_the_signature_check_need_macos_or_windows() {
         if !cfg!(target_os = "macos") {

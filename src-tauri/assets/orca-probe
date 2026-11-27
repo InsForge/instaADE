@@ -22,6 +22,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 
 # Agents in these states wait on a person or finished their turn (Orca's agent states).
 # "waiting" and "blocked" are idle like T3's waiting runs: counting them busy would keep a
@@ -29,7 +31,7 @@ import sys
 # busy.
 IDLE_STATES = ("waiting", "blocked", "done")
 
-# Of the probe's 5 s, the CLI gets 4.
+# Of the probe's 5 s, the CLI calls get 4, all of them together.
 CLI_TIMEOUT = 4
 
 
@@ -64,17 +66,34 @@ def server_running(data):
     return True
 
 
-def list_agents(data):
+def ask(data):
+    # Starts `orca agent list --json` for the server whose data is in `data`. Its answer goes
+    # to a file, not a pipe: a call that ends while the probe waits on another one is read
+    # whole later, however long its answer.
     cli = os.path.join(data, "cli", "bin", "orca")
-    out = subprocess.run(
+    out = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
         [cli, "agent", "list", "--json"],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
+        stdout=out,
         stderr=subprocess.DEVNULL,
-        timeout=CLI_TIMEOUT,
-        check=True,
-    ).stdout
-    result = json.loads(out)["result"]
+    )
+    return proc, out
+
+
+def answer(call, deadline):
+    # The agents and the truncated flag of a call `ask` started, if it ended by `deadline`.
+    proc, out = call
+    try:
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError(f"orca agent list exited with {proc.returncode}")
+    out.seek(0)
+    result = json.loads(out.read())["result"]
     return result["agents"], bool(result.get("truncated"))
 
 
@@ -83,29 +102,48 @@ def main():
     if not servers:
         say(False, "no orca server")
         return
+    # Every call runs at once and shares one deadline, so the probe answers within its 5 s
+    # however many servers there are.
+    deadline = time.monotonic() + CLI_TIMEOUT
+    calls = []
+    unread = []
+    for data in servers:
+        try:
+            calls.append((data, ask(data)))
+        except OSError as e:
+            unread.append(f"{data}: {e}")
     seq = 0
     busy = []
     idle = 0
     partial = False
-    for data in servers:
-        agents, truncated = list_agents(data)
+    for data, call in calls:
+        # Every call is waited for here, so none outlives the probe.
+        try:
+            agents, truncated = answer(call, deadline)
+            rows = [(a.get("state"), a.get("updatedAt")) for a in agents]
+        except Exception as e:  # noqa: BLE001: a server not read is decided below
+            unread.append(f"{data}: {e}")
+            continue
         partial = partial or truncated
-        for agent in agents:
-            state = agent.get("state")
+        for state, updated in rows:
             if state in IDLE_STATES:
                 idle += 1
             else:
                 busy.append(str(state))
             # updatedAt (ms) moves at every status change, so a turn that starts and ends
             # between two readings still changes it.
-            updated = agent.get("updatedAt")
             if isinstance(updated, (int, float)):
                 seq = max(seq, int(updated))
+    # A server not read never hides work another server reported: busy stays busy. When all
+    # that was read is idle, a server not read fails the probe, as a single one always did
+    # (counted idle: a broken or old orcad must not keep the sandbox up forever).
     if busy:
         say(True, f"{len(busy)} agents active ({','.join(sorted(set(busy)))})", seq)
     elif partial:
         # Orca listed only some agents: one it left out may be working.
         say(True, "orca listed only some agents", seq)
+    elif unread:
+        raise RuntimeError("; ".join(unread))
     else:
         say(False, f"no active agents ({idle} idle)", seq)
 
