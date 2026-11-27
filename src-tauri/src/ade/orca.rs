@@ -1000,6 +1000,103 @@ mod tests {
         assert!(!p.ok && p.stdout.is_empty());
     }
 
+    /// Processes the test started, killed when it ends.
+    #[cfg(unix)]
+    struct Running(Vec<std::process::Child>);
+
+    #[cfg(unix)]
+    impl Drop for Running {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// A process whose command line is the relay's, `node relay.js <args>` with the relay
+    /// directory of `home` (as Orca 1.4.217 starts it there), so the process list shows it.
+    #[cfg(unix)]
+    fn relay_process(home: &Path, args: &[&str]) -> std::process::Child {
+        let dir = home.join(".orca-remote").join("relay-0.1.0+2f74d1118794");
+        let sock = dir
+            .join("relay-205b5dfead917383.sock")
+            .display()
+            .to_string();
+        let credential = format!("{sock}.credential");
+        // Two commands, so the shell does not replace itself with `sleep` and keeps its
+        // arguments.
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :", "/usr/local/bin/node", "relay.js"])
+            .args(args)
+            .args(["--sock-path", &sock, "--credential-file", &credential])
+            .spawn()
+            .unwrap()
+    }
+
+    /// The probe's answer once the process list shows the relay processes (`ps` reads
+    /// them from the system, which a fresh process may not be in yet).
+    #[cfg(unix)]
+    fn answer_with_relay(home: &Path, want: &str) -> Option<serde_json::Value> {
+        let mut last = None;
+        for _ in 0..20 {
+            let answer = run_probe(home)?.answer();
+            if answer["reason"].as_str().is_some_and(|r| r.contains(want)) {
+                return Some(answer);
+            }
+            last = Some(answer);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_names_the_relay_of_an_older_orca_instead_of_no_server() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        if run_probe(home.path()).is_none() {
+            return;
+        }
+        let connected = "orca relay, no orcad (Orca 1.4.224 or older, app connected): its agents \
+                         run in terminals, which the tty signal counts";
+        let alone = connected.replace("app connected", "app not connected");
+        let mut running = Running(Vec::new());
+        // Another user's relay, or a CLI call through the relay, is not this home's relay.
+        running.0.push(relay_process(other.path(), &["--detached"]));
+        running
+            .0
+            .push(relay_process(home.path(), &["--orca-cli", "status"]));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer(),
+            serde_json::json!({"busy": false, "reason": "no orca server"})
+        );
+        // The relay Orca leaves running: its terminals outlive the app.
+        running.0.push(relay_process(
+            home.path(),
+            &["--detached", "--grace-time", "0", "--log-file", "relay.log"],
+        ));
+        assert_eq!(
+            answer_with_relay(home.path(), "app not connected").unwrap(),
+            serde_json::json!({"busy": false, "reason": alone})
+        );
+        // While the app is connected, its SSH session runs the relay's client.
+        running.0.push(relay_process(home.path(), &["--connect"]));
+        assert_eq!(
+            answer_with_relay(home.path(), "app connected").unwrap(),
+            serde_json::json!({"busy": false, "reason": connected})
+        );
+        assert_eq!(cli_calls(home.path()), 0, "nothing asks the relay");
+        // An orcad beside it (a newer Orca took the host over) answers for its agents.
+        let working = lists(serde_json::json!([agent("working", 4)]), false);
+        orcad(home.path(), ".orca", std::process::id(), &working);
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer(),
+            serde_json::json!({"busy": true, "reason": "1 agents active (working)", "seq": 4})
+        );
+    }
+
     #[test]
     fn locate_and_the_signature_check_need_macos_or_windows() {
         if !cfg!(target_os = "macos") {

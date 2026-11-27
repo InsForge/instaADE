@@ -4,7 +4,9 @@
 #   {"busy": bool, "seq": <newest agent update>, "reason": "..."}
 # A failure, a timeout or anything else on stdout counts as idle.
 #
-# Orca reaches the sandbox over SSH and starts its own server there, orcad, with nohup.
+# Orca reaches the sandbox over SSH and starts its own server there. From Orca 1.4.225 that
+# is orcad, started with nohup. Orca 1.4.224 and older deploy a relay instead (`relay`
+# below), which has no agent list on the sandbox: the probe then names the relay, as idle.
 # orcad keeps running its agents after the Orca app quits. A chat agent runs on pipes, not
 # in a terminal, so the sandbox would look idle under it. So this asks orcad, with the CLI
 # launcher orcad writes beside its data: `orca agent list --json`, about 0.2 s. orcad keeps
@@ -97,10 +99,46 @@ def answer(call, deadline):
     return result["agents"], bool(result.get("truncated"))
 
 
+def relay():
+    # Orca 1.4.224 and older run no orcad on an SSH host. They deploy a relay there instead,
+    # `node relay.js --detached --sock-path ~/.orca-remote/relay-<version>/relay-<id>.sock`,
+    # which keeps its terminals after the app quits, and while the app is connected its SSH
+    # session runs `relay.js --connect` with the same socket. A relay has no `agent list`, and
+    # its own CLI bridge asks the app on the user's computer, not the sandbox, so the probe
+    # never calls it. Its agents run in its terminals, which the tty signal counts. So this
+    # only names it, from the process list, without touching its socket: a connection would
+    # restart the relay's own idle timer. None: no relay of this user runs.
+    home = os.path.join(os.environ["HOME"], ".orca-remote", "relay-")
+    lines = subprocess.run(
+        ["ps", "-A", "-ww", "-o", "args="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=1,
+        check=True,
+        text=True,
+    ).stdout.splitlines()
+    mine = [line for line in lines if "relay.js" in line.split() and home in line]
+    if not any("--detached" in line.split() for line in mine):
+        return None
+    connected = any(
+        "--connect" in line.split() and "--orca-cli" not in line.split() for line in mine
+    )
+    app = "app connected" if connected else "app not connected"
+    return (
+        f"orca relay, no orcad (Orca 1.4.224 or older, {app}): "
+        "its agents run in terminals, which the tty signal counts"
+    )
+
+
 def main():
     servers = [d for d in data_dirs() if server_running(d)]
     if not servers:
-        say(False, "no orca server")
+        try:
+            found = relay()
+        except Exception:  # noqa: BLE001: without a process list, say what the files say
+            found = None
+        say(False, found or "no orca server")
         return
     # Every call runs at once and shares one deadline, so the probe answers within its 5 s
     # however many servers there are.
