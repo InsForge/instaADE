@@ -25,7 +25,7 @@ An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both th
 
 ## cmux (macOS)
 
-cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaADE installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** opens a `cmux://ssh` link with an SSH token of the sandbox.
+cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaADE installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** wakes the sandbox first, since the SSH gateway refuses a paused one and the link does not wake it. Then it opens a `cmux://ssh` link with an SSH token of the sandbox. When the sandbox does not wake, InstaADE shows the error and opens nothing.
 
 The link holds the token, so InstaADE opens it only in the real cmux app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). InstaADE checks this when it looks for cmux, again before it wakes, creates or marks a sandbox for cmux, and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made.
 
