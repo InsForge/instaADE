@@ -1479,8 +1479,13 @@ impl Core {
             }
             let kind = Kind::Background;
             match ssh::token_and_save(&client, &*self.ssh, &id, kind, &gate, margin).await {
-                // The store refused the new token, as it does when the host cannot take it.
-                Ok((_, Err(e))) => log(format!("SSH host of sandbox {id}: {e}")),
+                // The store refused the new token, as it does when the host cannot take it. The
+                // host may hold it all the same (it is written before the keychain), so an
+                // ordinary token in place of a background one is still said once.
+                Ok((t, Err(e))) => {
+                    self.note_ordinary(kind, &t);
+                    log(format!("SSH host of sandbox {id}: {e}"));
+                }
                 // The host holds the token in use, also when it fell behind the stored one, or
                 // holds the ordinary token an older release put there.
                 Ok((t, Ok(()))) => {
