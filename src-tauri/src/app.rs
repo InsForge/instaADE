@@ -6212,20 +6212,29 @@ mod tests {
         );
         let cfg = std::fs::read_to_string(ssh_config::config_path(o.home.path())).unwrap();
         assert_eq!(cfg, format!("{}\n", ssh_config::INCLUDE));
+        o.core.probes_settled().await;
         let r = requests(&server).await;
-        assert!(
-            !r.iter().any(|x| x.ends_with("/exec")),
-            "nothing runs: {r:?}"
-        );
         assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // On the sandbox, Open only brings the probe up to date, in the background, and
+        // records its hash.
+        let probe = ade::orca::OPEN_PROBE;
+        assert_eq!(exec_cmds(&server).await, [probe.script()]);
+        let key = ("m1".to_string(), Ade::Orca);
+        assert_eq!(
+            o.core.lock().data.open_probes.get(&key),
+            Some(&probe.hash())
+        );
         // Again: the same host, the stored token, the app started once more.
         let again = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
         assert_eq!(again.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(hosts_of(o.home.path()), hosts);
         assert_eq!(o.opened.lock().unwrap().len(), 2);
+        o.core.probes_settled().await;
         let r = requests(&server).await;
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // The same probe hash on record: nothing runs on the sandbox.
+        assert_eq!(exec_cmds(&server).await.len(), 1);
         // Orca pairs nothing, so the sandbox does not join the T3 pairings from here.
         assert!(!o.core.lock().data.connected.contains("m1"));
     }
@@ -6240,8 +6249,10 @@ mod tests {
         let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
         assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
+        o.core.probes_settled().await;
         let reqs = server.received_requests().await.unwrap();
         // Orca installs its own server: the one command is the setup with its activity probe.
+        // This Open went through Install, so no install in the background follows it.
         let execs: Vec<_> = reqs
             .iter()
             .enumerate()
@@ -7013,7 +7024,7 @@ mod tests {
         assert_eq!(exec_cmds(&server).await.len(), 2);
         // An ADE with no probe for Open, or another account's flow, runs nothing.
         p.core.probing.lock().unwrap().clear();
-        p.core.refresh_probe(Ade::Orca, "m1", account);
+        p.core.refresh_probe(Ade::Cmux, "m1", account);
         p.core.refresh_probe(Ade::Paseo, "m1", account + 1);
         p.core.probes_settled().await;
         assert_eq!(exec_cmds(&server).await.len(), 2);

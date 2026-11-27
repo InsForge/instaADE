@@ -1,9 +1,10 @@
 //! Orca, a desktop app for coding agents. It reaches a sandbox over SSH by itself and installs
 //! its own server there under `~/.orca-remote` on the first connect, so no versions must match.
-//! InstaADE installs only an activity probe there (`setup_script`). Orca has no link or command
-//! that adds an SSH host, but it imports the `Host` blocks of `~/.ssh/config`. So InstaADE
-//! writes the sandbox as a host there (`ssh_config`), starts Orca, and the user connects the
-//! host under Orca's Settings, SSH Hosts, after Import when Orca was already running.
+//! InstaADE installs only an activity probe there (`setup_script`, and `OPEN_PROBE` at Open).
+//! Orca has no link or command that adds an SSH host, but it imports the `Host` blocks of
+//! `~/.ssh/config`. So InstaADE writes the sandbox as a host there (`ssh_config`), starts Orca,
+//! and the user connects the host under Orca's Settings, SSH Hosts, after Import when Orca was
+//! already running.
 //! On this computer: find the real Orca app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Orca.exe` and the
 //! version in its file header.
@@ -14,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{ACTIVITY_DIR, Platform, Probe, SshHost};
+use crate::ade::{ACTIVITY_DIR, OpenProbe, Platform, Probe, SshHost};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "orca";
@@ -51,6 +52,13 @@ pub fn notice(alias: &str) -> String {
 pub const PROBE: Probe = Probe {
     name: "orca",
     script: include_str!("../../assets/orca-probe"),
+};
+
+/// The probe Open installs or updates in the background (`Ade::probe_on_open`), so a sandbox
+/// that got Orca before the probe existed gets it without Reconnect. It needs no prep.
+pub const OPEN_PROBE: OpenProbe = OpenProbe {
+    probe: PROBE,
+    prep: "",
 };
 
 const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
@@ -612,6 +620,16 @@ mod tests {
         assert!(s.contains("sudo install -d -m 0755 /usr/local/lib/instabox/activity.d"));
         assert!(s.contains("sudo install -m 0755 \"$new\" \"$probe\""));
         assert!(s.ends_with("\nexit 0"));
+    }
+
+    #[test]
+    fn open_installs_the_same_probe_as_the_setup_with_no_prep() {
+        assert_eq!(OPEN_PROBE.probe, PROBE);
+        assert_eq!(OPEN_PROBE.prep, "");
+        let s = OPEN_PROBE.script();
+        assert!(s.starts_with("set -eu\nprobe=/usr/local/lib/instabox/activity.d/orca\n"));
+        let probe = PROBE.script.strip_suffix('\n').unwrap();
+        assert!(s.contains(&format!("\n{probe}\n")));
     }
 
     #[test]

@@ -4,7 +4,7 @@ The README's [Supported ADEs](../README.md#supported-ades) says what you need an
 
 When an ADE's app is installed more than once, such as in both `/Applications` and `~/Applications`, InstaADE uses the real copy with the newest version. The version it shows is the copy it opens.
 
-Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
+Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Orca, Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
 
 ## T3 Code
 
@@ -63,7 +63,7 @@ Host instabox-dev-1
 - When the server does not answer within 4 seconds, or is too old for `agent list`, the sandbox sleeps by its terminals and CPU, as without the probe.
 - Each call counts as use of Orca's server. So while the sandbox runs, the server does not stop after its 15 idle minutes. It uses no CPU while idle, and it sleeps with the sandbox.
 - When the probe cannot be written, such as on a sandbox without `sudo`, Orca still installs, without the probe.
-- **Open in Orca** on a sandbox without Orca sets it up as **Install Orca** does, probe included. On a sandbox that already has Orca, it runs nothing there. So on a sandbox that got Orca from an older InstaADE, click **Reconnect** once to add the probe.
+- **Open in Orca** installs or updates the probe in the background, so a sandbox that got Orca before the probe existed gets it at its next Open.
 
 ## Paradev (macOS)
 

@@ -499,7 +499,7 @@ impl Ade {
         match self {
             Ade::T3 => None,
             Ade::Cmux => None,
-            Ade::Orca => None,
+            Ade::Orca => Some(orca::OPEN_PROBE),
             Ade::Paradev => None,
             Ade::Paseo => Some(paseo::OPEN_PROBE),
             Ade::Herdr => None,
@@ -740,6 +740,8 @@ mod tests {
         let probe = o.probe().unwrap();
         assert_eq!(probe.path(), "/usr/local/lib/instabox/activity.d/orca");
         assert_eq!(probe, orca::PROBE);
+        // Open runs nothing else on the sandbox, so it brings the probe up to date.
+        assert_eq!(o.probe_on_open(), Some(orca::OPEN_PROBE));
         assert_eq!(o.parse_version("1.4.269"), None);
         assert_eq!(o.refresh_script(), None);
         assert!(o.setup_current(""));
@@ -1042,13 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn only_paseo_installs_its_probe_on_open_for_now() {
+    fn only_orca_and_paseo_install_their_probe_on_open_for_now() {
         let on_open: Vec<Ade> = ALL
             .iter()
             .copied()
             .filter(|a| a.probe_on_open().is_some())
             .collect();
-        assert_eq!(on_open, [Ade::Paseo]);
+        assert_eq!(on_open, [Ade::Orca, Ade::Paseo]);
         for a in on_open {
             // The probe its setup installs, for an ADE whose Open runs nothing on the sandbox.
             assert_eq!(a.probe_on_open().map(|o| o.probe), a.probe());
