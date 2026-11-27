@@ -364,8 +364,8 @@ impl Ade {
     /// exits `SETUP_EXIT_BUSY` when the ADE is busy and the update waits. cmux runs its prep
     /// command, and `version` does not apply. Paradev's app sets its host up itself: this only
     /// reads whether the host runs. Paseo installs its CLI at `version` when the sandbox has
-    /// none, and runs its daemon as a service (`SshHost::setup`). Herdr is installed when the
-    /// sandbox lacks it, at Herdr's latest release, and its version printed.
+    /// none, runs its daemon as a service and installs its probe (`SshHost::setup`). Herdr is
+    /// installed when the sandbox lacks it, at Herdr's latest release, and its version printed.
     pub fn setup_script(self, version: &str) -> String {
         match self {
             Ade::T3 => t3::setup_script(version),
@@ -438,7 +438,7 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => None,
             Ade::Paradev => None,
-            Ade::Paseo => None,
+            Ade::Paseo => Some(paseo::PROBE),
             Ade::Herdr => None,
         }
     }
@@ -732,7 +732,8 @@ mod tests {
             "https://github.com/getpaseo/paseo/releases/latest"
         );
         assert_eq!(p.url_scheme(), "", "Paseo's links open agents, not hosts");
-        // InstaADE installs Paseo's daemon, but keeps no version in step and has no probe yet.
+        // InstaADE installs Paseo's daemon and its probe, but keeps no version in step, so
+        // there is nothing to reinstall.
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(
@@ -742,7 +743,11 @@ mod tests {
         );
         assert_eq!(p.version_script(), None);
         assert_eq!(p.stop_script(), None);
-        assert_eq!(p.probe(), None);
+        assert_eq!(p.probe(), Some(paseo::PROBE));
+        assert_eq!(
+            p.probe().map(|p| p.path()).as_deref(),
+            Some("/usr/local/lib/instabox/activity.d/paseo")
+        );
         assert_eq!(p.parse_version("0.17.4"), None);
         assert_eq!(p.refresh_script(), None);
         assert!(p.setup_current(""));
