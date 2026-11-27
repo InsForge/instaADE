@@ -1704,9 +1704,9 @@ impl Core {
     /// with it: wake it, sync the ADE, then open a new pairing link (no setup, no mark change),
     /// so the app gets the sandbox back even when it lost it. No link when the sync left a setup
     /// that would refuse the pairing (`sync_before_pairing`). A link ADE (cmux) on a sandbox
-    /// marked with it: open its link with an SSH token (the link wakes the sandbox). An SSH
-    /// host ADE (Orca, Paseo) on a sandbox marked with it: wake it, write its host and start the
-    /// app.
+    /// marked with it: wake it, since its SSH link does not wake a paused one, then open its
+    /// link with an SSH token. An SSH host ADE (Orca, Paseo) on a sandbox marked with it: wake
+    /// it, write its host and start the app.
     /// A host ADE (Paradev) on a sandbox marked with it: wake it (the app does not), then open
     /// its link. A terminal ADE (Herdr) on a sandbox marked with it: `open_terminal`. Anything
     /// else goes through the connect flow.
@@ -1863,17 +1863,18 @@ impl Core {
     }
 
     /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
-    /// in the ADE's own app found on this computer, never in whatever handles its scheme. The
-    /// app is checked again (identifier and signature) right before the token is made or
-    /// loaded: with no app, or one that fails the check, no token is made and nothing opens.
-    /// The token comes from `ssh::token`: the stored one while it has more than a day left,
-    /// else a new 30-day one.
+    /// in the ADE's own app found on this computer, never in whatever handles its scheme. It
+    /// checks the app, wakes the sandbox (the SSH gateway refuses a paused one, and the link
+    /// does not wake it), and checks the app again (identifier and signature) right before the
+    /// token is made or loaded, since the wake can take minutes: with no app, or one that fails
+    /// the check, no token is made and nothing opens. A wake that fails is the error, and
+    /// nothing opens. The token comes from `ssh::token`: the stored one while it has more than a
+    /// day left, else a new 30-day one.
     ///
     /// An SSH host ADE (Orca, Paseo) goes the same way. It checks the app, wakes the sandbox,
-    /// checks the app again (the wake can take minutes), makes or loads the token, writes it into
-    /// the sandbox's host in the user's SSH config, copies the host's address for an app that
-    /// adds hosts by it (Paseo), starts the app that passed the last check and returns what the
-    /// user does next there.
+    /// checks the app again, makes or loads the token, writes it into the sandbox's host in the
+    /// user's SSH config, copies the host's address for an app that adds hosts by it (Paseo),
+    /// starts the app that passed the last check and returns what the user does next there.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let open = ade.open();
         if let Open::Pair(_) = open {
@@ -1885,7 +1886,8 @@ impl Core {
         if let Open::Terminal(_) = open {
             return Err(terminal_not_link(ade));
         }
-        let app = self.checked_app(ade).await?;
+        // Before the sandbox is touched: with no app, or one that fails the check, nothing wakes.
+        self.checked_app(ade).await?;
         let (client, title) = self
             .read_in(account, |i| {
                 let title = i
@@ -1898,19 +1900,16 @@ impl Core {
             })
             .flatten()
             .ok_or_else(account_changed)?;
-        let (title, app) = if let Open::SshHost(_) = open {
-            // The user connects from the app next: a running sandbox answers at once. Its name
-            // makes the host's alias, and a sandbox made just now is not in the list yet.
-            let m = sandbox::ensure_running(&client, id)
-                .await
-                .map_err(ErrorView::from)?;
-            // A wake can take minutes: the app is found and checked again right before the
-            // token, and the app that passes this check is the one started.
-            let app = self.checked_app(ade).await?;
-            (if m.name.is_empty() { title } else { m.name }, app)
-        } else {
-            (title, app)
-        };
+        // The app connects next, and the SSH gateway refuses a paused sandbox: an SSH link does
+        // not wake it (cmux showed "Session open refused by peer"). Its name makes the link's
+        // title and the host's alias, and a sandbox made just now is not in the list yet.
+        let m = sandbox::ensure_running(&client, id)
+            .await
+            .map_err(ErrorView::from)?;
+        let title = if m.name.is_empty() { title } else { m.name };
+        // A wake can take minutes: the app is found and checked again right before the token,
+        // and the app that passes this check is the one opened.
+        let app = self.checked_app(ade).await?;
         let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
             .await
             .map_err(ErrorView::from)?;
@@ -4382,6 +4381,96 @@ mod tests {
         );
         let r = requests(&server).await;
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+    }
+
+    /// Mounts a sandbox m1 in `state` for the next read of it, before the ones `cmux_server`
+    /// answers (running).
+    async fn m1_once_in(server: &wiremock::MockServer, md: &serde_json::Value, state: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m1", "name": "dev 1", "state": state,
+                "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
+                "metadata": md, "orgId": "org-me"
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn open_in_cmux_wakes_a_paused_or_stopped_sandbox_before_it_opens_the_link() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        for (state, action) in [("suspended", "resume"), ("stopped", "start")] {
+            let md = serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"});
+            let (server, base) = cmux_server(md.clone()).await;
+            // The SSH gateway refuses a paused sandbox, and cmux's link does not wake it.
+            m1_once_in(&server, &md, state).await;
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/machines/m1/{action}")))
+                .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                    "id": "op1", "machineId": "m1", "type": action, "state": "queued",
+                    "machine": null
+                })))
+                .mount(&server)
+                .await;
+            let CmuxCore {
+                core,
+                opened,
+                app,
+                _dir,
+            } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
+            core.refresh(false).await;
+            assert_eq!(core.open_in_ade("m1", Some(Ade::Cmux)).await, Ok(None));
+            assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)], "{state}");
+            assert_eq!(core.state().error, None);
+            let r = requests(&server).await;
+            let at = |p: &str| {
+                r.iter()
+                    .position(|x| x == p)
+                    .unwrap_or_else(|| panic!("{p}: {r:?}"))
+            };
+            assert!(
+                at(&format!("POST /v1/machines/m1/{action}"))
+                    < at("POST /v1/machines/m1/ssh-tokens"),
+                "{r:?}"
+            );
+            assert!(!r.iter().any(|x| x.ends_with("/exec")), "{r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cmux_sandbox_that_does_not_wake_shows_the_error_and_opens_nothing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let md = serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"});
+        let (server, base) = cmux_server(md.clone()).await;
+        m1_once_in(&server, &md, "suspended").await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/resume"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {"code": "forbidden", "message": "This sandbox cannot be resumed.",
+                    "retryable": false}
+            })))
+            .mount(&server)
+            .await;
+        let CmuxCore {
+            core,
+            opened,
+            app: _,
+            _dir,
+        } = cmux_core(&base, Arc::new(MemorySshStore::default()), CmuxHere::Real);
+        core.refresh(false).await;
+        let e = core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap_err();
+        assert_eq!(e.message, "This sandbox cannot be resumed.");
+        assert_eq!(core.state().error, Some(e), "the app shows it");
+        assert!(opened.lock().unwrap().is_empty(), "nothing opened");
+        let r = requests(&server).await;
+        assert!(!r.iter().any(|x| x.ends_with("/ssh-tokens")), "{r:?}");
     }
 
     #[tokio::test]
