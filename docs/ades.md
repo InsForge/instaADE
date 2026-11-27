@@ -4,7 +4,7 @@ The README's [Supported ADEs](../README.md#supported-ades) says what you need an
 
 When an ADE's app is installed more than once, such as in both `/Applications` and `~/Applications`, InstaADE uses the real copy with the newest version. The version it shows is the copy it opens.
 
-Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
+Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Orca, Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
 
 ## T3 Code
 
@@ -33,7 +33,7 @@ cmux has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
 ## Orca
 
-Orca connects over SSH by itself and installs its own server on the sandbox under `~/.orca-remote`, so InstaADE installs nothing and no versions must match. Orca has no link that adds a host, but it imports the hosts in `~/.ssh/config`. So **Install Orca** and **Open in Orca** wake the sandbox, write it as a host to `~/.ssh/instabox/config` and start Orca. Then open **Settings**, then **SSH Hosts** in Orca, connect the host and open `/data/home`. Orca imports the hosts when it starts, and else only when you click **Import** there. So when Orca was already running, click **Import** first.
+Orca connects over SSH by itself and installs its own server on the sandbox under `~/.orca-remote`, so no versions must match. InstaADE adds only an [activity probe](#orcas-activity-probe) there. Orca has no link that adds a host, but it imports the hosts in `~/.ssh/config`. So **Install Orca** and **Open in Orca** wake the sandbox, write it as a host to `~/.ssh/instabox/config` and start Orca. Then open **Settings**, then **SSH Hosts** in Orca, connect the host and open `/data/home`. Orca imports the hosts when it starts, and else only when you click **Import** there. So when Orca was already running, click **Import** first.
 
 ```
 # instabox-sandbox <sandbox id>
@@ -54,7 +54,16 @@ Host instabox-dev-1
 - On macOS, InstaADE starts only the real Orca app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.stablyai.orca`, and `codesign` must find it signed with the Developer ID of team `6CX3WHS9HZ`. InstaADE checks this when it looks for Orca, again before it wakes, creates or marks a sandbox for Orca, and again after the wake, right before it makes or loads the token.
 - On Windows, InstaADE starts `Orca.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Orca` or `%ProgramFiles%\Orca`). It starts it only when the file's version resource names the product Orca and holds a version, read from the file each time. There is no signature check on Windows yet.
 
-Orca has no idle probe, so the sandbox sleeps by its terminals and CPU.
+### Orca's activity probe
+
+**Install Orca** and **Reconnect** add an activity probe in `/usr/local/lib/instabox/activity.d/orca`, so the sandbox does not sleep while an Orca agent works. Orca's server on the sandbox keeps running its agents after you quit Orca. An agent in a chat runs with no terminal, so without the probe the sandbox could pause under it. The probe asks Orca's server with Orca's own command, `orca agent list --json`, which the server puts in `~/.orca/cli/bin`. The answer takes about 0.2 seconds.
+
+- An agent that is `working`, or in a state the probe does not know, keeps the sandbox awake.
+- Agents that are `waiting` or `blocked` on you, or `done`, let it sleep. So does a sandbox where Orca's server does not run. Then the probe does not call the server.
+- When the server does not answer within 4 seconds, or is too old for `agent list`, the sandbox sleeps by its terminals and CPU, as without the probe.
+- Each call counts as use of Orca's server. So while the sandbox runs, the server does not stop after its 15 idle minutes. It uses no CPU while idle, and it sleeps with the sandbox.
+- When the probe cannot be written, such as on a sandbox without `sudo`, Orca still installs, without the probe.
+- **Open in Orca** installs or updates the probe in the background, so a sandbox that got Orca before the probe existed gets it at its next Open.
 
 ## Paradev (macOS)
 

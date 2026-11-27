@@ -1,9 +1,10 @@
 //! Orca, a desktop app for coding agents. It reaches a sandbox over SSH by itself and installs
-//! its own server there under `~/.orca-remote` on the first connect, so InstaADE installs
-//! nothing and no versions must match. Orca has no link or command that adds an SSH host, but
-//! it imports the `Host` blocks of `~/.ssh/config`. So InstaADE writes the sandbox as a host
-//! there (`ssh_config`), starts Orca, and the user connects the host under Orca's Settings, SSH
-//! Hosts, after Import when Orca was already running.
+//! its own server there under `~/.orca-remote` on the first connect, so no versions must match.
+//! InstaADE installs only an activity probe there (`setup_script`, and `OPEN_PROBE` at Open).
+//! Orca has no link or command that adds an SSH host, but it imports the `Host` blocks of
+//! `~/.ssh/config`. So InstaADE writes the sandbox as a host there (`ssh_config`), starts Orca,
+//! and the user connects the host under Orca's Settings, SSH Hosts, after Import when Orca was
+//! already running.
 //! On this computer: find the real Orca app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Orca.exe` and the
 //! version in its file header.
@@ -14,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Platform, SshHost};
+use crate::ade::{ACTIVITY_DIR, OpenProbe, Platform, Probe, SshHost};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "orca";
@@ -28,7 +29,7 @@ pub const URL_SCHEME: &str = "";
 pub const SSH_HOST: SshHost = SshHost {
     notice,
     address: None,
-    setup: None,
+    setup: Some(setup_script),
 };
 
 /// The sandbox's home, which the user opens in Orca once the host is connected.
@@ -41,6 +42,56 @@ pub fn notice(alias: &str) -> String {
     format!(
         "In Orca, open Settings, then SSH Hosts. Click Import if {alias} is not listed, then connect it and open {SANDBOX_HOME}."
     )
+}
+
+// ---- the sandbox ----
+
+/// The activity probe, installed as `ACTIVITY_DIR/orca`. It asks Orca's server on the sandbox
+/// whether an agent works, so the sandbox does not pause under an agent that keeps working
+/// after the Orca app quit.
+pub const PROBE: Probe = Probe {
+    name: "orca",
+    script: include_str!("../../assets/orca-probe"),
+};
+
+/// The probe Open installs or updates in the background (`Ade::probe_on_open`), so a sandbox
+/// that got Orca before the probe existed gets it without Reconnect. It needs no prep.
+pub const OPEN_PROBE: OpenProbe = OpenProbe {
+    probe: PROBE,
+    prep: "",
+};
+
+const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
+
+/// Stages the probe and writes it only when it differs from the one in place, or that one is
+/// not executable (the guest agent runs only executable files). Orca works without the probe,
+/// so a sandbox where it cannot be written (no sudo) still gets Orca: the script says so on
+/// stderr and exits 0, and the sandbox sleeps by its terminals and CPU, as before.
+const SETUP_TEMPLATE: &str = r##"probe=__PROBE_PATH__
+new=$(mktemp)
+trap 'rm -f "$new"' EXIT
+cat > "$new" <<'__PROBE_EOF__'
+__PROBE__
+__PROBE_EOF__
+if ! cmp -s "$new" "$probe" || [ ! -x "$probe" ]; then
+  { sudo install -d -m 0755 __ACTIVITY_DIR__ && sudo install -m 0755 "$new" "$probe"; } ||
+    echo "The Orca activity probe was not installed" >&2
+fi
+exit 0"##;
+
+/// What Install and Reconnect run on the sandbox before the mark (`SshHost::setup`): it
+/// installs the probe. The desktop version does not matter, since Orca brings its own server.
+pub fn setup_script(_desktop_version: &str) -> String {
+    assert!(
+        !PROBE.script.contains(PROBE_EOF),
+        "{PROBE_EOF} is in the probe"
+    );
+    let probe = PROBE.script.strip_suffix('\n').unwrap_or(PROBE.script);
+    SETUP_TEMPLATE
+        .replace("__PROBE_PATH__", &PROBE.path())
+        .replace("__ACTIVITY_DIR__", ACTIVITY_DIR)
+        .replace("__PROBE_EOF__", PROBE_EOF)
+        .replace("__PROBE__", probe)
 }
 
 // ---- this computer: macOS ----
@@ -549,6 +600,404 @@ mod tests {
              listed, then connect it and open /data/home."
         );
         assert_eq!((SSH_HOST.notice)("x"), notice("x"));
+    }
+
+    #[test]
+    fn the_setup_installs_the_probe_where_instabox_runs_it() {
+        let s = setup_script("1.4.279");
+        assert_eq!(
+            s,
+            setup_script("ignored"),
+            "the desktop version does not matter"
+        );
+        assert_eq!(SSH_HOST.setup.map(|f| f("1.4.279")), Some(s.clone()));
+        assert_eq!(PROBE.path(), "/usr/local/lib/instabox/activity.d/orca");
+        assert!(s.starts_with("probe=/usr/local/lib/instabox/activity.d/orca\n"));
+        let probe = PROBE.script.strip_suffix('\n').unwrap();
+        assert!(s.contains(&format!(
+            "cat > \"$new\" <<'{PROBE_EOF}'\n{probe}\n{PROBE_EOF}\n"
+        )));
+        assert!(s.contains("sudo install -d -m 0755 /usr/local/lib/instabox/activity.d"));
+        assert!(s.contains("sudo install -m 0755 \"$new\" \"$probe\""));
+        assert!(s.ends_with("\nexit 0"));
+    }
+
+    #[test]
+    fn open_installs_the_same_probe_as_the_setup_with_no_prep() {
+        assert_eq!(OPEN_PROBE.probe, PROBE);
+        assert_eq!(OPEN_PROBE.prep, "");
+        let s = OPEN_PROBE.script();
+        assert!(s.starts_with("set -eu\nprobe=/usr/local/lib/instabox/activity.d/orca\n"));
+        let probe = PROBE.script.strip_suffix('\n').unwrap();
+        assert!(s.contains(&format!("\n{probe}\n")));
+    }
+
+    #[test]
+    fn the_probe_is_python_with_unix_line_ends() {
+        assert!(PROBE.script.starts_with("#!/usr/bin/env python3\n"));
+        assert!(PROBE.script.contains("\"agent\", \"list\", \"--json\""));
+        // A CRLF checkout (Windows) would break the script on the sandbox.
+        assert!(!PROBE.script.contains('\r'));
+        assert!(!PROBE.script.contains(PROBE_EOF));
+    }
+
+    #[cfg(unix)]
+    fn write_exe(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Runs the setup with the activity directory in `root` and a `sudo` that runs
+    /// `sudo_body`. Returns whether it exited 0, and its stderr.
+    #[cfg(unix)]
+    fn run_setup(root: &Path, sudo_body: &str) -> (bool, String) {
+        let bin = root.join("bin");
+        write_exe(&bin.join("sudo"), &format!("#!/bin/sh\n{sudo_body}\n"));
+        let dir = root.join("activity.d");
+        let script = setup_script("x").replace(ACTIVITY_DIR, &dir.display().to_string());
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.success(), err)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_setup_writes_the_probe_only_when_it_differs_and_never_fails_orca() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("sudo.log");
+        let sudo = format!("echo \"$*\" >> '{}'\nexec \"$@\"", log.display());
+        let calls = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let probe = root.path().join("activity.d").join("orca");
+        let (ok, err) = run_setup(root.path(), &sudo);
+        assert!(ok, "{err}");
+        assert_eq!(std::fs::read_to_string(&probe).unwrap(), PROBE.script);
+        let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(calls(), 2, "the directory, then the probe");
+        // The same probe in place: nothing is written.
+        assert!(run_setup(root.path(), &sudo).0);
+        assert_eq!(calls(), 2);
+        // An older probe is replaced.
+        std::fs::write(&probe, "#!/usr/bin/env python3\n").unwrap();
+        assert!(run_setup(root.path(), &sudo).0);
+        assert_eq!(std::fs::read_to_string(&probe).unwrap(), PROBE.script);
+        assert_eq!(calls(), 4);
+        // The same probe, but not executable, so the guest agent skips it: written again.
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(run_setup(root.path(), &sudo).0);
+        let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(calls(), 6);
+        // Without a sudo that works, Orca still installs: the setup exits 0 and says why.
+        std::fs::remove_file(&probe).unwrap();
+        let (ok, err) = run_setup(root.path(), "exit 1");
+        assert!(ok);
+        assert!(
+            err.contains("The Orca activity probe was not installed"),
+            "{err}"
+        );
+        assert!(!probe.exists());
+    }
+
+    /// The probe run as instabox-guest-agent runs it: no environment but its own, in the home.
+    #[cfg(unix)]
+    struct Probed {
+        ok: bool,
+        stdout: String,
+        took: Duration,
+    }
+
+    #[cfg(unix)]
+    impl Probed {
+        fn answer(&self) -> serde_json::Value {
+            assert!(self.ok, "the probe failed: {}", self.stdout);
+            assert_eq!(self.stdout.lines().count(), 1, "{}", self.stdout);
+            assert!(self.stdout.len() <= 4096);
+            serde_json::from_str(&self.stdout).unwrap()
+        }
+    }
+
+    /// Runs the probe with `home` as HOME. None without python3.
+    #[cfg(unix)]
+    fn run_probe(home: &Path) -> Option<Probed> {
+        let Ok(python) = which::which("python3") else {
+            eprintln!("python3 not found: skipped");
+            return None;
+        };
+        let script = home.join("probe.py");
+        std::fs::write(&script, PROBE.script).unwrap();
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new(python)
+            .arg(&script)
+            .env_clear()
+            .env("HOME", home)
+            .env("SHELL", "/bin/bash")
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .current_dir(home)
+            .output()
+            .unwrap();
+        Some(Probed {
+            ok: out.status.success(),
+            stdout: String::from_utf8(out.stdout).unwrap(),
+            took: start.elapsed(),
+        })
+    }
+
+    /// Orca's server data in `home/data`, as orcad leaves it: `orca-runtime.json` naming `pid`,
+    /// and its CLI launcher, which here runs `cli_body` and logs each call to `home/cli.log`.
+    #[cfg(unix)]
+    fn orcad(home: &Path, data: &str, pid: u32, cli_body: &str) {
+        let data = home.join(data);
+        std::fs::create_dir_all(&data).unwrap();
+        let runtime = serde_json::json!({
+            "runtimeId": "r1", "pid": pid, "transports": [], "authToken": "secret",
+            "startedAt": 1
+        });
+        std::fs::write(data.join("orca-runtime.json"), runtime.to_string()).unwrap();
+        let log = home.join("cli.log");
+        let cli = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n{cli_body}\n",
+            log.display()
+        );
+        write_exe(&data.join("cli").join("bin").join("orca"), &cli);
+    }
+
+    /// A CLI body that prints what `orca agent list --json` prints for these `agents`.
+    #[cfg(unix)]
+    fn lists(agents: serde_json::Value, truncated: bool) -> String {
+        let answer = serde_json::json!({
+            "id": "q1", "ok": true,
+            "result": {"agents": agents, "truncated": truncated,
+                "hostScope": {"hostIds": ["local"], "omittedHostIds": []}},
+            "_meta": {"runtimeId": "r1"}
+        });
+        format!(
+            "cat <<'EOF'\n{}\nEOF",
+            serde_json::to_string_pretty(&answer).unwrap()
+        )
+    }
+
+    /// One row of `orca agent list --json`, as Orca 1.4.279 prints it.
+    #[cfg(unix)]
+    fn agent(state: &str, updated_at: i64) -> serde_json::Value {
+        serde_json::json!({
+            "orcaSessionId": null, "kind": "terminal", "agent": "claude", "state": state,
+            "worktreeId": "w1", "workspace": "repo", "paneKey": "tab:leaf", "title": null,
+            "lastAssistantMessage": null, "updatedAt": updated_at
+        })
+    }
+
+    #[cfg(unix)]
+    fn cli_calls(home: &Path) -> usize {
+        std::fs::read_to_string(home.join("cli.log"))
+            .unwrap_or_default()
+            .lines()
+            .inspect(|l| assert_eq!(*l, "agent list --json"))
+            .count()
+    }
+
+    /// A process id that ran and is gone.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_is_idle_without_a_running_orca_server_and_never_calls_one() {
+        let home = tempfile::tempdir().unwrap();
+        let Some(p) = run_probe(home.path()) else {
+            return;
+        };
+        assert_eq!(
+            p.answer(),
+            serde_json::json!({"busy": false, "reason": "no orca server"})
+        );
+        // A runtime file left by an orcad that is gone, with a working agent on record.
+        let working = lists(serde_json::json!([agent("working", 5)]), false);
+        orcad(home.path(), ".orca", dead_pid(), &working);
+        assert_eq!(run_probe(home.path()).unwrap().answer()["busy"], false);
+        orcad(home.path(), ".orca", 0, &working);
+        assert_eq!(run_probe(home.path()).unwrap().answer()["busy"], false);
+        assert_eq!(cli_calls(home.path()), 0, "the CLI never runs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_is_busy_only_while_an_agent_works() {
+        let home = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let cases = [
+            (
+                serde_json::json!([]),
+                false,
+                false,
+                "no active agents (0 idle)",
+                0,
+            ),
+            (
+                serde_json::json!([agent("done", 7), agent("working", 9)]),
+                false,
+                true,
+                "1 agents active (working)",
+                9,
+            ),
+            // Waiting on a person or done is idle.
+            (
+                serde_json::json!([agent("waiting", 11), agent("blocked", 3), agent("done", 2)]),
+                false,
+                false,
+                "no active agents (3 idle)",
+                11,
+            ),
+            // A state this probe does not know may be work.
+            (
+                serde_json::json!([agent("done", 1), agent("compacting", 4)]),
+                false,
+                true,
+                "1 agents active (compacting)",
+                4,
+            ),
+            // A list Orca cut short may leave out a working agent.
+            (
+                serde_json::json!([agent("done", 6)]),
+                true,
+                true,
+                "orca listed only some agents",
+                6,
+            ),
+        ];
+        for (n, (agents, truncated, busy, reason, seq)) in cases.into_iter().enumerate() {
+            orcad(home.path(), ".orca", me, &lists(agents, truncated));
+            let Some(p) = run_probe(home.path()) else {
+                return;
+            };
+            assert_eq!(
+                p.answer(),
+                serde_json::json!({"busy": busy, "reason": reason, "seq": seq}),
+                "case {n}"
+            );
+            assert_eq!(cli_calls(home.path()), n + 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_finds_a_server_whose_data_orca_keyed_by_machine() {
+        let home = tempfile::tempdir().unwrap();
+        let idle = lists(serde_json::json!([agent("done", 3)]), false);
+        orcad(home.path(), ".orca", dead_pid(), &idle);
+        let working = lists(serde_json::json!([agent("working", 8)]), false);
+        orcad(home.path(), ".orca-0123abcd", std::process::id(), &working);
+        // Orca's install folder has no runtime file.
+        std::fs::create_dir_all(home.path().join(".orca-remote")).unwrap();
+        let Some(p) = run_probe(home.path()) else {
+            return;
+        };
+        assert_eq!(
+            p.answer(),
+            serde_json::json!({"busy": true, "reason": "1 agents active (working)", "seq": 8})
+        );
+        assert_eq!(cli_calls(home.path()), 1, "only the server that runs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_fails_when_the_server_does_not_answer_in_time() {
+        let home = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        // An Orca without `agent list`: the CLI fails, and so does the probe (idle).
+        orcad(
+            home.path(),
+            ".orca",
+            me,
+            "echo 'unknown command' >&2\nexit 1",
+        );
+        let Some(p) = run_probe(home.path()) else {
+            return;
+        };
+        assert!(!p.ok);
+        assert_eq!(p.stdout, "");
+        orcad(home.path(), ".orca", me, "echo 'Orca is starting'");
+        let p = run_probe(home.path()).unwrap();
+        assert!(!p.ok && p.stdout.is_empty(), "not JSON");
+        // A CLI that hangs is cut off within the guest agent's 5 s.
+        orcad(home.path(), ".orca", me, "exec sleep 30");
+        let p = run_probe(home.path()).unwrap();
+        assert!(!p.ok && p.stdout.is_empty());
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_servers_share_one_deadline_and_one_not_read_hides_no_work() {
+        let home = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let slow = |agents| format!("sleep 3\n{}", lists(agents, false));
+        // Two servers that take 3 s each: one after the other, past the guest agent's 5 s.
+        orcad(
+            home.path(),
+            ".orca",
+            me,
+            &slow(serde_json::json!([agent("done", 2)])),
+        );
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([agent("working", 5)])),
+        );
+        let Some(p) = run_probe(home.path()) else {
+            return;
+        };
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert_eq!(
+            p.answer(),
+            serde_json::json!({"busy": true, "reason": "1 agents active (working)", "seq": 5})
+        );
+        assert_eq!(cli_calls(home.path()), 2);
+        // A server that does not answer in time does not hide the other's work, read whole
+        // after the wait for the first, though it is larger than a pipe holds.
+        orcad(home.path(), ".orca", me, "exec sleep 30");
+        let mut long = agent("working", 5);
+        long["lastAssistantMessage"] = serde_json::json!("x".repeat(100_000));
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([long])),
+        );
+        let p = run_probe(home.path()).unwrap();
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert_eq!(p.answer()["busy"], true);
+        // When all that was read is idle, the server not read fails the probe (counted idle).
+        orcad(
+            home.path(),
+            ".orca-0123abcd",
+            me,
+            &slow(serde_json::json!([agent("done", 7)])),
+        );
+        let p = run_probe(home.path()).unwrap();
+        assert!(p.took < Duration::from_secs(5), "{:?}", p.took);
+        assert!(!p.ok && p.stdout.is_empty());
     }
 
     #[test]

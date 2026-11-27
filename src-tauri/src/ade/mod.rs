@@ -101,9 +101,9 @@ pub struct SshHost {
     /// It holds no token, and the app copies it. None: the desktop app imports the host itself
     /// (Orca).
     pub address: Option<fn(&str) -> String>,
-    /// Sets up on the sandbox what the desktop app reaches over the host (Paseo's daemon), given
-    /// the desktop version. It runs at Install, before the mark. None: the desktop app brings
-    /// its own part (Orca).
+    /// Sets up on the sandbox what the desktop app reaches over the host (Paseo's daemon), or
+    /// what InstaADE adds next to the part the desktop app brings (Orca's activity probe), given
+    /// the desktop version. It runs at Install, before the mark. None: nothing to set up.
     pub setup: Option<fn(&str) -> String>,
 }
 
@@ -419,7 +419,7 @@ impl Ade {
         match self {
             Ade::T3 => t3::setup_script(version),
             Ade::Cmux => cmux::PREP_SCRIPT.to_string(),
-            Ade::Orca => String::new(),
+            Ade::Orca => orca::setup_script(version),
             Ade::Paradev => paradev::HOST_SCRIPT.to_string(),
             Ade::Paseo => paseo::setup_script(version),
             Ade::Herdr => herdr::SETUP_SCRIPT.to_string(),
@@ -485,7 +485,7 @@ impl Ade {
         match self {
             Ade::T3 => Some(t3::PROBE),
             Ade::Cmux => None,
-            Ade::Orca => None,
+            Ade::Orca => Some(orca::PROBE),
             Ade::Paradev => None,
             Ade::Paseo => Some(paseo::PROBE),
             Ade::Herdr => None,
@@ -499,7 +499,7 @@ impl Ade {
         match self {
             Ade::T3 => None,
             Ade::Cmux => None,
-            Ade::Orca => None,
+            Ade::Orca => Some(orca::OPEN_PROBE),
             Ade::Paradev => None,
             Ade::Paseo => Some(paseo::OPEN_PROBE),
             Ade::Herdr => None,
@@ -730,22 +730,31 @@ mod tests {
             "https://github.com/stablyai/orca/releases/latest"
         );
         assert_eq!(o.url_scheme(), "", "Orca takes no links");
-        // Orca installs its own server on the first connect: nothing to set up or keep in step.
+        // Orca installs its own server on the first connect: InstaADE installs only its
+        // activity probe, and keeps nothing in step.
         assert!(!o.pins_local_version());
         assert!(!o.reinstalls());
         assert_eq!(o.port(), None);
         assert_eq!(o.version_script(), None);
         assert_eq!(o.stop_script(), None);
-        assert_eq!(o.probe(), None);
+        let probe = o.probe().unwrap();
+        assert_eq!(probe.path(), "/usr/local/lib/instabox/activity.d/orca");
+        assert_eq!(probe, orca::PROBE);
+        // Open runs nothing else on the sandbox, so it brings the probe up to date.
+        assert_eq!(o.probe_on_open(), Some(orca::OPEN_PROBE));
         assert_eq!(o.parse_version("1.4.269"), None);
         assert_eq!(o.refresh_script(), None);
         assert!(o.setup_current(""));
         assert!(!o.pairing_needs_setup("0.1.12", Some("0.1.12")));
-        assert_eq!(o.setup_script("ignored"), "");
+        assert_eq!(o.setup_script("ignored"), orca::setup_script("ignored"));
         let Open::SshHost(h) = o.open() else {
             panic!("Orca opens through an SSH host")
         };
         assert_eq!((h.notice)("instabox-x"), orca::notice("instabox-x"));
+        assert_eq!(
+            h.setup.map(|s| s("1.4.279")),
+            Some(o.setup_script("1.4.279"))
+        );
         assert_eq!(o.platforms(), &[Platform::MacOs, Platform::Windows]);
         assert_eq!(o.runs_here(), cfg!(any(target_os = "macos", windows)));
     }
@@ -827,11 +836,12 @@ mod tests {
         );
         assert_eq!(h.setup.map(|s| s("0.17.4")), Some(p.setup_script("0.17.4")));
         assert_eq!(p.platforms(), &[Platform::MacOs, Platform::Windows]);
-        // Orca brings its own server and imports the host by itself.
+        // Orca brings its own server and imports the host by itself: its setup is only its probe.
         let Open::SshHost(o) = Ade::Orca.open() else {
             panic!("Orca opens through an SSH host")
         };
-        assert!(o.address.is_none() && o.setup.is_none());
+        assert!(o.address.is_none());
+        assert_eq!(o.setup.map(|s| s("x")), Some(orca::setup_script("x")));
     }
 
     #[test]
@@ -1034,13 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn only_paseo_installs_its_probe_on_open_for_now() {
+    fn only_orca_and_paseo_install_their_probe_on_open_for_now() {
         let on_open: Vec<Ade> = ALL
             .iter()
             .copied()
             .filter(|a| a.probe_on_open().is_some())
             .collect();
-        assert_eq!(on_open, [Ade::Paseo]);
+        assert_eq!(on_open, [Ade::Orca, Ade::Paseo]);
         for a in on_open {
             // The probe its setup installs, for an ADE whose Open runs nothing on the sandbox.
             assert_eq!(a.probe_on_open().map(|o| o.probe), a.probe());

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# instabox activity probe for Orca (the instabox idle-suspend contract). instabox-guest-agent
+# runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
+#   {"busy": bool, "seq": <newest agent update>, "reason": "..."}
+# A failure, a timeout or anything else on stdout counts as idle.
+#
+# Orca reaches the sandbox over SSH and starts its own server there, orcad, with nohup.
+# orcad keeps running its agents after the Orca app quits. A chat agent runs on pipes, not
+# in a terminal, so the sandbox would look idle under it. So this asks orcad, with the CLI
+# launcher orcad writes beside its data: `orca agent list --json`, about 0.2 s. orcad keeps
+# its data in ~/.orca, or in ~/.orca-<machine key> when the home holds another machine's
+# server (a sandbox made from a snapshot).
+#
+# Every call is a request to orcad, and a request restarts orcad's 15-minute idle exit. So
+# while the sandbox runs, orcad does not exit by itself. That costs no CPU, and orcad pauses
+# with the sandbox. When orcad does not run, the probe does not call it.
+#
+# An orcad too old for `agent list`, or without its CLI, fails the probe, which counts as
+# idle: the sandbox then sleeps by its terminals and CPU, as it did without the probe.
+import glob
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+# Agents in these states wait on a person or finished their turn (Orca's agent states).
+# "waiting" and "blocked" are idle like T3's waiting runs: counting them busy would keep a
+# forgotten question's sandbox up forever. "working", and any state a later Orca adds, is
+# busy.
+IDLE_STATES = ("waiting", "blocked", "done")
+
+# Of the probe's 5 s, the CLI calls get 4, all of them together.
+CLI_TIMEOUT = 4
+
+
+def say(busy, reason, seq=None):
+    out = {"busy": busy, "reason": reason}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
+
+
+def data_dirs():
+    home = os.environ["HOME"]
+    return [os.path.join(home, ".orca")] + sorted(glob.glob(os.path.join(home, ".orca-*")))
+
+
+def server_running(data):
+    # orcad writes orca-runtime.json with its pid at every start. A file left by an orcad
+    # that is gone (the sandbox restarted) names no live process.
+    try:
+        with open(os.path.join(data, "orca-runtime.json")) as f:
+            pid = int(json.load(f)["pid"])
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def ask(data):
+    # Starts `orca agent list --json` for the server whose data is in `data`. Its answer goes
+    # to a file, not a pipe: a call that ends while the probe waits on another one is read
+    # whole later, however long its answer.
+    cli = os.path.join(data, "cli", "bin", "orca")
+    out = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        [cli, "agent", "list", "--json"],
+        stdin=subprocess.DEVNULL,
+        stdout=out,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc, out
+
+
+def answer(call, deadline):
+    # The agents and the truncated flag of a call `ask` started, if it ended by `deadline`.
+    proc, out = call
+    try:
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError(f"orca agent list exited with {proc.returncode}")
+    out.seek(0)
+    result = json.loads(out.read())["result"]
+    return result["agents"], bool(result.get("truncated"))
+
+
+def main():
+    servers = [d for d in data_dirs() if server_running(d)]
+    if not servers:
+        say(False, "no orca server")
+        return
+    # Every call runs at once and shares one deadline, so the probe answers within its 5 s
+    # however many servers there are.
+    deadline = time.monotonic() + CLI_TIMEOUT
+    calls = []
+    unread = []
+    for data in servers:
+        try:
+            calls.append((data, ask(data)))
+        except OSError as e:
+            unread.append(f"{data}: {e}")
+    seq = 0
+    busy = []
+    idle = 0
+    partial = False
+    for data, call in calls:
+        # Every call is waited for here, so none outlives the probe.
+        try:
+            agents, truncated = answer(call, deadline)
+            rows = [(a.get("state"), a.get("updatedAt")) for a in agents]
+        except Exception as e:  # noqa: BLE001: a server not read is decided below
+            unread.append(f"{data}: {e}")
+            continue
+        partial = partial or truncated
+        for state, updated in rows:
+            if state in IDLE_STATES:
+                idle += 1
+            else:
+                busy.append(str(state))
+            # updatedAt (ms) moves at every status change, so a turn that starts and ends
+            # between two readings still changes it.
+            if isinstance(updated, (int, float)):
+                seq = max(seq, int(updated))
+    # A server not read never hides work another server reported: busy stays busy. When all
+    # that was read is idle, a server not read fails the probe, as a single one always did
+    # (counted idle: a broken or old orcad must not keep the sandbox up forever).
+    if busy:
+        say(True, f"{len(busy)} agents active ({','.join(sorted(set(busy)))})", seq)
+    elif partial:
+        # Orca listed only some agents: one it left out may be working.
+        say(True, "orca listed only some agents", seq)
+    elif unread:
+        raise RuntimeError("; ".join(unread))
+    else:
+        say(False, f"no active agents ({idle} idle)", seq)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001: any failure is the probe's failure
+        print(f"orca probe: {e}", file=sys.stderr)
+        sys.exit(1)

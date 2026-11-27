@@ -1667,7 +1667,8 @@ impl Core {
     /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
     /// installed (never an older version) and paired, then its app opens with the pairing
     /// link; a link ADE (cmux) gets its prep command, then its link opens; an SSH host ADE
-    /// (Orca, Paseo) gets its setup (Paseo's daemon), then its host written and its app started.
+    /// (Orca, Paseo) gets its setup (Orca's probe, Paseo's daemon), then its host written and
+    /// its app started.
     /// A host ADE (Paradev) is checked: once its host runs, the sandbox is marked and opens in
     /// it; else the user sets the host up in the app (`open_host`). A terminal ADE (Herdr) is
     /// installed, then opens in a terminal (`open_terminal`).
@@ -6211,26 +6212,35 @@ mod tests {
         );
         let cfg = std::fs::read_to_string(ssh_config::config_path(o.home.path())).unwrap();
         assert_eq!(cfg, format!("{}\n", ssh_config::INCLUDE));
+        o.core.probes_settled().await;
         let r = requests(&server).await;
-        assert!(
-            !r.iter().any(|x| x.ends_with("/exec")),
-            "nothing runs: {r:?}"
-        );
         assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // On the sandbox, Open only brings the probe up to date, in the background, and
+        // records its hash.
+        let probe = ade::orca::OPEN_PROBE;
+        assert_eq!(exec_cmds(&server).await, [probe.script()]);
+        let key = ("m1".to_string(), Ade::Orca);
+        assert_eq!(
+            o.core.lock().data.open_probes.get(&key),
+            Some(&probe.hash())
+        );
         // Again: the same host, the stored token, the app started once more.
         let again = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
         assert_eq!(again.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(hosts_of(o.home.path()), hosts);
         assert_eq!(o.opened.lock().unwrap().len(), 2);
+        o.core.probes_settled().await;
         let r = requests(&server).await;
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
+        // The same probe hash on record: nothing runs on the sandbox.
+        assert_eq!(exec_cmds(&server).await.len(), 1);
         // Orca pairs nothing, so the sandbox does not join the T3 pairings from here.
         assert!(!o.core.lock().data.connected.contains("m1"));
     }
 
     #[tokio::test]
-    async fn open_in_orca_of_a_sandbox_without_it_marks_it_with_no_exec() {
+    async fn open_in_orca_of_a_sandbox_without_it_installs_the_probe_then_marks_it() {
         let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
         let o = orca_core(&base, OrcaHere::Real);
         o.core
@@ -6239,12 +6249,25 @@ mod tests {
         let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
         assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
+        o.core.probes_settled().await;
         let reqs = server.received_requests().await.unwrap();
-        assert!(
-            !reqs.iter().any(|r| r.url.path().ends_with("/exec")),
-            "Orca installs its own server: nothing runs on the sandbox"
-        );
-        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        // Orca installs its own server: the one command is the setup with its activity probe.
+        // This Open went through Install, so no install in the background follows it.
+        let execs: Vec<_> = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1, "one exec");
+        let (at, exec) = execs[0];
+        let body: serde_json::Value = serde_json::from_slice(&exec.body).unwrap();
+        assert_eq!(body["cmd"], ade::orca::setup_script("1.4.269"));
+        let mark = reqs
+            .iter()
+            .position(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        assert!(at < mark, "the mark comes after the setup");
+        let patch = &reqs[mark];
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         assert_eq!(body["metadata"]["instabox-bridge"], "t3");
         assert_eq!(body["metadata"]["instabox-ades"], "t3,orca");
@@ -7001,7 +7024,7 @@ mod tests {
         assert_eq!(exec_cmds(&server).await.len(), 2);
         // An ADE with no probe for Open, or another account's flow, runs nothing.
         p.core.probing.lock().unwrap().clear();
-        p.core.refresh_probe(Ade::Orca, "m1", account);
+        p.core.refresh_probe(Ade::Cmux, "m1", account);
         p.core.refresh_probe(Ade::Paseo, "m1", account + 1);
         p.core.probes_settled().await;
         assert_eq!(exec_cmds(&server).await.len(), 2);

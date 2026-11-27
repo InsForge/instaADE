@@ -1,7 +1,7 @@
 //! Create a sandbox (or take an existing one), set an ADE up on it and mark it connected.
 //! A pairing ADE (T3) is installed, paired and its port published; a link ADE (cmux) gets its
 //! prep command, and the app opens its link afterwards. An SSH host ADE gets its setup, if it
-//! has one (Paseo's daemon; Orca has none), then the mark, and the app writes its host
+//! has one (Paseo's daemon, Orca's activity probe), then the mark, and the app writes its host
 //! afterwards. A host ADE (Paradev) is only checked: once its host runs, the sandbox is marked
 //! and gets its link. A terminal ADE (Herdr) is installed, and the app opens it in a terminal
 //! afterwards.
@@ -202,8 +202,8 @@ async fn install_and_pair(
         let prep = Some((l.prep.to_string(), PREP_TIMEOUT_SECS));
         return prepare(client, ade, prep, id, desktop_version, progress).await;
     }
-    // An SSH host ADE needs nothing on the sandbox (Orca), or its server (Paseo's daemon): the
-    // app writes the host afterwards.
+    // An SSH host ADE needs its server (Paseo's daemon) or only an activity probe (Orca, which
+    // brings its own server) on the sandbox: the app writes the host afterwards.
     if let Open::SshHost(h) = ade.open() {
         let setup = h.setup.map(|s| (s(desktop_version), SETUP_TIMEOUT_SECS));
         return prepare(client, ade, setup, id, desktop_version, progress).await;
@@ -281,8 +281,8 @@ async fn install_and_pair(
 
 /// Sets a link ADE up: one run of its prep command, if it has one, then the mark. There is no
 /// version to compare and no link yet: the app makes it with an SSH token. An SSH host ADE gets
-/// the same: Orca has no command and only gets the mark, Paseo's setup installs and starts its
-/// daemon first. `prep` is the command with its timeout in seconds.
+/// the same: Orca's setup installs its activity probe first, Paseo's installs and starts its
+/// daemon. `prep` is the command with its timeout in seconds.
 async fn prepare(
     client: &Client,
     ade: Ade,
