@@ -204,8 +204,8 @@ pub const PROBE: Probe = Probe {
 const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
 
 /// The probe Open installs or updates in the background (`Ade::probe_on_open`), with the CLI
-/// link the setup makes for it. Without a `paseo`, only the probe goes in: it then says there
-/// is no daemon.
+/// link the setup makes for it. Without a `paseo`, only the probe goes in. It then says there
+/// is no daemon, or, when one answers, fails for want of the CLI, which counts as idle.
 pub const OPEN_PROBE: OpenProbe = OpenProbe {
     probe: PROBE,
     prep: r#"if cli=$(command -v paseo); then
