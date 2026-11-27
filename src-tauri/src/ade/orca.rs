@@ -1031,6 +1031,22 @@ mod tests {
             .unwrap()
     }
 
+    /// Waits until this user's process list shows a command line with `needle`.
+    #[cfg(unix)]
+    fn wait_listed(needle: &str) {
+        for _ in 0..40 {
+            let out = std::process::Command::new("ps")
+                .args(["-A", "-ww", "-o", "args="])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&out.stdout).contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{needle} is not in the process list");
+    }
+
     /// The probe's answer once the process list shows the relay processes (`ps` reads
     /// them from the system, which a fresh process may not be in yet).
     #[cfg(unix)]
@@ -1072,7 +1088,8 @@ mod tests {
         running
             .0
             .push(relay_process(home.path(), sock, &["--orca-cli", "status"]));
-        std::thread::sleep(Duration::from_millis(300));
+        wait_listed(&other.path().display().to_string());
+        wait_listed("--orca-cli status");
         assert_eq!(
             run_probe(home.path()).unwrap().answer(),
             serde_json::json!({"busy": false, "reason": "no orca server"})
@@ -1087,13 +1104,20 @@ mod tests {
             answer_with_relay(home.path(), "app not connected").unwrap(),
             serde_json::json!({"busy": false, "reason": alone})
         );
-        // A client of another relay's socket, one that no longer runs, is not this app.
+        // A client of another relay's socket, one that no longer runs, is not this app, nor
+        // is a command through the CLI bridge on the relay's own socket.
         running.0.push(relay_process(
             home.path(),
             "relay-0000000000000000.sock",
             &["--connect"],
         ));
-        std::thread::sleep(Duration::from_millis(300));
+        running.0.push(relay_process(
+            home.path(),
+            sock,
+            &["--connect", "--orca-cli", "worktree", "ps"],
+        ));
+        wait_listed("relay-0000000000000000.sock");
+        wait_listed("--orca-cli worktree ps");
         assert_eq!(
             run_probe(home.path()).unwrap().answer()["reason"],
             alone.as_str()

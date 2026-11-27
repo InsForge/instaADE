@@ -138,7 +138,8 @@ def relay():
             continue
         if "--detached" in args:
             detached.add(sock)
-        elif "--connect" in args:
+        elif "--connect" in args and "--orca-cli" not in args:
+            # A command through the relay's CLI bridge is not the app.
             clients.add(sock)
     if not detached:
         return None
