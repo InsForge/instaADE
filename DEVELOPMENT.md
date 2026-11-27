@@ -9,7 +9,7 @@ Read this before you change the code, open a pull request, build a preview or cu
   - `api/`: the instabox API client. `auth.rs`: device sign-in and token storage.
   - `sandbox/`: create, connect, sync and lifecycle of sandboxes.
   - `ade/`: the ADE registry (`mod.rs`) and one module per ADE (`t3.rs`, `cmux.rs`, `orca.rs`, `paradev.rs`, `paseo.rs`, `herdr.rs`).
-  - `ssh.rs`: SSH tokens and the login commands, and the terminal that Open in Terminal and Herdr open. `ssh_config.rs`: the SSH hosts InstaADE writes for Orca and Paseo, and the one line it adds to `~/.ssh/config`.
+  - `ssh.rs`: the two SSH tokens of a sandbox (`Kind`: background and ordinary, see [SSH tokens](docs/ades.md#ssh-tokens)) and the login commands, and the terminal that Open in Terminal and Herdr open. `ssh_config.rs`: the SSH hosts InstaADE writes for Orca and Paseo, with the background token, and the one line it adds to `~/.ssh/config`.
   - `clipboard.rs`: copies a secret the user pastes once (Paradev's SSH address) and clears it a minute later, and copies Paseo's host address, which holds no secret and stays.
   - `old_app.rs`: finds a copy of the app from before it was InstaADE, and moves it to the Trash (see [The old app](#the-old-app)).
   - `agents.rs`: signing Claude Code or Codex in on a sandbox. `tray.rs`: the menu bar popover. `login.rs`: start at login.
@@ -71,6 +71,8 @@ Pull requests that add an ADE are welcome. Read [How InstaADE works with each AD
 A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. If the user adds the host by hand, it also needs the address to copy, and if its app needs a server on the sandbox, a setup that runs it and an idle probe for the agents it runs outside a terminal (Paseo's daemon). A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host. A terminal ADE needs an install script that prints its version, a version check, and the command the SSH session runs. An ADE with a probe whose Open runs nothing on the sandbox can return it from `Ade::probe_on_open` (Orca and Paseo do): Open then installs or updates the probe in the background, once per sandbox and probe hash while the app runs (`Core::refresh_probe`).
 
 An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca, Paradev and Paseo do. A terminal ADE gives the token to the OpenSSH client only, on its command line, as Open in Terminal does, so it has no app to check. It runs the client `locate` found, by its path, and builds the arguments with `ssh::terminal_args`, which refuses a host or token with anything a shell could run. `ssh::open_in_terminal` checks every argument again before any of it reaches a terminal.
+
+`Ade::ssh_token` says which of the sandbox's two SSH tokens an ADE gets. An app that stays connected by itself and sends heartbeats (a link or an SSH host ADE) gets the background token, so its connections do not keep the sandbox awake. A login the user starts (a terminal ADE) and a host ADE's setup get the ordinary token. Only the background token goes into the SSH host (`ssh_config::SyncedStore`), so a new ordinary token never changes it.
 
 ## The old app
 

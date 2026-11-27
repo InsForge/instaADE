@@ -367,9 +367,20 @@ impl Client {
         self.call(r).await
     }
 
-    pub async fn ssh_token(&self, id: &str, name: &str, ttl_seconds: u64) -> Result<SshToken> {
-        let r = Req::new(Method::POST, &["v1", "machines", id, "ssh-tokens"])
-            .json(&serde_json::json!({ "name": name, "ttlSeconds": ttl_seconds }));
+    /// A new SSH token of sandbox `id`. `background` asks for a background token, and an
+    /// ordinary one sends the body older releases sent.
+    pub async fn ssh_token(
+        &self,
+        id: &str,
+        name: &str,
+        ttl_seconds: u64,
+        background: bool,
+    ) -> Result<SshToken> {
+        let mut body = serde_json::json!({ "name": name, "ttlSeconds": ttl_seconds });
+        if background {
+            body["background"] = serde_json::Value::Bool(true);
+        }
+        let r = Req::new(Method::POST, &["v1", "machines", id, "ssh-tokens"]).json(&body);
         self.call(r).await
     }
 
@@ -726,6 +737,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((r.stdout.as_str(), r.exit_code), ("o", 0));
-        assert_eq!(c.ssh_token("m1", "n", 60).await.unwrap().port, 22);
+        let t = c.ssh_token("m1", "n", 60, false).await.unwrap();
+        assert_eq!(t.port, 22);
+        assert!(
+            !t.background,
+            "a reply without background is an ordinary token"
+        );
     }
 }

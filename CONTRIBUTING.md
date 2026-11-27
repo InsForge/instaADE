@@ -33,7 +33,7 @@ An ADE fits InstaADE when it has a desktop app on macOS or Windows, or runs in a
 
 1. Read [How InstaADE works with each ADE](docs/ades.md) to see how the ADEs differ.
 2. Follow [Adding an ADE](DEVELOPMENT.md#adding-an-ade) for the files to change.
-3. If the ADE gets an SSH token, check in `Ade::verify` that its app is the real one.
+3. If the ADE gets an SSH token, check in `Ade::verify` that its app is the real one, and pick its token in `Ade::ssh_token` (see [SSH tokens](docs/ades.md#ssh-tokens)).
 4. Add the ADE to the README's [Supported ADEs](README.md#supported-ades) and give it a section in `docs/ades.md`.
 5. In the pull request, show the ADE working from **Install** to **Open**, in a short video or screenshots.
 

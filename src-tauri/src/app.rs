@@ -31,13 +31,13 @@ use crate::sandbox::view::{
     self, SandboxView, SizeChoice, SleepChoice, ViewState, is_linux_template,
 };
 use crate::sandbox::{self, SandboxError, connect, lifecycle};
-use crate::ssh::{self, SshTokenStore};
+use crate::ssh::{self, Kind, SshTokenStore};
 use crate::ssh_config;
 use crate::updater::UpdateView;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
-/// A sandbox with an InstaADE SSH host (Orca, Paseo) gets a new token once the stored one has
-/// fewer days left than this, so the host keeps working without a click.
+/// A sandbox with an InstaADE SSH host (Orca, Paseo) gets a new background token once the
+/// stored one has fewer days left than this, so the host keeps working without a click.
 const HOST_TOKEN_RENEW_DAYS: i64 = 7;
 const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
 const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
@@ -709,6 +709,9 @@ pub struct Core {
     hook: Mutex<Option<Hook>>,
     /// A pass of `renew_ssh_hosts` is running.
     renewing: std::sync::atomic::AtomicBool,
+    /// The log said, this run, that the server made an ordinary token in place of a background
+    /// one (`note_ordinary`). It says so once.
+    ordinary_logged: std::sync::atomic::AtomicBool,
     /// The sandboxes and ADEs whose probe an Open installs now (`refresh_probe`).
     probing: Mutex<HashSet<(String, Ade)>>,
     /// Test only: the probe installs Opens started, so a test can wait for them.
@@ -851,6 +854,7 @@ impl Core {
             #[cfg(test)]
             hook: Mutex::new(None),
             renewing: std::sync::atomic::AtomicBool::new(false),
+            ordinary_logged: std::sync::atomic::AtomicBool::new(false),
             probing: Mutex::new(HashSet::new()),
             #[cfg(test)]
             probe_tasks: Mutex::new(Vec::new()),
@@ -1376,11 +1380,45 @@ impl Core {
             .push(line);
     }
 
+    /// `ade`'s SSH token of sandbox `id` (`Ade::ssh_token`), from `ssh::token`: the stored one
+    /// while it has more than a day left, else a new 30-day one.
+    async fn ade_token(
+        self: &Arc<Self>,
+        ade: Ade,
+        client: &Client,
+        id: &str,
+        account: u64,
+    ) -> Res<crate::api::SshToken> {
+        let kind = ade.ssh_token().unwrap_or(Kind::Ordinary);
+        let t = ssh::token(client, &*self.ssh, id, kind, &self.gate(account))
+            .await
+            .map_err(ErrorView::from)?;
+        self.note_ordinary(kind, &t);
+        Ok(t)
+    }
+
+    /// Logs, once per run, that the server made an ordinary token where `kind` asked for a
+    /// background one, as an instabox without background tokens does. The token is used all
+    /// the same.
+    fn note_ordinary(&self, kind: Kind, t: &crate::api::SshToken) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if ssh::ordinary_in_place_of_background(kind, t) && !self.ordinary_logged.swap(true, SeqCst)
+        {
+            self.log(
+                "SSH tokens: the server made an ordinary token where a background one was asked \
+                 for, so the connections of cmux, Orca and Paseo count as activity"
+                    .to_string(),
+            );
+        }
+    }
+
     /// Keeps every SSH host InstaADE wrote (Orca, Paseo) working without a click. For each sandbox
-    /// with a host, a stored token with fewer than 7 days left, or none, is renewed the way
-    /// `ssh::token` makes one, and the token store rewrites the host's `User` as it saves it.
-    /// A token with 7 days or more is left alone. Tokens are made over the API only, so no
-    /// sandbox wakes. A sandbox the API no longer has loses its host. Every write goes through
+    /// with a host, a stored background token with fewer than 7 days left, or none, is renewed
+    /// the way `ssh::token` makes one, and the token store rewrites the host's `User` as it
+    /// saves it. So a host an older release wrote with the ordinary token gets the background
+    /// one at the first pass, and keeps its alias. The ordinary token is not renewed here: no
+    /// host holds it. A token with 7 days or more is left alone. Tokens are made over the API
+    /// only, so no sandbox wakes. A sandbox the API no longer has loses its host. Every write goes through
     /// the gate of the account the pass began under, so nothing happens once it changed. A
     /// failure is logged and tried again on the next full refresh; the popover never shows it.
     /// A host that could not take a new token keeps the stored token behind, so the next pass
@@ -1439,11 +1477,19 @@ impl Core {
                 }
                 continue;
             }
-            match ssh::token_and_save(&client, &*self.ssh, &id, &gate, margin).await {
-                // The store refused the new token, as it does when the host cannot take it.
-                Ok((_, Err(e))) => log(format!("SSH host of sandbox {id}: {e}")),
-                // The host holds the token in use, also when it fell behind the stored one.
+            let kind = Kind::Background;
+            match ssh::token_and_save(&client, &*self.ssh, &id, kind, &gate, margin).await {
+                // The store refused the new token, as it does when the host cannot take it. The
+                // host may hold it all the same (it is written before the keychain), so an
+                // ordinary token in place of a background one is still said once.
+                Ok((t, Err(e))) => {
+                    self.note_ordinary(kind, &t);
+                    log(format!("SSH host of sandbox {id}: {e}"));
+                }
+                // The host holds the token in use, also when it fell behind the stored one, or
+                // holds the ordinary token an older release put there.
                 Ok((t, Ok(()))) => {
+                    self.note_ordinary(kind, &t);
                     let home = self.home.clone();
                     if let Some(Err(e)) =
                         guarded(&gate, || ssh_config::update_login(&home, &id, &t))
@@ -1868,13 +1914,15 @@ impl Core {
     /// does not wake it), and checks the app again (identifier and signature) right before the
     /// token is made or loaded, since the wake can take minutes: with no app, or one that fails
     /// the check, no token is made and nothing opens. A wake that fails is the error, and
-    /// nothing opens. The token comes from `ssh::token`: the stored one while it has more than a
-    /// day left, else a new 30-day one.
+    /// nothing opens. The token is the sandbox's background one (`ade_token`): the app stays
+    /// connected on its own, and its connections must not keep the sandbox awake.
     ///
     /// An SSH host ADE (Orca, Paseo) goes the same way. It checks the app, wakes the sandbox,
-    /// checks the app again, makes or loads the token, writes it into the sandbox's host in the
-    /// user's SSH config, copies the host's address for an app that adds hosts by it (Paseo),
-    /// starts the app that passed the last check and returns what the user does next there.
+    /// checks the app again, makes or loads the background token, writes it into the sandbox's
+    /// host in the user's SSH config, copies the host's address for an app that adds hosts by
+    /// it (Paseo), starts the app that passed the last check and returns what the user does
+    /// next there. A host an older release wrote with the ordinary token keeps its alias and
+    /// gets the background token as its `User`.
     async fn open_link(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let open = ade.open();
         if let Open::Pair(_) = open {
@@ -1910,9 +1958,7 @@ impl Core {
         // A wake can take minutes: the app is found and checked again right before the token,
         // and the app that passes this check is the one opened.
         let app = self.checked_app(ade).await?;
-        let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
-            .await
-            .map_err(ErrorView::from)?;
+        let t = self.ade_token(ade, &client, id, account).await?;
         match open {
             Open::Link(l) => {
                 let link = (l.link)(&SshLogin {
@@ -2001,10 +2047,10 @@ impl Core {
 
     /// Opens a host ADE (Paradev) for running sandbox `id`, only in the ADE's own app, checked
     /// again right before. With the sandbox's `link` (its host runs), it opens the sandbox in
-    /// the app. Without one, the user sets the host up in the app: the SSH address, with an
-    /// SSH token from `ssh::token`, goes on the clipboard, the app opens its host setup, and the
-    /// answer is the ADE's notice of what to do there. With no app, or one that fails the
-    /// check, no token is made, nothing is copied and nothing opens.
+    /// the app. Without one, the user sets the host up in the app: the SSH address, with the
+    /// sandbox's ordinary SSH token (`ade_token`), goes on the clipboard, the app opens its host
+    /// setup, and the answer is the ADE's notice of what to do there. With no app, or one that
+    /// fails the check, no token is made, nothing is copied and nothing opens.
     async fn open_host(
         self: &Arc<Self>,
         ade: Ade,
@@ -2027,9 +2073,7 @@ impl Core {
             .read_in(account, |i| i.client.clone())
             .flatten()
             .ok_or_else(account_changed)?;
-        let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
-            .await
-            .map_err(ErrorView::from)?;
+        let t = self.ade_token(ade, &client, id, account).await?;
         let address = (h.ssh_address)(&SshLogin {
             host: &t.host,
             port: t.port,
@@ -2055,8 +2099,9 @@ impl Core {
     /// the sandbox wakes, since the SSH gateway refuses a paused one. The client is looked for
     /// again right before the token, since the wake can take minutes, and the one found then is
     /// the one that runs: its exact path goes to the terminal, never a bare `ssh` the terminal
-    /// would look up. The token comes from `ssh::token`, and goes to that client only, on its
-    /// command line, as with Open in Terminal. A host or token that is not plain opens nothing
+    /// would look up. The token is the sandbox's ordinary one (`ade_token`), as for Open in
+    /// Terminal, and goes to that client only, on its command line, never through the SSH host
+    /// Orca and Paseo use. A host or token that is not plain opens nothing
     /// (`ssh::terminal_args`).
     async fn open_terminal(self: &Arc<Self>, ade: Ade, id: &str, account: u64) -> Res<Notice> {
         let Open::Terminal(t) = ade.open() else {
@@ -2074,9 +2119,7 @@ impl Core {
             .await
             .map_err(ErrorView::from)?;
         let ssh_client = self.checked_app(ade).await?;
-        let tok = ssh::token(&client, &*self.ssh, id, &self.gate(account))
-            .await
-            .map_err(ErrorView::from)?;
+        let tok = self.ade_token(ade, &client, id, account).await?;
         let args = ssh::terminal_args(&tok, t.command).map_err(ErrorView::other)?;
         guarded(&self.gate(account), || (self.terminal)(&ssh_client, &args))
             .ok_or_else(account_changed)?
@@ -2435,8 +2478,9 @@ impl Core {
         Ok(agents::signed_in(&client, id, agent).await)
     }
 
-    /// The SSH login command to show and copy. The details view shows a failure next to
-    /// the SSH row, so this leaves `state.error` alone.
+    /// The SSH login command to show and copy, with the sandbox's ordinary token: the user
+    /// runs it, and it wakes the sandbox. The details view shows a failure next to the SSH row,
+    /// so this leaves `state.error` alone.
     pub async fn ssh_command(self: &Arc<Self>, id: &str) -> Res<String> {
         let r = match self.signed_in() {
             Ok((client, account)) => self.login_command(&client, id, account).await,
@@ -2454,22 +2498,23 @@ impl Core {
         id: &str,
         account: u64,
     ) -> Res<String> {
-        let t = ssh::token(client, &*self.ssh, id, &self.gate(account))
+        let t = ssh::token(client, &*self.ssh, id, Kind::Ordinary, &self.gate(account))
             .await
             .map_err(ErrorView::from)?;
         Ok(ssh::display_command(&t))
     }
 
-    /// Opens the sandbox's SSH login in a terminal, built from the token's fields
-    /// (`ssh::login_args`), never from the command string the server formats. A host or token
-    /// that is not plain opens nothing.
+    /// Opens the sandbox's SSH login in a terminal, with its ordinary token, built from the
+    /// token's fields (`ssh::login_args`), never from the command string the server formats. A
+    /// host or token that is not plain opens nothing.
     pub async fn open_ssh(self: &Arc<Self>, id: &str) -> Res<()> {
         let (client, account) = match self.signed_in() {
             Ok(v) => v,
             Err(e) => return self.settle(Err(e)),
         };
         let r = async {
-            let t = ssh::token(&client, &*self.ssh, id, &self.gate(account))
+            let gate = self.gate(account);
+            let t = ssh::token(&client, &*self.ssh, id, Kind::Ordinary, &gate)
                 .await
                 .map_err(ErrorView::from)?;
             let args = ssh::login_args(&t).map_err(ErrorView::other)?;
@@ -3450,7 +3495,7 @@ mod tests {
     #[tokio::test]
     async fn the_ssh_command_leaves_the_error_line_alone() {
         let ssh = Arc::new(MemorySshStore::default());
-        ssh.save("m1", &ssh_token()).unwrap();
+        ssh.save("m1", Kind::Ordinary, &ssh_token()).unwrap();
         let base = api_base(None);
         let core = Arc::new(Core::new(
             base.clone(),
@@ -3526,6 +3571,7 @@ mod tests {
             command: "ssh ibssh_x@ssh.example.test".into(),
             expires_at: Some(Utc::now() + chrono::Duration::days(20)),
             host_key_fingerprint: None,
+            background: false,
         }
     }
 
@@ -3546,8 +3592,9 @@ mod tests {
         let keys = Arc::new(MemoryKeyStore::default());
         keys.save("ibk_secret").unwrap();
         let ssh = Arc::new(MemorySshStore::default());
-        ssh.save("a", &ssh_token()).unwrap();
-        ssh.save("e", &ssh_token()).unwrap();
+        ssh.save("a", Kind::Ordinary, &ssh_token()).unwrap();
+        ssh.save("a", Kind::Background, &ssh_token()).unwrap();
+        ssh.save("e", Kind::Ordinary, &ssh_token()).unwrap();
         let connected = Arc::new(MemoryConnectedStore::default());
         connected.add(7, "a", &crate::gate::Open).unwrap();
         let emitted = Arc::new(Mutex::new(Vec::<AppState>::new()));
@@ -3577,8 +3624,10 @@ mod tests {
 
         assert_eq!(store.load().unwrap(), None, "tokens cleared");
         assert_eq!(keys.load().unwrap(), None, "MCP key cleared");
-        assert_eq!(ssh.load("a").unwrap(), None, "SSH tokens cleared");
-        assert_eq!(ssh.load("e").unwrap(), None);
+        for kind in [Kind::Ordinary, Kind::Background] {
+            assert_eq!(ssh.load("a", kind).unwrap(), None, "SSH tokens cleared");
+            assert_eq!(ssh.load("e", kind).unwrap(), None);
+        }
         let s = core.state();
         assert!(!s.signed_in);
         assert!(s.sandboxes.is_empty() && s.orgs.is_empty() && s.login.is_none());
@@ -3632,7 +3681,8 @@ mod tests {
         let keys = Arc::new(MemoryKeyStore::default());
         keys.save("ibk_secret").unwrap();
         let ssh = Arc::new(MemorySshStore::default());
-        ssh.save("a", &ssh_token()).unwrap();
+        ssh.save("a", Kind::Ordinary, &ssh_token()).unwrap();
+        ssh.save("a", Kind::Background, &ssh_token()).unwrap();
         let signed_out = Arc::new(tokio::sync::Notify::new());
         let signal = signed_out.clone();
         let core = Arc::new(Core::new(
@@ -3672,7 +3722,9 @@ mod tests {
         );
         assert_eq!(store.load().unwrap(), None, "tokens cleared");
         assert_eq!(keys.load().unwrap(), None, "MCP key cleared");
-        assert_eq!(ssh.load("a").unwrap(), None, "SSH tokens cleared");
+        for kind in [Kind::Ordinary, Kind::Background] {
+            assert_eq!(ssh.load("a", kind).unwrap(), None, "SSH tokens cleared");
+        }
     }
 
     #[tokio::test]
@@ -4214,10 +4266,25 @@ mod tests {
         assert!(opened.lock().unwrap().is_empty(), "no pairing link opened");
     }
 
+    /// The reply to a new SSH token `token` of `m1`, a background one when `background`.
+    fn minted(token: &str, background: bool) -> serde_json::Value {
+        let mut t = serde_json::json!({
+            "id": "k1", "name": "Instabox", "host": "ssh.example.test", "port": 2222,
+            "token": token, "command": format!("ssh -p 2222 {token}@ssh.example.test"),
+            "expiresAt": Utc::now() + chrono::Duration::days(30)
+        });
+        if background {
+            t["background"] = true.into();
+            t["backgroundActive"] = true.into();
+        }
+        t
+    }
+
     /// A mock API with one running sandbox `m1` named "dev 1" with `metadata`. It mints SSH
-    /// tokens, answers every exec with success, takes a metadata patch and creates sandboxes.
+    /// tokens (`ibssh_new`, a background one when asked, as a server with background tokens
+    /// does), answers every exec with success, takes a metadata patch and creates sandboxes.
     async fn cmux_server(metadata: serde_json::Value) -> (wiremock::MockServer, Url) {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         let m1 = serde_json::json!({
@@ -4225,6 +4292,14 @@ mod tests {
             "template": {"id": "agent-browser"}, "spec": {"vcpus": 2, "memMiB": 4096},
             "metadata": metadata, "orgId": "org-me"
         });
+        // Ahead of the ordinary token below, behind a test's own answers (priority 1).
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .and(body_partial_json(serde_json::json!({"background": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(minted("ibssh_new", true)))
+            .with_priority(3)
+            .mount(&server)
+            .await;
         let answers = [
             (
                 "GET",
@@ -4236,11 +4311,7 @@ mod tests {
             (
                 "POST",
                 "/v1/machines/m1/ssh-tokens",
-                serde_json::json!({
-                    "id": "k1", "name": "Instabox", "host": "ssh.example.test", "port": 2222,
-                    "token": "ibssh_new", "command": "ssh -p 2222 ibssh_new@ssh.example.test",
-                    "expiresAt": Utc::now() + chrono::Duration::days(30)
-                }),
+                minted("ibssh_new", false),
             ),
             (
                 "POST",
@@ -4372,8 +4443,10 @@ mod tests {
             1,
             "{r:?}"
         );
-        // The token is kept, so the next open reuses it.
-        assert_eq!(ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        // The token is kept as the background one, so the next open reuses it.
+        let kept = ssh.load("m1", Kind::Background).unwrap().unwrap();
+        assert_eq!((kept.token.as_str(), kept.background), ("ibssh_new", true));
+        assert_eq!(ssh.load("m1", Kind::Ordinary).unwrap(), None);
         core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
         assert_eq!(
             *opened.lock().unwrap(),
@@ -4512,7 +4585,7 @@ mod tests {
             .await;
             let ssh = Arc::new(MemorySshStore::default());
             // Even a stored token is not loaded for an app that fails the check.
-            ssh.save("m1", &ssh_token()).unwrap();
+            ssh.save("m1", Kind::Background, &ssh_token()).unwrap();
             let CmuxCore {
                 core,
                 opened,
@@ -5680,7 +5753,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         core.sign_out().await.unwrap();
         assert!(call.await.unwrap().is_err());
-        assert_eq!(ssh.load("m1").unwrap(), None, "no token saved");
+        assert_eq!(
+            ssh.load("m1", Kind::Ordinary).unwrap(),
+            None,
+            "no token saved"
+        );
     }
 
     // ---- account boundary: forced interleavings ----
@@ -5975,7 +6052,7 @@ mod tests {
             let keys = Arc::new(MemoryKeyStore::default());
             keys.save("ibk_a").unwrap();
             let ssh = Arc::new(MemorySshStore::default());
-            ssh.save("m1", &ssh_token()).unwrap();
+            ssh.save("m1", Kind::Ordinary, &ssh_token()).unwrap();
             let core = Arc::new(Core::new(
                 base.clone(),
                 keys.clone(),
@@ -6015,7 +6092,7 @@ mod tests {
                 format!("{status}: A's MCP key is still there"),
             );
             c.check(
-                ssh.load("m1").unwrap().is_none(),
+                ssh.load("m1", Kind::Ordinary).unwrap().is_none(),
                 format!("{status}: A's SSH token is still there"),
             );
         }
@@ -6088,10 +6165,12 @@ mod tests {
         c.check(core.account() != before, "the account count did not move");
         c.check(store.load().unwrap().is_none(), "tokens kept");
         c.check(keys.load().unwrap().is_none(), "its MCP key is still there");
-        c.check(
-            ssh.load("a").unwrap().is_none(),
-            "its SSH token is still there",
-        );
+        for kind in [Kind::Ordinary, Kind::Background] {
+            c.check(
+                ssh.load("a", kind).unwrap().is_none(),
+                format!("its {kind:?} SSH token is still there"),
+            );
+        }
         c.done();
     }
 
@@ -6152,7 +6231,7 @@ mod tests {
         let b = device_session(store.clone(), "iba_b").await;
         let after_b = core.install_signed_in(b, core.account()).unwrap();
         keys.save("ibk_b").unwrap();
-        ssh.save("b1", &ssh_token()).unwrap();
+        ssh.save("b1", Kind::Ordinary, &ssh_token()).unwrap();
         // A's watcher saw A end with the replacement.
         let ran = tokio::time::timeout(Duration::from_secs(3), watcher_ran.notified()).await;
         assert!(ran.is_ok(), "A's watcher never ran");
@@ -6178,7 +6257,10 @@ mod tests {
             format!("store holds {saved:?}"),
         );
         c.check(keys.load().unwrap().is_some(), "B's MCP key is gone");
-        c.check(ssh.load("b1").unwrap().is_some(), "B's SSH token is gone");
+        c.check(
+            ssh.load("b1", Kind::Ordinary).unwrap().is_some(),
+            "B's SSH token is gone",
+        );
         c.done();
     }
 
@@ -6450,7 +6532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_token_from_another_action_rewrites_the_orca_host() {
+    async fn a_new_ordinary_token_leaves_the_orca_host_and_a_new_background_one_rewrites_it() {
         let (_server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
                 .await;
@@ -6458,39 +6540,51 @@ mod tests {
         // The store the app uses: the keychain, wrapped to keep the hosts in step.
         let store =
             ssh_config::SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
-        let mut old = ssh_token();
-        old.token = "ibssh_old".into();
-        old.expires_at = Some(Utc::now() + chrono::Duration::hours(2));
-        ssh_config::write_host(home.path(), "m1", "dev 1", &old).unwrap();
-        store.save("m1", &old).unwrap();
+        let soon = chrono::Duration::hours(2);
+        let old = token_left("ibssh_old", soon);
+        let bg = token_left("ibssh_bg", soon);
+        ssh_config::write_host(home.path(), "m1", "dev 1", &bg).unwrap();
+        store.save("m1", Kind::Ordinary, &old).unwrap();
+        store.save("m1", Kind::Background, &bg).unwrap();
         let o = orca_core(&base, OrcaHere::Real);
         let client = o.core.client().unwrap();
         // The SSH command or an agent sign-in asks for a token, and the stored one runs out soon.
-        let t = ssh::token(&client, &store, "m1", &crate::gate::Open)
+        let open = &crate::gate::Open;
+        let t = ssh::token(&client, &store, "m1", Kind::Ordinary, open)
             .await
             .unwrap();
-        assert_eq!(t.token, "ibssh_new");
+        assert_eq!((t.token.as_str(), t.background), ("ibssh_new", false));
         let hosts = hosts_of(home.path());
+        assert!(hosts.contains("  User ibssh_bg\n"), "{hosts}");
+        assert!(!hosts.contains("ibssh_new"), "{hosts}");
+        // A new background token, as Open in Orca or the renewal makes, goes into the host.
+        let t = ssh::token(&client, &store, "m1", Kind::Background, open)
+            .await
+            .unwrap();
+        assert_eq!((t.token.as_str(), t.background), ("ibssh_new", true));
+        let hosts = hosts_of(home.path());
+        assert!(hosts.contains("Host instabox-dev-1\n"), "{hosts}");
         assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
-        assert!(!hosts.contains("ibssh_old"), "{hosts}");
+        assert!(!hosts.contains("ibssh_bg"), "{hosts}");
     }
 
     // ---- Orca: renewing the hosts' tokens ----
 
-    /// A token of `m1` named `token` with `left` until it runs out.
+    /// A background token of `m1` named `token` with `left` until it runs out.
     fn token_left(token: &str, left: chrono::Duration) -> crate::api::SshToken {
         crate::api::SshToken {
             token: token.into(),
             command: format!("ssh {token}@ssh.example.test"),
             expires_at: Some(Utc::now() + left),
+            background: true,
             ..ssh_token()
         }
     }
 
-    /// Writes the host of `id` with `t` and keeps `t` in the core's token store.
+    /// Writes the host of `id` with `t` and keeps `t` as the core's background token.
     fn host_with(o: &OrcaCore, id: &str, t: &crate::api::SshToken) {
         ssh_config::write_host(o.home.path(), id, "dev 1", t).unwrap();
-        o.core.ssh.save(id, t).unwrap();
+        o.core.ssh.save(id, Kind::Background, t).unwrap();
     }
 
     fn token_requests(r: &[String]) -> usize {
@@ -6510,7 +6604,9 @@ mod tests {
         let hosts = hosts_of(o.home.path());
         assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
         assert!(!hosts.contains("ibssh_old"), "{hosts}");
-        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        let kept = o.core.ssh.load("m1", Kind::Background).unwrap().unwrap();
+        assert_eq!((kept.token.as_str(), kept.background), ("ibssh_new", true));
+        assert_eq!(o.core.ssh.load("m1", Kind::Ordinary).unwrap(), None);
         let r = requests(&server).await;
         assert_eq!(token_requests(&r), 1, "{r:?}");
         // A token is an API call only: the sandbox is not read, woken or run on.
@@ -6552,14 +6648,18 @@ mod tests {
     async fn a_sandbox_without_a_host_gets_no_renewal() {
         let (server, base) = cmux_server(serde_json::json!({})).await;
         let o = orca_core(&base, OrcaHere::Real);
-        // A token about to run out, with no host: the SSH command renews it when it needs it.
-        o.core
-            .ssh
-            .save("m1", &token_left("ibssh_old", chrono::Duration::hours(30)))
-            .unwrap();
+        // Tokens about to run out, with no host: the SSH command renews the ordinary one, and
+        // Open the background one, when they need it.
+        let old = token_left("ibssh_old", chrono::Duration::hours(30));
+        for kind in [Kind::Ordinary, Kind::Background] {
+            o.core.ssh.save("m1", kind, &old).unwrap();
+        }
         o.core.renew_ssh_hosts(None).await;
         assert!(requests(&server).await.is_empty());
-        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_old");
+        for kind in [Kind::Ordinary, Kind::Background] {
+            let stored = o.core.ssh.load("m1", kind).unwrap().unwrap();
+            assert_eq!(stored.token, "ibssh_old");
+        }
         assert!(!o.home.path().join(".ssh").exists());
     }
 
@@ -6599,7 +6699,7 @@ mod tests {
         let hosts = hosts_of(o.home.path());
         assert!(!hosts.contains("ibssh_new"), "{hosts}");
         assert!(!hosts.contains("Host instabox-dev-1"), "{hosts}");
-        assert_eq!(o.core.ssh.load("m1").unwrap(), None);
+        assert_eq!(o.core.ssh.load("m1", Kind::Background).unwrap(), None);
     }
 
     #[tokio::test]
@@ -7237,7 +7337,12 @@ mod tests {
             "{logged:?}"
         );
         assert_eq!(
-            o.core.ssh.load("m1").unwrap().unwrap().token,
+            o.core
+                .ssh
+                .load("m1", Kind::Background)
+                .unwrap()
+                .unwrap()
+                .token,
             "ibssh_old",
             "the stored token stays behind the host"
         );
@@ -7253,7 +7358,8 @@ mod tests {
         let logged = o.core.renew_ssh_hosts(None).await;
         assert!(logged.is_empty(), "{logged:?}");
         assert!(hosts_of(o.home.path()).contains("  User ibssh_new\n"));
-        assert_eq!(o.core.ssh.load("m1").unwrap().unwrap().token, "ibssh_new");
+        let kept = o.core.ssh.load("m1", Kind::Background).unwrap().unwrap();
+        assert_eq!(kept.token, "ibssh_new");
         assert_eq!(token_requests(&requests(&server).await), 2);
     }
 
@@ -7266,6 +7372,7 @@ mod tests {
             .ssh
             .save(
                 "m1",
+                Kind::Background,
                 &token_left("ibssh_stored", chrono::Duration::days(20)),
             )
             .unwrap();
@@ -7281,6 +7388,240 @@ mod tests {
         let hosts = hosts_of(o.home.path());
         assert!(hosts.contains("  User ibssh_stored\n"), "{hosts}");
         assert!(requests(&server).await.is_empty(), "no new token");
+    }
+
+    // ---- the background token and the ordinary one ----
+
+    /// The body that asks for an ordinary token: the one older releases sent.
+    fn ordinary_body() -> serde_json::Value {
+        serde_json::json!({"name": "Instabox", "ttlSeconds": 2592000})
+    }
+
+    fn background_body() -> serde_json::Value {
+        serde_json::json!({"name": "Instabox", "ttlSeconds": 2592000, "background": true})
+    }
+
+    /// The bodies of the SSH token requests `server` got, in order.
+    async fn token_bodies(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/ssh-tokens"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    /// What an older release left for sandbox m1: its host, with the one token it kept for
+    /// everything, which is now the ordinary one.
+    fn older_release_host(home: &Path, store: &dyn SshTokenStore) -> crate::api::SshToken {
+        let old = crate::api::SshToken {
+            background: false,
+            ..token_left("ibssh_old", chrono::Duration::days(20))
+        };
+        ssh_config::write_host(home, "m1", "dev 1", &old).unwrap();
+        store.save("m1", Kind::Ordinary, &old).unwrap();
+        old
+    }
+
+    #[tokio::test]
+    async fn apps_that_stay_connected_get_the_background_token_and_logins_the_ordinary_one() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let md = serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux,orca,herdr"});
+        let (server, base) = cmux_server(md).await;
+        for (body, token, background) in [
+            (background_body(), "ibssh_bg", true),
+            (ordinary_body(), "ibssh_plain", false),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/ssh-tokens"))
+                .and(body_json(body))
+                .respond_with(ResponseTemplate::new(200).set_body_json(minted(token, background)))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        let apps = tempfile::tempdir().unwrap();
+        let cmux = ade::cmux::test_bundle(apps.path(), ade::cmux::BUNDLE_ID, "0.64.25", false);
+        let orca = ade::orca::test_bundle(apps.path(), ade::orca::BUNDLE_ID, "1.4.269");
+        let home = tempfile::tempdir().unwrap();
+        let (core, opened) = recording_core(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(ssh_config::SyncedStore::new(
+                MemorySshStore::default(),
+                home.path().to_path_buf(),
+            )),
+            home.path().to_path_buf(),
+        );
+        let (c, o) = (cmux.clone(), orca.clone());
+        let core = Arc::new(core.with_apps(
+            Arc::new(move |ade| match ade {
+                Ade::Cmux => Some(c.clone()),
+                Ade::Orca => Some(o.clone()),
+                Ade::Herdr => Some(PathBuf::from(HERDR_SSH)),
+                _ => None,
+            }),
+            Arc::new(|ade, path| match ade {
+                Ade::Cmux => ade::cmux::verify_with(path, |_| true),
+                Ade::Orca => ade::orca::verify_with(path, |_| true),
+                _ => ade.verify(path),
+            }),
+        ));
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state
+                .set_desktop(Ade::Herdr, Some("OpenSSH 10.3p1".into()))
+        });
+        core.refresh(false).await;
+        for ade in [Ade::Cmux, Ade::Orca, Ade::Herdr] {
+            core.open_in_ade("m1", Some(ade)).await.unwrap();
+        }
+        let command = core.ssh_command("m1").await.unwrap();
+        core.open_ssh("m1").await.unwrap();
+        core.probes_settled().await;
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [
+                format!(
+                    "{} in {}",
+                    CMUX_LINK.replace("user=ibssh_new", "user=ibssh_bg"),
+                    cmux.display()
+                ),
+                orca.display().to_string(),
+                HERDR_TERMINAL.replace("ibssh_new", "ibssh_plain"),
+                "terminal: ssh -p 2222 ibssh_plain@ssh.example.test".to_string(),
+            ]
+        );
+        assert_eq!(command, "ssh -p 2222 ibssh_plain@ssh.example.test");
+        // Orca's host holds the background token, and the ordinary one never reaches it.
+        let hosts = hosts_of(home.path());
+        assert!(hosts.contains("Host instabox-dev-1\n"), "{hosts}");
+        assert!(hosts.contains("  User ibssh_bg\n"), "{hosts}");
+        assert!(!hosts.contains("ibssh_plain"), "{hosts}");
+        // One token of each kind, each made once and then reused.
+        assert_eq!(
+            token_bodies(&server).await,
+            [background_body(), ordinary_body()]
+        );
+        let logs = core.logs.lock().unwrap().clone();
+        assert!(
+            !logs.iter().any(|l| l.contains("ordinary token where")),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_in_orca_moves_a_host_an_older_release_wrote_to_the_background_token() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "orca", "instabox-ades": "orca"}))
+                .await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let old = older_release_host(o.home.path(), &*o.core.ssh);
+        o.core.refresh(false).await;
+        let notice = o.core.open_in_ade("m1", Some(Ade::Orca)).await.unwrap();
+        o.core.probes_settled().await;
+        // The same alias, so the host Orca imported keeps working: only its login changed.
+        assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
+        let hosts = hosts_of(o.home.path());
+        assert_eq!(hosts.matches("# instabox-sandbox ").count(), 1, "{hosts}");
+        assert!(
+            hosts.contains(
+                "# instabox-sandbox m1\nHost instabox-dev-1\n  HostName ssh.example.test\n  \
+                 Port 2222\n  User ibssh_new\n"
+            ),
+            "{hosts}"
+        );
+        assert!(!hosts.contains("ibssh_old"), "{hosts}");
+        assert_eq!(token_bodies(&server).await, [background_body()]);
+        // The SSH command keeps the old token as the ordinary one: no new token, the host
+        // stays as it is.
+        assert_eq!(o.core.ssh_command("m1").await.unwrap(), old.command);
+        assert_eq!(token_bodies(&server).await.len(), 1);
+        assert_eq!(hosts_of(o.home.path()), hosts);
+    }
+
+    #[tokio::test]
+    async fn open_in_paseo_moves_its_host_to_the_background_token_and_keeps_its_address() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        older_release_host(p.home.path(), &*p.core.ssh);
+        p.core.refresh(false).await;
+        let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        p.core.probes_settled().await;
+        // The address the user added in Paseo stays the same: nothing to add again.
+        assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        assert_eq!(*p.copied.lock().unwrap(), ["ssh://instabox-dev-1"]);
+        let hosts = hosts_of(p.home.path());
+        assert!(hosts.contains("Host instabox-dev-1\n"), "{hosts}");
+        assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
+        assert!(!hosts.contains("ibssh_old"), "{hosts}");
+        assert_eq!(token_bodies(&server).await, [background_body()]);
+    }
+
+    #[tokio::test]
+    async fn the_first_renewal_moves_a_host_an_older_release_wrote_to_the_background_token() {
+        let (server, base) = cmux_server(serde_json::json!({})).await;
+        let o = orca_core(&base, OrcaHere::Real);
+        let old = older_release_host(o.home.path(), &*o.core.ssh);
+        // The old token has 20 days left, but it is not a background token.
+        let logged = o.core.renew_ssh_hosts(None).await;
+        assert!(logged.is_empty(), "{logged:?}");
+        let hosts = hosts_of(o.home.path());
+        assert!(hosts.contains("Host instabox-dev-1\n"), "{hosts}");
+        assert!(hosts.contains("  User ibssh_new\n"), "{hosts}");
+        assert_eq!(token_bodies(&server).await, [background_body()]);
+        let ordinary = o.core.ssh.load("m1", Kind::Ordinary).unwrap();
+        assert_eq!(ordinary, Some(old), "the ordinary token stays");
+        // The next pass leaves the new token alone.
+        o.core.renew_ssh_hosts(None).await;
+        assert_eq!(token_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_token_in_place_of_a_background_one_is_used_and_logged_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "cmux", "instabox-ades": "cmux"}))
+                .await;
+        // An older server ignores `background` and makes an ordinary token.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(minted("ibssh_new", false)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let ssh = Arc::new(MemorySshStore::default());
+        let CmuxCore {
+            core,
+            opened,
+            app,
+            _dir,
+        } = cmux_core(&base, ssh.clone(), CmuxHere::Real);
+        core.refresh(false).await;
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        // The link has it all the same, and it is kept as the background token.
+        assert_eq!(*opened.lock().unwrap(), [cmux_opened(&app)]);
+        let kept = ssh.load("m1", Kind::Background).unwrap().unwrap();
+        assert_eq!((kept.token.as_str(), kept.background), ("ibssh_new", false));
+        // Another one later (the stored one was lost) is not logged again.
+        ssh.clear_all().unwrap();
+        core.open_in_ade("m1", Some(Ade::Cmux)).await.unwrap();
+        assert_eq!(
+            token_bodies(&server).await,
+            [background_body(), background_body()]
+        );
+        let logs = core.logs.lock().unwrap().clone();
+        let said = logs
+            .iter()
+            .filter(|l| l.contains("ordinary token where a background one was asked for"))
+            .count();
+        assert_eq!(said, 1, "{logs:?}");
     }
 
     // ---- the tray's actions ----
@@ -7558,7 +7899,11 @@ mod tests {
         // m7's token is kept already; its host comes while the list is read.
         o.core
             .ssh
-            .save("m7", &token_left("ibssh_m7", chrono::Duration::days(20)))
+            .save(
+                "m7",
+                Kind::Background,
+                &token_left("ibssh_m7", chrono::Duration::days(20)),
+            )
             .unwrap();
         let gone = o.core.refresh_and_find_gone(true).await;
         o.core.renew_ssh_hosts(gone).await;

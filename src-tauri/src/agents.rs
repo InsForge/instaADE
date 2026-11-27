@@ -253,7 +253,8 @@ async fn finish(
         tokio::time::sleep(timing.url_poll).await;
     };
     let port = callback_port(&url).ok_or_else(|| anyhow!("This login has no local callback"))?;
-    let token = ssh::token(client, store, id, gate).await?;
+    // The ordinary token: the forward is a login the user started, and it ends with it.
+    let token = ssh::token(client, store, id, ssh::Kind::Ordinary, gate).await?;
     // Dropped on every exit from here on, which ends the forward.
     let mut forward = guarded(gate, || {
         spawner.spawn(port, &ssh::forward_args(&token, port))
@@ -303,7 +304,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use url::Url;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     const CLAUDE_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A43327%2Fcallback&state=x";
@@ -469,8 +470,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(running_machine()))
             .mount(server)
             .await;
+        // Only the ordinary token's body: the login's forward never asks for a background one.
         Mock::given(method("POST"))
             .and(path("/v1/machines/m1/ssh-tokens"))
+            .and(body_json(
+                serde_json::json!({"name": "Instabox", "ttlSeconds": 2592000}),
+            ))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!(
                 {"id":"i","name":"n","host":"ssh.example.test","port":2222,"token":"ibssh_x",
                 "command":"ssh","expiresAt":"2099-01-01T00:00:00Z"})))

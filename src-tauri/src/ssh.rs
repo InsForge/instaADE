@@ -1,4 +1,5 @@
-//! SSH login for a sandbox: a long-lived token, the command to show, and the port-forward arguments.
+//! SSH login for a sandbox: its two long-lived tokens (`Kind`), the command to show, and the
+//! port-forward arguments.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,73 +25,107 @@ const TOKEN_NAME: &str = "Instabox";
 const TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const REUSE_MARGIN_HOURS: i64 = 24;
 
-/// Where SSH tokens live between runs, one per sandbox.
+/// Which of a sandbox's two SSH tokens. Each is stored apart and renewed by the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// For a login the user starts: the SSH command, Open in Terminal, Herdr, Paradev's host
+    /// setup and an agent sign-in. Its connections wake the sandbox and count as activity.
+    Ordinary,
+    /// For an app that stays connected on its own and sends heartbeats (cmux, Orca, Paseo).
+    /// While instabox applies background tokens, its connections neither wake the sandbox nor
+    /// count as activity, so an idle app does not keep the sandbox awake. An agent at work
+    /// still does, through the ADE's activity probe and the sandbox's terminals and CPU.
+    Background,
+}
+
+/// Where SSH tokens live between runs, one of each kind per sandbox.
 pub trait SshTokenStore: Send + Sync {
-    fn load(&self, id: &str) -> std::result::Result<Option<SshToken>, String>;
-    fn save(&self, id: &str, token: &SshToken) -> std::result::Result<(), String>;
-    /// Forgets every stored token (sign-out). Succeeds when there is none.
+    fn load(&self, id: &str, kind: Kind) -> std::result::Result<Option<SshToken>, String>;
+    fn save(&self, id: &str, kind: Kind, token: &SshToken) -> std::result::Result<(), String>;
+    /// Forgets every stored token of both kinds (sign-out). Succeeds when there is none.
     fn clear_all(&self) -> std::result::Result<(), String>;
 }
 
-/// The OS keychain: one entry, account `ssh-tokens`, holding a JSON map from sandbox id to
-/// token, so sign-out can remove them all.
+/// The OS keychain: one entry per kind, account `ssh-tokens` (ordinary) or
+/// `ssh-tokens-background`, each holding a JSON map from sandbox id to token, so sign-out can
+/// remove them all. The ordinary entry is the one older releases keep every token in.
 pub struct KeyringSshStore;
 
 const SSH_ACCOUNT: &str = "ssh-tokens";
-/// Serializes read-change-write of the one entry.
+const BACKGROUND_ACCOUNT: &str = "ssh-tokens-background";
+/// Serializes read-change-write of the entries.
 static SSH_LOCK: StdMutex<()> = StdMutex::new(());
 
 type TokenMap = HashMap<String, SshToken>;
 
 impl KeyringSshStore {
-    fn entry() -> std::result::Result<keyring::Entry, String> {
-        keyring::Entry::new(crate::keychain_service(), SSH_ACCOUNT).map_err(|e| e.to_string())
+    fn account(kind: Kind) -> &'static str {
+        match kind {
+            Kind::Ordinary => SSH_ACCOUNT,
+            Kind::Background => BACKGROUND_ACCOUNT,
+        }
     }
 
-    fn read() -> std::result::Result<TokenMap, String> {
-        match Self::entry()?.get_password() {
+    fn entry(kind: Kind) -> std::result::Result<keyring::Entry, String> {
+        keyring::Entry::new(crate::keychain_service(), Self::account(kind))
+            .map_err(|e| e.to_string())
+    }
+
+    fn read(kind: Kind) -> std::result::Result<TokenMap, String> {
+        match Self::entry(kind)?.get_password() {
             Ok(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
             Err(keyring::Error::NoEntry) => Ok(TokenMap::new()),
             Err(e) => Err(e.to_string()),
         }
     }
-}
 
-impl SshTokenStore for KeyringSshStore {
-    fn load(&self, id: &str) -> std::result::Result<Option<SshToken>, String> {
-        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(Self::read()?.remove(id))
-    }
-
-    fn save(&self, id: &str, token: &SshToken) -> std::result::Result<(), String> {
-        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = Self::read()?;
-        all.insert(id.to_string(), token.clone());
-        let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
-        Self::entry()?
-            .set_password(&json)
-            .map_err(|e| e.to_string())
-    }
-
-    fn clear_all(&self) -> std::result::Result<(), String> {
-        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        match Self::entry()?.delete_credential() {
+    fn delete(kind: Kind) -> std::result::Result<(), String> {
+        match Self::entry(kind)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }
 }
 
+impl SshTokenStore for KeyringSshStore {
+    fn load(&self, id: &str, kind: Kind) -> std::result::Result<Option<SshToken>, String> {
+        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Self::read(kind)?.remove(id))
+    }
+
+    fn save(&self, id: &str, kind: Kind, token: &SshToken) -> std::result::Result<(), String> {
+        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = Self::read(kind)?;
+        all.insert(id.to_string(), token.clone());
+        let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
+        Self::entry(kind)?
+            .set_password(&json)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Removes both entries, the second also when the first fails, and answers the first
+    /// failure.
+    fn clear_all(&self) -> std::result::Result<(), String> {
+        let _g = SSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ordinary = Self::delete(Kind::Ordinary);
+        let background = Self::delete(Kind::Background);
+        ordinary.and(background)
+    }
+}
+
 /// In-memory store, for tests.
 #[derive(Default)]
-pub struct MemorySshStore(StdMutex<TokenMap>);
+pub struct MemorySshStore(StdMutex<HashMap<(Kind, String), SshToken>>);
 
 impl SshTokenStore for MemorySshStore {
-    fn load(&self, id: &str) -> std::result::Result<Option<SshToken>, String> {
-        Ok(self.0.lock().unwrap().get(id).cloned())
+    fn load(&self, id: &str, kind: Kind) -> std::result::Result<Option<SshToken>, String> {
+        Ok(self.0.lock().unwrap().get(&(kind, id.to_string())).cloned())
     }
-    fn save(&self, id: &str, token: &SshToken) -> std::result::Result<(), String> {
-        self.0.lock().unwrap().insert(id.to_string(), token.clone());
+    fn save(&self, id: &str, kind: Kind, token: &SshToken) -> std::result::Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert((kind, id.to_string()), token.clone());
         Ok(())
     }
     fn clear_all(&self) -> std::result::Result<(), String> {
@@ -99,14 +134,17 @@ impl SshTokenStore for MemorySshStore {
     }
 }
 
-/// The sandbox's SSH token: the stored one while it has more than 24 h left, else a new one.
+/// The sandbox's SSH token of `kind`: the stored one while it has more than 24 h left, else a
+/// new one.
 pub async fn token(
     client: &Client,
     store: &dyn SshTokenStore,
     id: &str,
+    kind: Kind,
     gate: &dyn Gate,
 ) -> Result<SshToken> {
-    token_within(client, store, id, gate, Duration::hours(REUSE_MARGIN_HOURS)).await
+    let margin = Duration::hours(REUSE_MARGIN_HOURS);
+    token_within(client, store, id, kind, gate, margin).await
 }
 
 /// `token`, reusing the stored token only while it has more than `margin` left. A stored token
@@ -115,34 +153,48 @@ pub async fn token_within(
     client: &Client,
     store: &dyn SshTokenStore,
     id: &str,
+    kind: Kind,
     gate: &dyn Gate,
     margin: Duration,
 ) -> Result<SshToken> {
     // The token still works this run if saving fails; the next run asks for a new one.
-    token_and_save(client, store, id, gate, margin)
+    token_and_save(client, store, id, kind, gate, margin)
         .await
         .map(|(t, _)| t)
 }
 
 /// `token_within`, with what the store answered when it saved a new token (`Ok` for the stored
 /// one). A token that was not saved still works; the caller decides what a failed save means.
+/// A new background token is asked for with `background`. A server that does not know it makes
+/// an ordinary token, whose reply has no `background`: that token is kept and used in its
+/// place all the same (`ordinary_in_place_of_background`).
 pub async fn token_and_save(
     client: &Client,
     store: &dyn SshTokenStore,
     id: &str,
+    kind: Kind,
     gate: &dyn Gate,
     margin: Duration,
 ) -> Result<(SshToken, std::result::Result<(), String>)> {
     // A broken store only costs a fresh token, so treat a load failure as a miss.
-    if let Ok(Some(t)) = store.load(id)
+    if let Ok(Some(t)) = store.load(id, kind)
         && t.expires_at.is_some_and(|e| e > Utc::now() + margin)
     {
         return Ok((t, Ok(())));
     }
-    let t = client.ssh_token(id, TOKEN_NAME, TOKEN_TTL_SECS).await?;
+    let background = kind == Kind::Background;
+    let t = client
+        .ssh_token(id, TOKEN_NAME, TOKEN_TTL_SECS, background)
+        .await?;
     // After a sign-out nothing is saved, and the caller gets no token either.
-    let saved = guarded(gate, || store.save(id, &t)).ok_or_else(account_changed)?;
+    let saved = guarded(gate, || store.save(id, kind, &t)).ok_or_else(account_changed)?;
     Ok((t, saved))
+}
+
+/// True when `t`, a token of `kind`, stands in for a background token but is an ordinary one,
+/// as a server without background tokens makes.
+pub fn ordinary_in_place_of_background(kind: Kind, t: &SshToken) -> bool {
+    kind == Kind::Background && !t.background
 }
 
 /// The login command to show the user, as the server formatted it.
@@ -378,6 +430,7 @@ mod tests {
             command: format!("ssh -p 2222 {token}@ssh.example.test"),
             expires_at: Some(Utc::now() + expires_in),
             host_key_fingerprint: None,
+            background: false,
         }
     }
 
@@ -569,10 +622,16 @@ mod tests {
             .await;
         let store = MemorySshStore::default();
         let stored = tok("ibssh_old", Duration::days(10));
-        store.save("m1", &stored).unwrap();
-        let got = token(&client(&server), &store, "m1", &crate::gate::Open)
-            .await
-            .unwrap();
+        store.save("m1", Kind::Ordinary, &stored).unwrap();
+        let got = token(
+            &client(&server),
+            &store,
+            "m1",
+            Kind::Ordinary,
+            &crate::gate::Open,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, stored);
     }
 
@@ -591,13 +650,20 @@ mod tests {
             .await;
         let store = MemorySshStore::default();
         store
-            .save("m1", &tok("ibssh_old", Duration::hours(2)))
+            .save("m1", Kind::Ordinary, &tok("ibssh_old", Duration::hours(2)))
             .unwrap();
-        let got = token(&client(&server), &store, "m1", &crate::gate::Open)
-            .await
-            .unwrap();
+        let got = token(
+            &client(&server),
+            &store,
+            "m1",
+            Kind::Ordinary,
+            &crate::gate::Open,
+        )
+        .await
+        .unwrap();
         assert_eq!(got.token, "ibssh_new");
-        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_new");
+        let stored = store.load("m1", Kind::Ordinary).unwrap().unwrap();
+        assert_eq!(stored.token, "ibssh_new");
     }
 
     #[tokio::test]
@@ -616,11 +682,13 @@ mod tests {
             .mount(&server)
             .await;
         let store = MemorySshStore::default();
-        let err = token(&client(&server), &store, "m3", &Closed)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "account_changed");
-        assert!(store.load("m3").unwrap().is_none());
+        for kind in [Kind::Ordinary, Kind::Background] {
+            let err = token(&client(&server), &store, "m3", kind, &Closed)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "account_changed");
+            assert!(store.load("m3", kind).unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -634,10 +702,129 @@ mod tests {
             .mount(&server)
             .await;
         let store = MemorySshStore::default();
-        let got = token(&client(&server), &store, "m2", &crate::gate::Open)
+        let got = token(
+            &client(&server),
+            &store,
+            "m2",
+            Kind::Ordinary,
+            &crate::gate::Open,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.token, "ibssh_new");
+        assert!(store.load("m2", Kind::Ordinary).unwrap().is_some());
+        assert!(store.load("m2", Kind::Background).unwrap().is_none());
+    }
+
+    /// The reply of a server that knows background tokens, for a background `t`.
+    fn background_body_for(t: &SshToken) -> serde_json::Value {
+        let mut body = body_for(t);
+        body["background"] = true.into();
+        body["backgroundActive"] = false.into();
+        body
+    }
+
+    #[tokio::test]
+    async fn a_background_token_is_asked_for_with_background_and_kept_apart() {
+        let server = MockServer::start().await;
+        let bg = tok("ibssh_bg", Duration::days(30));
+        let plain = tok("ibssh_plain", Duration::days(30));
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .and(body_json(serde_json::json!(
+                {"name": "Instabox", "ttlSeconds": 2592000, "background": true}
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_json(background_body_for(&bg)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The ordinary token's body is the one older releases sent, with no background.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .and(body_json(
+                serde_json::json!({"name": "Instabox", "ttlSeconds": 2592000}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body_for(&plain)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = MemorySshStore::default();
+        let c = client(&server);
+        // Each kind twice: the second of each is the stored one.
+        for _ in 0..2 {
+            let got = token(&c, &store, "m1", Kind::Background, &crate::gate::Open)
+                .await
+                .unwrap();
+            assert_eq!((got.token.as_str(), got.background), ("ibssh_bg", true));
+            assert!(!ordinary_in_place_of_background(Kind::Background, &got));
+            let got = token(&c, &store, "m1", Kind::Ordinary, &crate::gate::Open)
+                .await
+                .unwrap();
+            assert_eq!((got.token.as_str(), got.background), ("ibssh_plain", false));
+        }
+        let stored = |kind| store.load("m1", kind).unwrap().unwrap().token;
+        assert_eq!(stored(Kind::Background), "ibssh_bg");
+        assert_eq!(stored(Kind::Ordinary), "ibssh_plain");
+    }
+
+    #[tokio::test]
+    async fn a_server_without_background_tokens_makes_an_ordinary_one_that_is_used_in_its_place() {
+        let server = MockServer::start().await;
+        let fresh = tok("ibssh_new", Duration::days(30));
+        // An older server ignores `background` and answers without it.
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .and(body_json(serde_json::json!(
+                {"name": "Instabox", "ttlSeconds": 2592000, "background": true}
+            )))
+            .respond_with(ResponseTemplate::new(201).set_body_json(body_for(&fresh)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = MemorySshStore::default();
+        let c = client(&server);
+        let got = token(&c, &store, "m1", Kind::Background, &crate::gate::Open)
             .await
             .unwrap();
-        assert_eq!(got.token, "ibssh_new");
-        assert!(store.load("m2").unwrap().is_some());
+        assert_eq!((got.token.as_str(), got.background), ("ibssh_new", false));
+        assert!(ordinary_in_place_of_background(Kind::Background, &got));
+        assert!(!ordinary_in_place_of_background(Kind::Ordinary, &got));
+        // It is kept as the background token and reused by the same rule, not asked for again.
+        let again = token(&c, &store, "m1", Kind::Background, &crate::gate::Open)
+            .await
+            .unwrap();
+        assert_eq!(again, got);
+        assert_eq!(store.load("m1", Kind::Ordinary).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_token_an_older_release_stored_stays_the_ordinary_one() {
+        let server = MockServer::start().await;
+        let bg = tok("ibssh_bg", Duration::days(30));
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ssh-tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(background_body_for(&bg)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // An older release kept its one token in the ordinary entry, as JSON without
+        // `background`.
+        let old: SshToken =
+            serde_json::from_value(body_for(&tok("ibssh_old", Duration::days(20)))).unwrap();
+        assert!(!old.background);
+        let store = MemorySshStore::default();
+        store.save("m1", Kind::Ordinary, &old).unwrap();
+        let c = client(&server);
+        let got = token(&c, &store, "m1", Kind::Background, &crate::gate::Open)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.token, "ibssh_bg",
+            "a new background token, not the old one"
+        );
+        let got = token(&c, &store, "m1", Kind::Ordinary, &crate::gate::Open)
+            .await
+            .unwrap();
+        assert_eq!(got, old, "the old token stays the ordinary one");
     }
 }

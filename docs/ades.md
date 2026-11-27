@@ -6,6 +6,15 @@ When an ADE's app is installed more than once, such as in both `/Applications` a
 
 Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Orca, Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
 
+## SSH tokens
+
+InstaADE keeps two SSH tokens for each sandbox, in two keychain entries. Each token lasts 30 days. InstaADE uses the stored one while it has more than a day left, else it makes a new one.
+
+- The **background token** is for an app that stays connected by itself and checks the connection every few seconds: cmux, Orca and Paseo. When instabox applies background tokens to the sandbox, the connections of this token do not wake the sandbox and do not count as activity. So an idle app does not keep the sandbox awake. An agent at work still keeps it awake, through the ADE's activity probe and the sandbox's terminals and CPU. InstaADE asks for this token with `background: true`. An instabox that does not know background tokens makes an ordinary token. InstaADE then uses that token in its place, and writes this to its log once.
+- The **ordinary token** is for a login that you start: the SSH command in the sandbox's details, **Open in Terminal**, Herdr, Paradev's SSH address and the sign-in of Claude Code or Codex. Its connections wake the sandbox and count as activity.
+
+The SSH host that Orca and Paseo use holds the background token. An older InstaADE wrote that host with its one token, which is now the ordinary one. The host keeps its alias. Its `User` changes to the background token the next time InstaADE starts, or at the next **Open**. So you do not add the host again in Orca or Paseo.
+
 ## T3 Code
 
 InstaADE installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
@@ -25,7 +34,7 @@ An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both th
 
 ## cmux (macOS)
 
-cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaADE installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** wakes the sandbox first, since the SSH gateway refuses a paused one and the link does not wake it. Then it opens a `cmux://ssh` link with an SSH token of the sandbox. When the sandbox does not wake, InstaADE shows the error and opens nothing.
+cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaADE installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** wakes the sandbox first, since the SSH gateway refuses a paused one and the link does not wake it. Then it opens a `cmux://ssh` link with the sandbox's [background token](#ssh-tokens). When the sandbox does not wake, InstaADE shows the error and opens nothing.
 
 The link holds the token, so InstaADE opens it only in the real cmux app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.cmuxterm.app`, and `codesign` must find it signed with the Developer ID of Manaflow, Inc. (team `7WLXT3NR37`). InstaADE checks this when it looks for cmux, again before it wakes, creates or marks a sandbox for cmux, and again right before it makes or loads the token. It never opens the link in another handler of `cmux://` links or through cmux.com. Without that app, nothing opens and no token is made.
 
@@ -40,7 +49,7 @@ Orca connects over SSH by itself and installs its own server on the sandbox unde
 Host instabox-dev-1
   HostName ssh.instabox.sh
   Port 2222
-  User <SSH token>
+  User <background token>
   StrictHostKeyChecking accept-new
   ForwardAgent no
 ```
@@ -48,8 +57,8 @@ Host instabox-dev-1
 - The alias is `instabox-` and the sandbox name. When two sandboxes have the same name, the second one also gets the end of its id. A host keeps its alias, because Orca knows the host by it.
 - `~/.ssh/config` gets one line at the top, `Include ~/.ssh/instabox/config`, so these options come before any `Host *`. InstaADE never changes another line there, and keeps a copy of the file in `~/.ssh/config.instabox.bak` before its first change. On Windows these files are in `%USERPROFILE%\.ssh`.
 - `ForwardAgent no` is there because the InstaBox SSH gateway refuses agent forwarding, and Orca fails the whole connection when that request is refused.
-- The hosts file holds SSH tokens. On macOS only you can read it and its folder. When InstaADE gets a new token for the sandbox, it rewrites `User`.
-- Tokens last 30 days. At startup, at sign-in and every few minutes, InstaADE renews the token of each sandbox with a host once it has fewer than 7 days left. That is an API call only and never wakes the sandbox. When the host cannot take the new token, the stored token stays behind, so the next pass tries again.
+- The hosts file holds the sandboxes' [background tokens](#ssh-tokens). On macOS only you can read it and its folder. When InstaADE gets a new background token for the sandbox, it rewrites `User`. A new ordinary token never changes the host.
+- Tokens last 30 days. At startup, at sign-in and every few minutes, InstaADE renews the background token of each sandbox with a host once it has fewer than 7 days left, or when it has none yet. That is an API call only and never wakes the sandbox. When the host cannot take the new token, the stored token stays behind, so the next pass tries again.
 - Deleting the sandbox in InstaADE removes its host. A full refresh removes the host of any sandbox no longer in your sandbox list, and signing out removes them all. InstaADE changes only the blocks it marked. Orca keeps a host it imported until you remove it in Orca.
 - On macOS, InstaADE starts only the real Orca app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.stablyai.orca`, and `codesign` must find it signed with the Developer ID of team `6CX3WHS9HZ`. InstaADE checks this when it looks for Orca, again before it wakes, creates or marks a sandbox for Orca, and again after the wake, right before it makes or loads the token.
 - On Windows, InstaADE starts `Orca.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Orca` or `%ProgramFiles%\Orca`). It starts it only when the file's version resource names the product Orca and holds a version, read from the file each time. There is no signature check on Windows yet.
@@ -143,7 +152,7 @@ Then Herdr opens, as with **Open in Herdr**. **Reconnect** runs the same command
 - The OpenSSH client is the one InstaADE found, by its full path, such as `/usr/bin/ssh` or `C:\Windows\System32\OpenSSH\ssh.exe`. InstaADE looks for it again right before it makes or loads the token, and the one it finds then is the one that runs.
 - InstaADE builds the command from the host, port and token the API answers, not from the SSH command it shows. When the host or the token holds anything but letters, digits, `.`, `_` and `-`, or starts with `-`, nothing opens. **Open in Terminal** builds and checks its login the same way, and runs `ssh`.
 - On macOS the terminal is Terminal, as for **Open in Terminal**: the command goes into a temporary `.command` file that only you can read, and InstaADE removes it 10 seconds later. On Windows it is Windows Terminal, else a console window.
-- The token is the one the SSH command in the sandbox's details uses: the stored one while it has more than a day left, else a new 30-day one.
+- The token is the [ordinary token](#ssh-tokens), the one the SSH command in the sandbox's details uses: the stored one while it has more than a day left, else a new 30-day one. It goes on the command line, never through the SSH host of Orca and Paseo.
 - The first time, ssh adds the gateway's host key to `~/.ssh/known_hosts` without asking.
 - Herdr keeps its panes in a server on the sandbox. Closing the terminal, or detaching with `ctrl+b q`, leaves the agents running, and the next Open attaches to them again. `herdr server stop` on the sandbox ends them.
 
