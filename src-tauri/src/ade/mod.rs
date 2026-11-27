@@ -699,7 +699,8 @@ mod tests {
             "https://github.com/paradevai/paradev/releases/latest"
         );
         assert_eq!(p.url_scheme(), "superset");
-        // InstaADE installs, keeps in step and probes nothing: Paradev's app sets its host up.
+        // Paradev's app sets its host up, so InstaADE keeps nothing in step and reinstalls
+        // nothing. Its host check installs only the idle probe (`paradev::HOST_SCRIPT`).
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(p.port(), None);
