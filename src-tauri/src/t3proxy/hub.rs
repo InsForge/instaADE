@@ -1,12 +1,13 @@
 //! InstaADE's own: the proxies of the sandboxes T3 Code paired through, one per sandbox on a
 //! fixed localhost port, and the pairing itself.
 //!
-//! Upstream, the proxy uses a T3 session of its own, issued on the sandbox with
-//! `t3 auth session issue` through the instabox exec API and kept in the keychain. That is a
-//! bearer token: the T3 servers that ask for DPoP (0.1.11 and later) need the proxy to be a DPoP
-//! client before this can ship (its own P-256 key, `t3 auth pairing create` and `/oauth/token`,
-//! renewed hourly).
+//! Upstream, the proxy uses a DPoP session of its own (`dpop`): a P-256 key per sandbox, a
+//! pairing credential from `t3 auth pairing create` run through the instabox exec API, and the
+//! one-hour token T3 trades it for. Key and token are kept together in the keychain
+//! (`t3-proxy-tokens`). A T3 without DPoP (older than 0.1.11) gets the earlier bearer session
+//! (`t3 auth session issue`) only with `INSTAADE_T3_PROXY=any`.
 
+use super::dpop::{self, Credential, DpopKey};
 use super::runtime::{self, Control, ControlError, Record, Runtime, Tuning};
 use crate::ade::t3;
 use crate::api::{Client, ExecRequest, Machine};
@@ -24,8 +25,8 @@ use tokio::task::JoinHandle;
 pub const BASE_PORT: u16 = 37800;
 const PORT_RANGE: u16 = 1000;
 
-/// Issues the proxy's T3 session on the sandbox, printed alone on stdout. The base directory is
-/// the `t3-instabox` service's (see `t3::PAIR_SCRIPT`).
+/// Issues a bearer session for the proxy on a T3 without DPoP, printed alone on stdout. The base
+/// directory is the `t3-instabox` service's (see `t3::PAIR_SCRIPT`).
 pub const ISSUE_TOKEN_SCRIPT: &str = r#"t3 auth session issue --base-dir "$HOME/.t3-instabox/$(cat /etc/machine-id)" --token-only --ttl 3650d --label instaade-proxy"#;
 const ISSUE_TIMEOUT_SECS: u32 = 60;
 
@@ -63,9 +64,32 @@ impl Control for Instabox {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    async fn pairing_credential(&self, id: &str) -> Result<String, String> {
+        let client = (self.client)().ok_or("You are not signed in")?;
+        let r = client
+            .exec(
+                id,
+                &ExecRequest {
+                    cmd: dpop::PAIRING_SCRIPT.to_string(),
+                    timeout_seconds: Some(ISSUE_TIMEOUT_SECS),
+                },
+            )
+            .await
+            .map_err(|e| e.message)?;
+        if r.exit_code != 0 || r.timed_out {
+            return Err(format!(
+                "t3 auth pairing create failed: {}",
+                crate::sandbox::connect::tail_lines(&r.stderr)
+            ));
+        }
+        dpop::parse_pairing_credential(&r.stdout)
+            .ok_or_else(|| "T3 printed no pairing credential".to_string())
+    }
 }
 
-/// Where the proxy's upstream tokens live between runs, one per sandbox.
+/// Where the proxy's upstream credentials (`dpop::Credential`, key and token) live between
+/// runs, one per sandbox.
 pub trait TokenStore: Send + Sync {
     fn load(&self, id: &str) -> Result<Option<String>, String>;
     fn save(&self, id: &str, token: &str) -> Result<(), String>;
@@ -177,6 +201,8 @@ pub struct Hub {
     control: Arc<dyn Control>,
     tokens: Arc<dyn TokenStore>,
     tuning: Tuning,
+    /// `INSTAADE_T3_PROXY=any`: a T3 without DPoP gets a bearer session.
+    allow_bearer: bool,
     http: reqwest::Client,
     running: tokio::sync::Mutex<HashMap<String, Running>>,
 }
@@ -187,12 +213,14 @@ impl Hub {
         control: Arc<dyn Control>,
         tokens: Arc<dyn TokenStore>,
         tuning: Tuning,
+        allow_bearer: bool,
     ) -> Arc<Hub> {
         Arc::new(Hub {
             dir,
             control,
             tokens,
             tuning,
+            allow_bearer,
             http: reqwest::Client::new(),
             running: tokio::sync::Mutex::new(HashMap::new()),
         })
@@ -214,8 +242,8 @@ impl Hub {
     pub async fn start_saved(self: &Arc<Self>) {
         for record in self.records() {
             let id = record.id.clone();
-            let token = match self.tokens.load(&id) {
-                Ok(Some(t)) => t,
+            let credential = match self.tokens.load(&id) {
+                Ok(Some(t)) => Credential::parse(&t),
                 Ok(None) => {
                     log_warn!(
                         "{id}: no upstream token in the keychain; Open in T3 Code pairs it again"
@@ -227,7 +255,7 @@ impl Hub {
                     continue;
                 }
             };
-            if let Err(e) = self.start(record, token).await {
+            if let Err(e) = self.start(record, credential).await {
                 log_warn!("{id}: {e:#}");
             }
         }
@@ -239,7 +267,11 @@ impl Hub {
     }
 
     /// Serves `record` on its port and follows its sandbox.
-    async fn start(self: &Arc<Self>, record: Record, token: String) -> Result<Arc<Runtime>> {
+    async fn start(
+        self: &Arc<Self>,
+        record: Record,
+        credential: Credential,
+    ) -> Result<Arc<Runtime>> {
         let id = record.id.clone();
         let listener = TcpListener::bind(("127.0.0.1", record.port))
             .await
@@ -247,7 +279,8 @@ impl Hub {
         let rt = Arc::new(Runtime::new(
             self.dir.join(&id),
             record,
-            token,
+            credential,
+            self.tokens.clone(),
             self.control.clone(),
             self.tuning,
         ));
@@ -323,7 +356,7 @@ impl Hub {
             .context("T3 on the sandbox sent no environment id")
     }
 
-    async fn issue_token(&self, client: &Client, id: &str) -> Result<String> {
+    async fn issue_token(&self, client: &Client, id: &str) -> Result<Credential> {
         let r = client
             .exec(
                 id,
@@ -341,8 +374,71 @@ impl Hub {
             );
         }
         let token = parse_token(&r.stdout).context("T3 printed no session token")?;
-        self.tokens.save(id, &token).map_err(|e| anyhow!(e))?;
-        Ok(token)
+        let credential = Credential::Bearer { token };
+        self.tokens
+            .save(id, &credential.to_stored())
+            .map_err(|e| anyhow!(e))?;
+        Ok(credential)
+    }
+
+    /// A new DPoP session on T3 at `upstream`: a new key, a pairing credential issued on the
+    /// sandbox, traded for a token bound to the key.
+    async fn pair_dpop(&self, id: &str, upstream: &str) -> Result<Credential> {
+        let key = DpopKey::generate()?;
+        let pairing = self
+            .control
+            .pairing_credential(id)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        let (token, expires_at) = dpop::exchange(
+            &self.http,
+            upstream,
+            &key,
+            &pairing,
+            dpop::BOOTSTRAP_TOKEN_TYPE,
+        )
+        .await?;
+        let credential = Credential::Dpop {
+            key: key.pkcs8().to_owned(),
+            token,
+            expires_at,
+        };
+        self.tokens
+            .save(id, &credential.to_stored())
+            .map_err(|e| anyhow!(e))?;
+        log_info!("{id}: paired with a DPoP session");
+        Ok(credential)
+    }
+
+    /// The proxy's credential for T3 at `upstream`: the saved one when it fits, else a new one.
+    /// DPoP whenever T3 takes it; a bearer session only for a T3 without DPoP, and only with
+    /// `allow_bearer`.
+    async fn credential_for(
+        &self,
+        client: &Client,
+        id: &str,
+        upstream: &str,
+    ) -> Result<Credential> {
+        let saved = self
+            .tokens
+            .load(id)
+            .map_err(|e| anyhow!(e))?
+            .map(|s| Credential::parse(&s));
+        if dpop::supports_dpop(&self.http, upstream).await? {
+            return match saved {
+                Some(c) if c.is_dpop() => Ok(c),
+                _ => self.pair_dpop(id, upstream).await,
+            };
+        }
+        if !self.allow_bearer {
+            bail!(
+                "T3 on this sandbox has no DPoP sessions (T3 older than 0.1.11). Update T3 Code, or start InstaADE with INSTAADE_T3_PROXY=any to use a bearer session."
+            );
+        }
+        match saved {
+            Some(c @ Credential::Bearer { .. }) => Ok(c),
+            _ => self.issue_token(client, id).await,
+        }
     }
 
     /// Pairs T3 Code with the proxy of running sandbox `id`: publishes its T3 port, makes sure
@@ -365,10 +461,7 @@ impl Hub {
             .trim_end_matches('/')
             .to_owned();
         let environment_id = self.environment_id(&upstream).await?;
-        let mut token = match self.tokens.load(id).map_err(|e| anyhow!(e))? {
-            Some(t) => t,
-            None => self.issue_token(client, id).await?,
-        };
+        let credential = self.credential_for(client, id, &upstream).await?;
         let existing = self.runtime(id).await;
         let rt = match existing {
             Some(rt) => {
@@ -377,7 +470,7 @@ impl Hub {
                     r.upstream_url = upstream.clone();
                     r.environment_id = environment_id.clone();
                 });
-                rt.set_upstream_token(token.clone());
+                rt.set_credential(credential.clone()).await;
                 rt
             }
             None => {
@@ -393,10 +486,10 @@ impl Hub {
                     name: name.to_string(),
                     port,
                     environment_id,
-                    upstream_url: upstream,
+                    upstream_url: upstream.clone(),
                     client_tokens: saved.map(|r| r.client_tokens).unwrap_or_default(),
                 };
-                self.start(record, token.clone()).await?
+                self.start(record, credential.clone()).await?
             }
         };
         // Open is a person: the sandbox is held again, released or not.
@@ -406,8 +499,11 @@ impl Hub {
         }
         // T3 refuses a session whose data was reset: one new session, then give up.
         if rt.prime().await.is_err() {
-            token = self.issue_token(client, id).await?;
-            rt.set_upstream_token(token);
+            let fresh = match credential {
+                Credential::Dpop { .. } => self.pair_dpop(id, &upstream).await?,
+                Credential::Bearer { .. } => self.issue_token(client, id).await?,
+            };
+            rt.set_credential(fresh).await;
             rt.prime().await?;
         }
         let code = rt.auth.new_pairing_code();

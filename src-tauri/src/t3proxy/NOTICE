@@ -1,7 +1,8 @@
 Parts of this directory are ported from t3boat (https://github.com/paukraft/t3boat, commit
 e6bc867): the routing, auth endpoints and relaying in mod.rs, and auth.rs, session.rs,
 classify.rs, cache.rs, upstream.rs, media.rs, assets.rs, threads.rs and store.rs. Each of those
-files says so in its header. runtime.rs and hub.rs are InstaADE's own. t3boat's license:
+files says so in its header. runtime.rs, hub.rs and dpop.rs are InstaADE's own. t3boat's
+license:
 
 MIT License
 

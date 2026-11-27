@@ -1,7 +1,9 @@
 //! The proxy end to end, against a fake T3 server and a fake instabox: pairing through the
-//! proxy, the release of an idle sandbox, and what a sleeping sandbox answers or wakes for.
+//! proxy, the release of an idle sandbox, what a sleeping sandbox answers or wakes for, and the
+//! proxy's DPoP session upstream (proofs checked as T3 checks them, renewal, refusal).
 
 use super::auth::token_hash;
+use super::dpop::{self, Credential, DpopKey};
 use super::hub::{Hub, MemoryTokenStore, TokenStore};
 use super::runtime::{Control, ControlError, Power, Record, Runtime, Tuning};
 use crate::api::{Client, Credentials, Machine};
@@ -10,43 +12,193 @@ use axum::extract::ws::{Message as WsMsg, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::routing::{get, post};
+use axum::{Form, Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+/// The bearer session of a T3 without DPoP.
 const UP_TOKEN: &str = "up-token-0123456789";
 const CLIENT_TOKEN: &str = "client-token";
 
-/// A T3 server: answers every request on its socket, counts its sockets.
-#[derive(Default)]
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// A token T3 issued for a DPoP key.
+struct Issued {
+    thumbprint: String,
+    expires_at: i64,
+}
+
+/// A T3 server: answers every request on its socket, counts its sockets, and checks every
+/// credential as T3 does.
 struct FakeT3 {
+    base: Mutex<String>,
+    /// Takes DPoP sessions (0.1.11 and later); else bearer only.
+    dpop: bool,
     connections: AtomicUsize,
     open: AtomicUsize,
     tags: Mutex<Vec<String>>,
     queries: Mutex<Vec<String>>,
     /// The shell shows an agent at work.
     working: AtomicBool,
+    /// Lifetime of the DPoP tokens it issues, in seconds.
+    expires_in: AtomicI64,
+    pairings: Mutex<HashSet<String>>,
+    tokens: Mutex<HashMap<String, Issued>>,
+    jtis: Mutex<HashSet<String>>,
+    exchanges: AtomicUsize,
+    renewals: AtomicUsize,
+    refuse_renewal: AtomicBool,
+    /// Requests that came with a bearer token although DPoP was in use.
+    bearer_seen: AtomicUsize,
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {UP_TOKEN}"))
+impl FakeT3 {
+    fn new(dpop: bool) -> Self {
+        FakeT3 {
+            base: Mutex::new(String::new()),
+            dpop,
+            connections: AtomicUsize::new(0),
+            open: AtomicUsize::new(0),
+            tags: Mutex::new(Vec::new()),
+            queries: Mutex::new(Vec::new()),
+            working: AtomicBool::new(false),
+            expires_in: AtomicI64::new(3600),
+            pairings: Mutex::new(HashSet::new()),
+            tokens: Mutex::new(HashMap::new()),
+            jtis: Mutex::new(HashSet::new()),
+            exchanges: AtomicUsize::new(0),
+            renewals: AtomicUsize::new(0),
+            refuse_renewal: AtomicBool::new(false),
+            bearer_seen: AtomicUsize::new(0),
+        }
+    }
+
+    /// `t3 auth pairing create`.
+    fn mint_pairing(&self) -> String {
+        let credential = super::auth::random_token();
+        self.pairings.lock().unwrap().insert(credential.clone());
+        credential
+    }
+
+    fn issue(&self, thumbprint: String) -> (String, i64) {
+        let token = super::auth::random_token();
+        let expires_in = self.expires_in.load(Ordering::SeqCst);
+        self.tokens.lock().unwrap().insert(
+            token.clone(),
+            Issued {
+                thumbprint,
+                expires_at: now_secs() + expires_in,
+            },
+        );
+        (token, expires_in)
+    }
+
+    /// A proof for `method` on `path`, as `dpop.ts` verifies it: its thumbprint.
+    fn proof(
+        &self,
+        proof: Option<&str>,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> Option<String> {
+        let parts: Vec<&str> = proof?.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let header: Value = serde_json::from_slice(&B64.decode(parts[0]).ok()?).ok()?;
+        let payload: Value = serde_json::from_slice(&B64.decode(parts[1]).ok()?).ok()?;
+        if header["typ"] != "dpop+jwt"
+            || header["alg"] != "ES256"
+            || header["jwk"].get("d").is_some()
+        {
+            return None;
+        }
+        let (x, y) = (header["jwk"]["x"].as_str()?, header["jwk"]["y"].as_str()?);
+        let mut point = vec![4u8];
+        point.extend(B64.decode(x).ok()?);
+        point.extend(B64.decode(y).ok()?);
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, point)
+            .verify(
+                format!("{}.{}", parts[0], parts[1]).as_bytes(),
+                &B64.decode(parts[2]).ok()?,
+            )
+            .ok()?;
+        let htu = format!("{}{path}", self.base.lock().unwrap());
+        let fresh = (payload["iat"].as_i64()? - now_secs()).abs() <= 300;
+        let ath_ok = token.is_none_or(|t| payload["ath"] == dpop::ath(t));
+        if payload["htm"] != method || payload["htu"] != htu.as_str() || !fresh || !ath_ok {
+            return None;
+        }
+        // Each proof once.
+        if !self
+            .jtis
+            .lock()
+            .unwrap()
+            .insert(payload["jti"].as_str()?.to_owned())
+        {
+            return None;
+        }
+        let thumbprint_input = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+        Some(B64.encode(
+            ring::digest::digest(&ring::digest::SHA256, thumbprint_input.as_bytes()).as_ref(),
+        ))
+    }
+
+    /// The request's credential is good: a live DPoP token with its key's proof, or (on a T3
+    /// without DPoP) the bearer session.
+    fn authorized(&self, method: &str, path: &str, headers: &HeaderMap) -> bool {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            if self.dpop {
+                self.bearer_seen.fetch_add(1, Ordering::SeqCst);
+                return false;
+            }
+            return token == UP_TOKEN;
+        }
+        let Some(token) = auth.strip_prefix("DPoP ") else {
+            return false;
+        };
+        let proof = headers.get("dpop").and_then(|v| v.to_str().ok());
+        let Some(thumbprint) = self.proof(proof, method, path, Some(token)) else {
+            return false;
+        };
+        self.tokens
+            .lock()
+            .unwrap()
+            .get(token)
+            .is_some_and(|i| i.thumbprint == thumbprint && i.expires_at > now_secs())
+    }
 }
 
 async fn up_descriptor() -> Json<Value> {
     Json(json!({"environmentId": "env-1", "label": "upstream"}))
 }
 
-async fn up_session(headers: HeaderMap) -> Response {
-    if !authorized(&headers) {
+async fn up_session(State(t3): State<Arc<FakeT3>>, headers: HeaderMap) -> Response {
+    if !headers.contains_key("authorization") {
+        let methods = if t3.dpop {
+            json!(["bearer-access-token", "dpop-access-token"])
+        } else {
+            json!(["bearer-access-token"])
+        };
+        return Json(json!({"authenticated": false, "auth": {"sessionMethods": methods}}))
+            .into_response();
+    }
+    if !t3.authorized("GET", "/api/auth/session", &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(json!({
@@ -57,8 +209,59 @@ async fn up_session(headers: HeaderMap) -> Response {
     .into_response()
 }
 
+async fn up_token(
+    State(t3): State<Arc<FakeT3>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let refused = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code": "invalid_credential"})),
+        )
+            .into_response()
+    };
+    let proof = headers.get("dpop").and_then(|v| v.to_str().ok());
+    let Some(thumbprint) = t3.proof(proof, "POST", "/oauth/token", None) else {
+        return refused();
+    };
+    let subject = form.get("subject_token").cloned().unwrap_or_default();
+    let issued = match form.get("subject_token_type").map(String::as_str) {
+        Some(dpop::BOOTSTRAP_TOKEN_TYPE) => {
+            if !t3.pairings.lock().unwrap().remove(&subject) {
+                return refused();
+            }
+            t3.exchanges.fetch_add(1, Ordering::SeqCst);
+            t3.issue(thumbprint)
+        }
+        Some(dpop::ACCESS_TOKEN_TYPE) => {
+            t3.renewals.fetch_add(1, Ordering::SeqCst);
+            // An expired token renews too; the key must be the one it is bound to.
+            let bound = t3
+                .tokens
+                .lock()
+                .unwrap()
+                .get(&subject)
+                .is_some_and(|i| i.thumbprint == thumbprint);
+            if !bound || t3.refuse_renewal.load(Ordering::SeqCst) {
+                return refused();
+            }
+            t3.issue(thumbprint)
+        }
+        _ => return refused(),
+    };
+    Json(json!({
+        "access_token": issued.0,
+        "issued_token_type": dpop::ACCESS_TOKEN_TYPE,
+        "token_type": "DPoP",
+        "expires_in": issued.1,
+        "scope": "orchestration:read orchestration:operate"
+    }))
+    .into_response()
+}
+
 async fn up_shell(State(t3): State<Arc<FakeT3>>, headers: HeaderMap) -> Response {
-    if !authorized(&headers) {
+    if !t3.authorized("GET", "/api/orchestration/shell", &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let threads = if t3.working.load(Ordering::SeqCst) {
@@ -75,7 +278,8 @@ async fn up_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !authorized(&headers) {
+    // The upgrade carries its own proof, for `GET` on the socket's URL without its query.
+    if !t3.authorized("GET", "/ws", &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     t3.queries.lock().unwrap().push(query.unwrap_or_default());
@@ -110,35 +314,43 @@ async fn up_ws(
     })
 }
 
-async fn fake_t3() -> (Arc<FakeT3>, String) {
-    let t3 = Arc::new(FakeT3::default());
+async fn fake_t3(dpop: bool) -> (Arc<FakeT3>, String) {
+    let t3 = Arc::new(FakeT3::new(dpop));
     let app = Router::new()
         .route("/.well-known/t3/environment", get(up_descriptor))
         .route("/api/auth/session", get(up_session))
+        .route("/oauth/token", post(up_token))
         .route("/api/orchestration/shell", get(up_shell))
         .route("/ws", get(up_ws))
         .with_state(t3.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    *t3.base.lock().unwrap() = url.clone();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (t3, url)
 }
 
-/// instabox: the sandbox's state, and wakes counted.
+/// instabox: the sandbox's state, wakes counted, and pairing credentials from T3 on it.
 struct FakeControl {
     state: Mutex<String>,
     auto_suspended: bool,
     wakes: AtomicUsize,
-    revision: std::sync::atomic::AtomicI64,
+    revision: AtomicI64,
+    t3: Arc<FakeT3>,
+    pairings_asked: AtomicUsize,
+    refuse_pairing: AtomicBool,
 }
 
 impl FakeControl {
-    fn new(state: &str, auto_suspended: bool) -> Arc<Self> {
+    fn new(state: &str, auto_suspended: bool, t3: Arc<FakeT3>) -> Arc<Self> {
         Arc::new(FakeControl {
             state: Mutex::new(state.into()),
             auto_suspended,
             wakes: AtomicUsize::new(0),
-            revision: std::sync::atomic::AtomicI64::new(1),
+            revision: AtomicI64::new(1),
+            t3,
+            pairings_asked: AtomicUsize::new(0),
+            refuse_pairing: AtomicBool::new(false),
         })
     }
 
@@ -167,6 +379,14 @@ impl Control for FakeControl {
         *self.state.lock().unwrap() = "running".into();
         Ok(())
     }
+
+    async fn pairing_credential(&self, _id: &str) -> Result<String, String> {
+        self.pairings_asked.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_pairing.load(Ordering::SeqCst) {
+            return Err("t3 auth pairing create failed".into());
+        }
+        Ok(self.t3.mint_pairing())
+    }
 }
 
 fn tuning(idle_after: Duration) -> Tuning {
@@ -175,6 +395,27 @@ fn tuning(idle_after: Duration) -> Tuning {
         poll: Duration::from_millis(50),
         tick: Duration::from_millis(20),
         busy_recheck: Duration::from_millis(100),
+        renew_before: Duration::from_secs(1),
+    }
+}
+
+/// A DPoP session on `t3`, paired the way the hub pairs it.
+async fn paired(t3: &FakeT3, base: &str) -> Credential {
+    let key = DpopKey::generate().unwrap();
+    let pairing = t3.mint_pairing();
+    let (token, expires_at) = dpop::exchange(
+        &reqwest::Client::new(),
+        base,
+        &key,
+        &pairing,
+        dpop::BOOTSTRAP_TOKEN_TYPE,
+    )
+    .await
+    .unwrap();
+    Credential::Dpop {
+        key: key.pkcs8().to_owned(),
+        token,
+        expires_at,
     }
 }
 
@@ -182,17 +423,26 @@ struct Proxy {
     t3: Arc<FakeT3>,
     control: Arc<FakeControl>,
     rt: Arc<Runtime>,
+    tokens: Arc<MemoryTokenStore>,
     port: u16,
     _dir: tempfile::TempDir,
 }
 
-/// A proxy on an ephemeral port for a sandbox in `state`, its runtime running.
-async fn proxy(state: &str, auto_suspended: bool, idle_after: Duration) -> Proxy {
-    let (t3, upstream_url) = fake_t3().await;
-    let control = FakeControl::new(state, auto_suspended);
+/// A proxy on an ephemeral port for a sandbox in `state`, paired with DPoP, its runtime
+/// running. `expires_in`: the lifetime of T3's tokens, in seconds.
+async fn proxy_with(
+    state: &str,
+    auto_suspended: bool,
+    idle_after: Duration,
+    expires_in: i64,
+) -> Proxy {
+    let (t3, upstream_url) = fake_t3(true).await;
+    t3.expires_in.store(expires_in, Ordering::SeqCst);
+    let control = FakeControl::new(state, auto_suspended, t3.clone());
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let credential = paired(&t3, &upstream_url).await;
     let record = Record {
         id: "m_test".into(),
         name: "qa".into(),
@@ -201,10 +451,12 @@ async fn proxy(state: &str, auto_suspended: bool, idle_after: Duration) -> Proxy
         upstream_url,
         client_tokens: vec![token_hash(CLIENT_TOKEN)],
     };
+    let tokens = Arc::new(MemoryTokenStore::default());
     let rt = Arc::new(Runtime::new(
         dir.path().join("m_test"),
         record,
-        UP_TOKEN.into(),
+        credential,
+        tokens.clone(),
         control.clone(),
         tuning(idle_after),
     ));
@@ -217,9 +469,14 @@ async fn proxy(state: &str, auto_suspended: bool, idle_after: Duration) -> Proxy
         t3,
         control,
         rt,
+        tokens,
         port,
         _dir: dir,
     }
+}
+
+async fn proxy(state: &str, auto_suspended: bool, idle_after: Duration) -> Proxy {
+    proxy_with(state, auto_suspended, idle_after, 3600).await
 }
 
 type Ws =
@@ -273,6 +530,10 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
     panic!("never: {what}");
 }
 
+fn count(n: &AtomicUsize) -> usize {
+    n.load(Ordering::SeqCst)
+}
+
 #[tokio::test]
 async fn an_idle_sandbox_is_released_and_the_next_action_takes_it_back() {
     let p = proxy("running", true, Duration::from_millis(400)).await;
@@ -287,13 +548,10 @@ async fn an_idle_sandbox_is_released_and_the_next_action_takes_it_back() {
         (first["_tag"].as_str(), first["requestId"].as_str()),
         (Some("Chunk"), Some("1"))
     );
-    assert_eq!(p.t3.open.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&p.t3.open), 1);
 
     // No action for `idle_after`: the upstream socket closes, so the port lease ends.
-    eventually("the upstream socket closes", || {
-        p.t3.open.load(Ordering::SeqCst) == 0
-    })
-    .await;
+    eventually("the upstream socket closes", || count(&p.t3.open) == 0).await;
     assert!(p.rt.released());
     assert_eq!(p.rt.power(), Power::Stopped);
     assert_eq!(p.control.wakes(), 0);
@@ -311,7 +569,7 @@ async fn an_idle_sandbox_is_released_and_the_next_action_takes_it_back() {
     assert_eq!(report["requestId"], "2");
     assert_eq!(report["exit"]["_tag"], "Success");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(p.t3.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&p.t3.connections), 1);
     assert_eq!(p.control.wakes(), 0);
 
     // A person acts: the proxy takes the sandbox back and the action goes through.
@@ -327,8 +585,9 @@ async fn an_idle_sandbox_is_released_and_the_next_action_takes_it_back() {
     // Then the socket closes so T3 Code resubscribes against the live server.
     assert_eq!(next(&mut ws).await, json!({"close": 1012}));
     assert_eq!(p.control.wakes(), 1);
-    assert_eq!(p.t3.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(count(&p.t3.connections), 2);
     assert!(!p.rt.released());
+    assert_eq!(count(&p.t3.bearer_seen), 0, "DPoP all the way");
 }
 
 #[tokio::test]
@@ -343,17 +602,10 @@ async fn a_sandbox_with_an_agent_working_is_held() {
     .await;
     next(&mut ws).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert_eq!(
-        p.t3.open.load(Ordering::SeqCst),
-        1,
-        "held while the agent works"
-    );
+    assert_eq!(count(&p.t3.open), 1, "held while the agent works");
     assert!(!p.rt.released());
     p.t3.working.store(false, Ordering::SeqCst);
-    eventually("released once the run ends", || {
-        p.t3.open.load(Ordering::SeqCst) == 0
-    })
-    .await;
+    eventually("released once the run ends", || count(&p.t3.open) == 0).await;
 }
 
 #[tokio::test]
@@ -382,7 +634,7 @@ async fn a_sleeping_sandbox_answers_upkeep_here_and_wakes_for_the_unknown() {
     assert_eq!(next(&mut ws).await["requestId"], "4");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(p.control.wakes(), 0);
-    assert_eq!(p.t3.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(count(&p.t3.connections), 0);
 
     // An RPC the proxy does not know wakes the sandbox, which is always safe.
     send(&mut ws, request("5", "something.new", json!({}))).await;
@@ -431,6 +683,93 @@ async fn a_sandbox_its_owner_paused_wakes_only_for_a_person() {
     assert_eq!(p.control.wakes(), 1);
 }
 
+#[tokio::test]
+async fn the_dpop_token_is_renewed_before_it_runs_out_while_held() {
+    // Tokens for 2 s, renewed with 1 s left: about every second while the proxy holds it.
+    let p = proxy_with("running", true, Duration::from_secs(60), 2).await;
+    let first = p.rt.credential().await;
+    eventually("a renewal", || count(&p.t3.renewals) >= 2).await;
+    assert_ne!(p.rt.credential().await, first, "a new token");
+    // The renewed token is kept, and it works.
+    let kept = Credential::parse(&p.tokens.load("m_test").unwrap().unwrap());
+    assert!(kept.is_dpop() && kept != first);
+    p.rt.prime().await.unwrap();
+    assert_eq!(count(&p.t3.exchanges), 1, "renewed, not paired again");
+    assert_eq!(count(&p.t3.bearer_seen), 0);
+}
+
+#[tokio::test]
+async fn a_released_sandbox_is_not_renewed_and_its_expired_token_renews_on_the_next_use() {
+    let p = proxy_with("running", true, Duration::from_millis(200), 2).await;
+    eventually("released", || p.rt.released()).await;
+    let at_release = count(&p.t3.renewals);
+    // A renewal is a request to the sandbox: it would wake it, so none while released.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        count(&p.t3.renewals),
+        at_release,
+        "no renewal while released"
+    );
+    // The next action takes the sandbox back; its expired token renews first.
+    let mut ws = t3_code(p.port).await;
+    let archive = json!({"type": "thread.archive", "commandId": "c1", "threadId": "t1"});
+    send(
+        &mut ws,
+        request("1", "orchestration.dispatchCommand", archive),
+    )
+    .await;
+    assert_eq!(next(&mut ws).await["requestId"], "1");
+    assert!(count(&p.t3.renewals) > at_release);
+    assert_eq!(count(&p.t3.exchanges), 1);
+}
+
+#[tokio::test]
+async fn a_refused_renewal_pairs_again_through_the_sandbox() {
+    let p = proxy_with("running", true, Duration::from_secs(60), 2).await;
+    p.t3.refuse_renewal.store(true, Ordering::SeqCst);
+    eventually("paired again", || count(&p.t3.exchanges) == 2).await;
+    assert_eq!(count(&p.control.pairings_asked), 1);
+    assert!(p.rt.credential().await.is_dpop());
+    p.t3.refuse_renewal.store(false, Ordering::SeqCst);
+    p.rt.prime().await.unwrap();
+    assert_eq!(count(&p.t3.bearer_seen), 0);
+}
+
+#[tokio::test]
+async fn a_session_refused_for_good_fails_with_a_clear_error_and_never_falls_back_to_bearer() {
+    let p = proxy_with("running", true, Duration::from_secs(60), 2).await;
+    p.t3.refuse_renewal.store(true, Ordering::SeqCst);
+    p.control.refuse_pairing.store(true, Ordering::SeqCst);
+    eventually("pairing again was tried", || {
+        count(&p.control.pairings_asked) == 1
+    })
+    .await;
+    let url = format!("{}/api/orchestration/shell", p.rt.upstream_url());
+    let e = p.rt.upstream_headers("GET", &url).await.unwrap_err();
+    assert!(e.downcast_ref::<dpop::Refused>().is_some(), "{e:#}");
+    assert!(e.to_string().contains("Open in T3 Code"), "{e}");
+    // Through the proxy, the same message, and T3 is not asked again each time.
+    let res = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/api/orchestration/shell",
+            p.port
+        ))
+        .header("authorization", format!("Bearer {CLIENT_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    assert!(res.text().await.unwrap().contains("Open in T3 Code"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count(&p.control.pairings_asked), 1);
+    assert_eq!(count(&p.t3.bearer_seen), 0);
+    // A new pairing (Open in T3 Code) ends it.
+    p.t3.refuse_renewal.store(false, Ordering::SeqCst);
+    p.rt.set_credential(paired(&p.t3, &p.rt.upstream_url()).await)
+        .await;
+    p.rt.prime().await.unwrap();
+}
+
 struct Creds;
 
 #[async_trait]
@@ -443,42 +782,57 @@ impl Credentials for Creds {
     }
 }
 
-#[tokio::test]
-async fn pairing_goes_through_the_proxy() {
+/// The instabox API for `hub.pair_link`: the published port, and `exec` answering `stdout`.
+async fn instabox_api(
+    upstream_url: &str,
+    exec_stdout: Option<&str>,
+) -> (wiremock::MockServer, Client) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let (t3, upstream_url) = fake_t3().await;
     let api = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/machines/m_test/ports"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"url": upstream_url})))
         .mount(&api)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/machines/m_test/exec"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({"stdout": format!("{UP_TOKEN}\n"), "stderr": "", "exitCode": 0}),
-            ),
-        )
-        .expect(1)
-        .mount(&api)
-        .await;
+    let exec = Mock::given(method("POST")).and(path("/v1/machines/m_test/exec"));
+    match exec_stdout {
+        Some(out) => exec
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"stdout": out, "stderr": "", "exitCode": 0})),
+            )
+            .expect(1),
+        None => exec.respond_with(ResponseTemplate::new(500)).expect(0),
+    }
+    .mount(&api)
+    .await;
     let client = Client::new(url::Url::parse(&api.uri()).unwrap(), Arc::new(Creds));
+    (api, client)
+}
+
+#[tokio::test]
+async fn pairing_goes_through_the_proxy() {
+    let (t3, upstream_url) = fake_t3(true).await;
+    // A T3 with DPoP: no bearer session is issued (no exec of `t3 auth session issue`).
+    let (_api, client) = instabox_api(&upstream_url, None).await;
     let dir = tempfile::tempdir().unwrap();
     let tokens = Arc::new(MemoryTokenStore::default());
-    let control = FakeControl::new("running", true);
+    let control = FakeControl::new("running", true, t3.clone());
     let hub = Hub::new(
         dir.path().to_path_buf(),
-        control,
+        control.clone(),
         tokens.clone(),
         tuning(Duration::from_secs(60)),
+        false,
     );
 
     let link = hub.pair_link(&client, "m_test", "qa").await.unwrap();
-    // The upstream session is the keychain's, issued once on the sandbox.
-    assert_eq!(tokens.load("m_test").unwrap().as_deref(), Some(UP_TOKEN));
+    // The upstream session is a DPoP one, kept with its key.
+    let stored = Credential::parse(&tokens.load("m_test").unwrap().unwrap());
+    assert!(stored.is_dpop());
+    assert_eq!(count(&t3.exchanges), 1);
+    assert_eq!(count(&control.pairings_asked), 1);
     let pairing: String =
         url::form_urlencoded::parse(link.strip_prefix("t3code://pair?").unwrap().as_bytes())
             .find(|(k, _)| k == "pairingUrl")
@@ -556,7 +910,7 @@ async fn pairing_goes_through_the_proxy() {
         .unwrap();
     assert_eq!(rebound.status(), 403);
 
-    // The socket opens with a ticket; its DPoP proof stays here.
+    // The socket opens with a ticket; T3 Code's DPoP proof stays here, the proxy proves its own.
     let ticket: Value = http
         .post(at("/api/auth/websocket-ticket/rpc"))
         .header("authorization", format!("DPoP {access}"))
@@ -581,10 +935,56 @@ async fn pairing_goes_through_the_proxy() {
 
     // What is kept on disk holds no secret.
     let record = std::fs::read_to_string(dir.path().join("m_test").join("record.json")).unwrap();
-    assert!(!record.contains(&access) && !record.contains(UP_TOKEN));
+    let Credential::Dpop { key, token: up, .. } = &stored else {
+        unreachable!()
+    };
+    assert!(
+        !record.contains(&access)
+            && !record.contains(up.as_str())
+            && !record.contains(key.as_str())
+    );
     assert!(record.contains(&token_hash(&access)));
 
-    // Open again: the same port, no second session issued (the exec mock expects one call).
+    // Open again: the same port and the same session.
     let link2 = hub.pair_link(&client, "m_test", "qa").await.unwrap();
     assert!(link2.contains(&format!("localhost%3A{port}%2Fpair")));
+    assert_eq!(count(&t3.exchanges), 1);
+    assert_eq!(count(&t3.bearer_seen), 0);
+}
+
+#[tokio::test]
+async fn a_t3_without_dpop_gets_a_bearer_session_only_when_allowed() {
+    let (t3, upstream_url) = fake_t3(false).await;
+    let control = FakeControl::new("running", true, t3.clone());
+    let dir = tempfile::tempdir().unwrap();
+    // Without `INSTAADE_T3_PROXY=any`: a clear refusal, and nothing is issued.
+    let (_api, client) = instabox_api(&upstream_url, None).await;
+    let tokens = Arc::new(MemoryTokenStore::default());
+    let hub = Hub::new(
+        dir.path().to_path_buf(),
+        control.clone(),
+        tokens.clone(),
+        tuning(Duration::from_secs(60)),
+        false,
+    );
+    let e = hub.pair_link(&client, "m_test", "qa").await.unwrap_err();
+    assert!(e.to_string().contains("INSTAADE_T3_PROXY=any"), "{e}");
+    assert_eq!(tokens.load("m_test").unwrap(), None);
+    // With it: the bearer session `t3 auth session issue` prints.
+    let (_api, client) = instabox_api(&upstream_url, Some(&format!("{UP_TOKEN}\n"))).await;
+    let hub = Hub::new(
+        dir.path().to_path_buf(),
+        control.clone(),
+        tokens.clone(),
+        tuning(Duration::from_secs(60)),
+        true,
+    );
+    hub.pair_link(&client, "m_test", "qa").await.unwrap();
+    assert_eq!(
+        Credential::parse(&tokens.load("m_test").unwrap().unwrap()),
+        Credential::Bearer {
+            token: UP_TOKEN.into()
+        }
+    );
+    assert_eq!(count(&control.pairings_asked), 0);
 }

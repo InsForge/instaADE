@@ -177,6 +177,8 @@ pub fn run() {
                     Arc::new(t3proxy::hub::Instabox::new(source)),
                     Arc::new(t3proxy::hub::KeyringTokenStore),
                     t3proxy::runtime::Tuning::default(),
+                    // A T3 without DPoP gets a bearer session only with INSTAADE_T3_PROXY=any.
+                    t3proxy::Gate::from_env() == t3proxy::Gate::Any,
                 );
                 core.set_t3_proxy(hub.clone());
                 tauri::async_runtime::spawn(async move { hub.start_saved().await });

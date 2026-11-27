@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Pau Kraft. See NOTICE in src-tauri/src/t3proxy.
 
 //! WebSocket connections to the T3 server on the sandbox, through its published port,
-//! authenticated with the proxy's own bearer token. Each open one holds an instabox port lease,
-//! so the proxy closes them when it releases an idle sandbox.
+//! authorized with the proxy's own session (`Runtime::upstream_headers`: a DPoP token and a
+//! fresh proof per upgrade). Each open one holds an instabox port lease, so the proxy closes
+//! them when it releases an idle sandbox.
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -21,16 +22,19 @@ pub type Upstream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 pub const PING: Duration = Duration::from_secs(10);
 pub const SILENCE: Duration = Duration::from_secs(30);
 
-/// Opens `target` (path and query) on the T3 server as a WebSocket.
-pub async fn connect(base_url: &str, token: &str, target: &str) -> Result<Upstream> {
+/// Headers that authorize one upstream request, made for it alone (a DPoP proof is used once).
+pub type AuthHeaders = Vec<(&'static str, String)>;
+
+/// Opens `target` (path and query) on the T3 server as a WebSocket, with `headers`.
+pub async fn connect(base_url: &str, headers: &AuthHeaders, target: &str) -> Result<Upstream> {
     let ws_base = base_url
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
     let mut req = format!("{ws_base}{target}").into_client_request()?;
-    req.headers_mut().insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {token}"))?,
-    );
+    for (name, value) in headers {
+        req.headers_mut()
+            .insert(*name, HeaderValue::from_str(value)?);
+    }
     let (ws, _) = tokio::time::timeout(
         Duration::from_secs(15),
         tokio_tungstenite::connect_async(req),
@@ -41,9 +45,8 @@ pub async fn connect(base_url: &str, token: &str, target: &str) -> Result<Upstre
 }
 
 /// The RPC socket. `client_query` carries the desktop's client* parameters through, minus its
-/// proxy ticket and its DPoP proof (made for the proxy's URL, and the proxy's own credential
-/// upstream is a bearer token). Upstream sends whole frames: the proxy does not split or join
-/// parts.
+/// proxy ticket and its DPoP proof (made for the proxy's URL; upstream the proxy proves its own
+/// key in a header). Upstream sends whole frames: the proxy does not split or join parts.
 pub fn rpc_target(client_query: &str) -> String {
     let client = super::query_without(
         client_query,
@@ -57,10 +60,10 @@ pub fn rpc_target(client_query: &str) -> String {
 /// request order: the success value or the server's failure message.
 pub async fn call_many(
     base_url: &str,
-    token: &str,
+    headers: &AuthHeaders,
     requests: Vec<(String, Value)>,
 ) -> Result<Vec<std::result::Result<Value, String>>> {
-    let mut ws = connect(base_url, token, &rpc_target("")).await?;
+    let mut ws = connect(base_url, headers, &rpc_target("")).await?;
     let mut results = vec![Ok(Value::Null); requests.len()];
     let mut pending = std::collections::HashMap::new();
     for (i, (tag, payload)) in requests.into_iter().enumerate() {
@@ -100,13 +103,13 @@ pub async fn call_many(
 /// clients do, so the server keeps sending.
 pub async fn subscribe_until<T>(
     base_url: &str,
-    token: &str,
+    headers: &AuthHeaders,
     tag: &str,
     payload: Value,
     timeout: Duration,
     mut on_item: impl FnMut(&Value) -> Option<T>,
 ) -> Result<(Option<T>, Value)> {
-    let mut ws = connect(base_url, token, &rpc_target("")).await?;
+    let mut ws = connect(base_url, headers, &rpc_target("")).await?;
     let msg = json!({"_tag": "Request", "id": "1", "tag": tag, "payload": payload, "headers": []});
     ws.send(Message::text(msg.to_string())).await?;
     let deadline = tokio::time::Instant::now() + timeout;

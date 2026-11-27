@@ -6,6 +6,12 @@
 //! - Power comes from instabox: a read of the sandbox (`GET /v1/machines/{id}`), which
 //!   instabox does not count as use, every `Tuning::poll`.
 //! - A wake is `sandbox::ensure_running` (resume or start), then the T3 server answering.
+//! - Upstream the proxy uses a DPoP session of its own (`dpop`): every request and WebSocket
+//!   upgrade gets a fresh proof, and the one-hour token is renewed before it runs out while the
+//!   proxy holds the sandbox, never while it is released or asleep (that request would wake it;
+//!   T3 renews an expired token too). A refused renewal pairs again once through the exec API;
+//!   if that fails too, requests fail with `dpop::Refused` until the sandbox is paired again.
+//!   There is no fallback to a bearer token.
 //! - New: after `Tuning::idle_after` without a user action, and with no agent working, the
 //!   runtime captures the state and releases the sandbox (`Power::Stopped` while it still runs).
 //!   Every session closes its upstream socket then, so the instabox port lease ends and the
@@ -15,6 +21,8 @@
 use super::assets;
 use super::auth::{self, Auth};
 use super::cache::{self, Cache, Capture};
+use super::dpop::{self, Credential, DpopKey, Refused};
+use super::hub::TokenStore;
 use super::threads::{self, ThreadFlags};
 use super::upstream;
 use crate::api::Machine;
@@ -91,6 +99,9 @@ pub trait Control: Send + Sync {
     async fn machine(&self, id: &str) -> Result<Machine, ControlError>;
     /// Resumes or starts the sandbox and returns once it runs.
     async fn wake(&self, id: &str) -> Result<(), String>;
+    /// A one-time T3 pairing credential, issued on the running sandbox
+    /// (`dpop::PAIRING_SCRIPT`). Never logged.
+    async fn pairing_credential(&self, id: &str) -> Result<String, String>;
 }
 
 /// What InstaADE keeps of a sandbox paired through the proxy, in `record.json`. No secret:
@@ -126,6 +137,8 @@ pub struct Tuning {
     pub tick: Duration,
     /// After a capture found an agent working, the next check waits this long.
     pub busy_recheck: Duration,
+    /// A DPoP token is renewed once it has this long left.
+    pub renew_before: Duration,
 }
 
 impl Default for Tuning {
@@ -141,6 +154,34 @@ impl Default for Tuning {
             poll: Duration::from_secs(30),
             tick: Duration::from_secs(5),
             busy_recheck: Duration::from_secs(30),
+            // T3's tokens last an hour: renewed about every 50 minutes while in use.
+            renew_before: Duration::from_secs(600),
+        }
+    }
+}
+
+/// The proxy's credential on the sandbox's T3, and the key it is bound to.
+struct UpstreamAuth {
+    credential: Credential,
+    key: Option<DpopKey>,
+    /// T3 refused the session and pairing again failed: requests fail with this until the
+    /// sandbox is paired again (`set_credential`), without asking T3 each time.
+    refused: Option<String>,
+}
+
+impl UpstreamAuth {
+    fn new(credential: Credential) -> Self {
+        let (key, refused) = match &credential {
+            Credential::Dpop { key, .. } => match DpopKey::from_pkcs8(key) {
+                Ok(k) => (Some(k), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            Credential::Bearer { .. } => (None, None),
+        };
+        UpstreamAuth {
+            credential,
+            key,
+            refused,
         }
     }
 }
@@ -167,7 +208,8 @@ pub struct Runtime {
     id: String,
     dir: PathBuf,
     record: RwLock<Record>,
-    token: RwLock<String>,
+    upstream_auth: tokio::sync::Mutex<UpstreamAuth>,
+    tokens: Arc<dyn TokenStore>,
     control: Arc<dyn Control>,
     tuning: Tuning,
     pub http: reqwest::Client,
@@ -189,7 +231,8 @@ impl Runtime {
     pub fn new(
         dir: PathBuf,
         record: Record,
-        token: String,
+        credential: Credential,
+        tokens: Arc<dyn TokenStore>,
         control: Arc<dyn Control>,
         tuning: Tuning,
     ) -> Self {
@@ -202,7 +245,8 @@ impl Runtime {
             id: record.id.clone(),
             dir,
             record: RwLock::new(record),
-            token: RwLock::new(token),
+            upstream_auth: tokio::sync::Mutex::new(UpstreamAuth::new(credential)),
+            tokens,
             control,
             tuning,
             http,
@@ -251,8 +295,133 @@ impl Runtime {
         self.update_record(|r| r.client_tokens.push(hash));
     }
 
-    pub fn set_upstream_token(&self, token: String) {
-        *self.token.write().unwrap() = token;
+    /// A new upstream credential (a pairing): it also ends an earlier refusal.
+    pub async fn set_credential(&self, credential: Credential) {
+        *self.upstream_auth.lock().await = UpstreamAuth::new(credential);
+    }
+
+    /// The upstream credential as it stands, renewed or not.
+    pub async fn credential(&self) -> Credential {
+        self.upstream_auth.lock().await.credential.clone()
+    }
+
+    /// The headers that authorize `method` on `url` upstream, for this one request: a DPoP
+    /// token with a fresh proof, renewed first when due (or, with `INSTAADE_T3_PROXY=any` on a
+    /// T3 without DPoP, a bearer token).
+    pub async fn upstream_headers(&self, method: &str, url: &str) -> Result<upstream::AuthHeaders> {
+        let mut guard = self.upstream_auth.lock().await;
+        let a = &mut *guard;
+        if let Credential::Bearer { token } = &a.credential {
+            return Ok(vec![("authorization", format!("Bearer {token}"))]);
+        }
+        self.fresh(a).await?;
+        let (Credential::Dpop { token, .. }, Some(key)) = (&a.credential, &a.key) else {
+            return Err(Refused("no DPoP key".into()).into());
+        };
+        let proof = key.proof(method, url, Some(token))?;
+        Ok(vec![
+            ("authorization", format!("DPoP {token}")),
+            ("dpop", proof),
+        ])
+    }
+
+    /// Renews the DPoP token once it has `renew_before` or less left (an expired one too: T3
+    /// renews it within its 30-day window). A refused renewal pairs again once through the
+    /// sandbox; both failing is a `Refused` that stays until the sandbox is paired again.
+    async fn fresh(&self, a: &mut UpstreamAuth) -> Result<()> {
+        if let Some(reason) = &a.refused {
+            return Err(Refused(reason.clone()).into());
+        }
+        let (token, expires_at) = match &a.credential {
+            Credential::Dpop {
+                token, expires_at, ..
+            } => (token.clone(), *expires_at),
+            Credential::Bearer { .. } => return Ok(()),
+        };
+        let now = Utc::now().timestamp_millis();
+        if !dpop::renewal_due(expires_at, now, self.tuning.renew_before) {
+            return Ok(());
+        }
+        let Some(key) = a.key.as_ref() else {
+            return Err(Refused("no DPoP key".into()).into());
+        };
+        let base = self.upstream_url();
+        let renewed =
+            match dpop::exchange(&self.http, &base, key, &token, dpop::ACCESS_TOKEN_TYPE).await {
+                Ok(t) => {
+                    log_info!("{}: DPoP token renewed", self.id);
+                    Ok(t)
+                }
+                Err(e) => {
+                    log_warn!("{}: renewing the DPoP token: {e:#}; pairing again", self.id);
+                    self.pair_again(key).await
+                }
+            };
+        match renewed {
+            Ok((token, expires_at)) => {
+                a.credential = Credential::Dpop {
+                    key: key.pkcs8().to_owned(),
+                    token,
+                    expires_at,
+                };
+                if let Err(e) = self.tokens.save(&self.id, &a.credential.to_stored()) {
+                    log_warn!("{}: saving the renewed token: {e}", self.id);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let reason = format!("{e:#}");
+                log_warn!("{}: {}", self.id, Refused(reason.clone()));
+                a.refused = Some(reason.clone());
+                Err(Refused(reason).into())
+            }
+        }
+    }
+
+    /// A new session for the same key, from a pairing credential issued on the sandbox.
+    async fn pair_again(&self, key: &DpopKey) -> Result<(String, i64)> {
+        let credential = self
+            .control
+            .pairing_credential(&self.id)
+            .await
+            .map_err(|e| anyhow!("pairing again: {e}"))?;
+        let out = dpop::exchange(
+            &self.http,
+            &self.upstream_url(),
+            key,
+            &credential,
+            dpop::BOOTSTRAP_TOKEN_TYPE,
+        )
+        .await
+        .context("pairing again")?;
+        log_info!("{}: paired again with a new DPoP session", self.id);
+        Ok(out)
+    }
+
+    /// Renews the token when due. The run loop calls it only while the proxy holds the sandbox.
+    pub async fn renew_if_due(&self) {
+        let mut guard = self.upstream_auth.lock().await;
+        if guard.refused.is_some() {
+            return;
+        }
+        if let Err(e) = self.fresh(&mut guard).await {
+            log_debug!("{}: {e:#}", self.id);
+        }
+    }
+
+    /// Opens `target` (path and query) on the sandbox's T3 as a WebSocket, authorized.
+    pub async fn connect_upstream(&self, target: &str) -> Result<upstream::Upstream> {
+        let base = self.upstream_url();
+        let headers = self
+            .upstream_headers("GET", &format!("{base}{target}"))
+            .await?;
+        upstream::connect(&base, &headers, target).await
+    }
+
+    /// The headers for a short-lived RPC socket (`upstream::call_many`, `subscribe_until`).
+    async fn rpc_headers(&self) -> Result<upstream::AuthHeaders> {
+        self.upstream_headers("GET", &format!("{}/ws", self.upstream_url()))
+            .await
     }
 
     /// Where this sandbox's record, cache, chats and images are kept on this computer.
@@ -369,10 +538,6 @@ impl Runtime {
             .to_owned()
     }
 
-    pub fn upstream_token(&self) -> String {
-        self.token.read().unwrap().clone()
-    }
-
     /// The sandbox's own descriptor, never instabox's answer for a sandbox that does not run.
     /// Cached for while the sandbox sleeps. Only while it runs: a request to the published port
     /// of a paused sandbox wakes it.
@@ -467,13 +632,12 @@ impl Runtime {
         self.fetch_descriptor()
             .await
             .ok_or_else(|| anyhow!("T3 on the sandbox did not answer"))?;
-        let res = self
-            .http
-            .get(format!("{}/api/auth/session", self.upstream_url()))
-            .bearer_auth(self.upstream_token())
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
+        let url = format!("{}/api/auth/session", self.upstream_url());
+        let mut req = self.http.get(&url).timeout(Duration::from_secs(10));
+        for (name, value) in self.upstream_headers("GET", &url).await? {
+            req = req.header(name, value);
+        }
+        let res = req.send().await?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
             bail!("T3 on the sandbox refused the proxy's session");
         }
@@ -511,7 +675,11 @@ impl Runtime {
             .iter()
             .map(|c| ("orchestration.dispatchCommand".to_owned(), c.clone()))
             .collect();
-        match upstream::call_many(&self.upstream_url(), &self.upstream_token(), requests).await {
+        let sent = match self.rpc_headers().await {
+            Ok(headers) => upstream::call_many(&self.upstream_url(), &headers, requests).await,
+            Err(e) => Err(e),
+        };
+        match sent {
             Ok(results) => {
                 self.cache
                     .lock()
@@ -628,9 +796,10 @@ impl Runtime {
             .into_iter()
             .map(|(key, payload)| (key, ("projects.readFile".to_owned(), payload)))
             .unzip();
+        let headers = self.rpc_headers().await?;
         let answers = tokio::time::timeout_at(
             deadline,
-            upstream::call_many(&self.upstream_url(), &self.upstream_token(), requests),
+            upstream::call_many(&self.upstream_url(), &headers, requests),
         )
         .await??;
         let mut cache = self.cache.lock().unwrap();
@@ -653,12 +822,21 @@ impl Runtime {
         if !self.cache.lock().unwrap().streams.contains_key(&key) {
             return;
         }
-        let (url, token) = (self.upstream_url(), self.upstream_token());
-        let first =
-            upstream::subscribe_until(&url, &token, TAG, json!({}), CAPTURE_BUDGET, |list| {
-                Some(list.clone())
-            });
-        let list = tokio::time::timeout_at(deadline, first).await;
+        let url = self.upstream_url();
+        let list = match self.rpc_headers().await {
+            Ok(headers) => {
+                let first = upstream::subscribe_until(
+                    &url,
+                    &headers,
+                    TAG,
+                    json!({}),
+                    CAPTURE_BUDGET,
+                    |list| Some(list.clone()),
+                );
+                tokio::time::timeout_at(deadline, first).await
+            }
+            Err(e) => Ok(Err(e)),
+        };
         let mut cache = self.cache.lock().unwrap();
         match (list, cache.streams.get_mut(&key)) {
             (Ok(Ok((Some(list), _))), Some(replay)) => replay.value = vec![list],
@@ -682,14 +860,15 @@ impl Runtime {
             .extend(["api", "orchestration"])
             .extend(segments);
         url.set_query(query);
-        let res = self
+        let mut req = self
             .http
-            .get(url)
-            .bearer_auth(self.upstream_token())
+            .get(url.clone())
             .header("x-t3-orchestration-protocol", "2")
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await?;
+            .timeout(Duration::from_secs(30));
+        for (name, value) in self.upstream_headers("GET", url.as_str()).await? {
+            req = req.header(name, value);
+        }
+        let res = req.send().await?;
         if !res.status().is_success() {
             bail!("orchestration read: HTTP {}", res.status());
         }
@@ -850,6 +1029,8 @@ impl Runtime {
             match self.power() {
                 Power::Missing => return,
                 Power::Running => {
+                    // Only while the proxy holds the sandbox: Running is never released.
+                    self.renew_if_due().await;
                     // Retries a send that failed during the wake.
                     self.flush_deferred_commands().await;
                     self.maybe_release(&mut last_check).await;

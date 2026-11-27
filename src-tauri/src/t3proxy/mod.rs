@@ -1,7 +1,7 @@
 // Routing, auth endpoints and relaying are ported from t3boat
 // (https://github.com/paukraft/t3boat), MIT License, Copyright (c) 2026 Pau Kraft. See NOTICE
-// in this directory. The gate, the instabox runtime (`runtime.rs`) and the hub (`hub.rs`) are
-// InstaADE's own.
+// in this directory. The gate, the instabox runtime (`runtime.rs`), the hub (`hub.rs`) and the
+// proxy's DPoP session upstream (`dpop.rs`) are InstaADE's own.
 
 //! PROTOTYPE, off by default: a local proxy between T3 Code and the T3 server on a sandbox.
 //! Only with `INSTAADE_T3_PROXY` set does anything here run (see `gate`).
@@ -31,6 +31,7 @@ pub mod assets;
 pub mod auth;
 pub mod cache;
 pub mod classify;
+pub mod dpop;
 pub mod hub;
 pub mod media;
 #[cfg(test)]
@@ -67,10 +68,11 @@ pub use hub::Hub;
 pub const FLAG: &str = "INSTAADE_T3_PROXY";
 
 /// The T3 Code versions this prototype was tried with. `INSTAADE_T3_PROXY=1` uses the proxy
-/// for these only; `INSTAADE_T3_PROXY=any` for every version. T3 Code 0.1.11 and later pair
-/// with DPoP: the proxy accepts their tokens without checking the proof, and still talks to the
-/// sandbox with a bearer session, which is not tried yet.
-pub const TESTED_T3: &[&str] = &["0.1.10"];
+/// for these only; `INSTAADE_T3_PROXY=any` for every version. The proxy talks to T3 on the
+/// sandbox with a DPoP session, which T3 has from 0.1.11 on (0.1.13 was tried). An older T3
+/// (0.1.10 was tried) gets a bearer session, only with `any`. Towards T3 Code the proxy takes
+/// `Bearer` and `DPoP` tokens alike without checking the proof.
+pub const TESTED_T3: &[&str] = &["0.1.13"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
@@ -451,17 +453,13 @@ fn route_name(target: &str) -> String {
         .join("/")
 }
 
-/// The proxy's own credential on the sandbox's server.
-fn upstream_bearer(m: &Runtime) -> Option<HeaderValue> {
-    HeaderValue::from_str(&format!("Bearer {}", m.upstream_token())).ok()
-}
-
 /// How a request goes on to the T3 server on the sandbox.
 struct Relay {
     /// Path and query there.
     target: String,
-    /// The credential it is sent with, if any: never the caller's own for the proxy.
-    authorization: Option<HeaderValue>,
+    /// Sent with the proxy's own credential (a DPoP token and a fresh proof), never the
+    /// caller's: false only for URL-token requests without a bearer.
+    authorize: bool,
     /// Whether it may wake a sleeping sandbox. If not, a sleeping sandbox answers 503.
     wake: bool,
 }
@@ -507,7 +505,7 @@ async fn forward(State(m): M, req: Request) -> Response {
     }
     let route = Relay {
         target: target(&parts.uri),
-        authorization: if bearer { upstream_bearer(&m) } else { None },
+        authorize: bearer,
         wake: authorized && (post || m.wakes_for_background()),
     };
     let answer = relay(&m, parts, body, route).await;
@@ -532,9 +530,13 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
     let Ok(body) = axum::body::to_bytes(body, MAX_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let send = || {
+    // A fresh proof for every send: T3 takes each one once.
+    let send = || async {
         let url = format!("{}{}", m.upstream_url(), route.target);
-        let mut rb = m.http.request(parts.method.clone(), url).body(body.clone());
+        let mut rb = m
+            .http
+            .request(parts.method.clone(), &url)
+            .body(body.clone());
         for (k, v) in &parts.headers {
             // The credential is the route's, and the body's length is what is sent here. A
             // DPoP proof was made for the proxy's URL, not the sandbox's.
@@ -544,10 +546,12 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
                 rb = rb.header(k, v);
             }
         }
-        if let Some(authorization) = &route.authorization {
-            rb = rb.header(header::AUTHORIZATION, authorization);
+        if route.authorize {
+            for (name, value) in m.upstream_headers(parts.method.as_str(), &url).await? {
+                rb = rb.header(name, value);
+            }
         }
-        rb.send()
+        anyhow::Ok(rb.send().await?)
     };
     let first = send().await;
     // Maybe never reached T3: instabox answers for a sandbox that does not run itself (503
@@ -558,7 +562,9 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
             r.status(),
             StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
         ),
-        Err(e) => e.is_connect(),
+        Err(e) => e
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect),
     };
     let res = if unreached && !matches!(m.refresh_power().await, Ok(Power::Running)) {
         if let Err(res) = wake(m, route.wake, &route.target).await {
@@ -570,7 +576,11 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
     };
     let res = match res {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        // The proxy's session was refused: not the sandbox's fault, and no retry helps.
+        Err(e) if e.downcast_ref::<dpop::Refused>().is_some() => {
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     };
     let mut out = Response::builder().status(res.status());
     for (k, v) in res.headers() {
@@ -606,9 +616,12 @@ mod tests {
         assert_eq!(Gate::parse(Some("true")), Gate::Off);
         assert_eq!(Gate::parse(Some("1")), Gate::Tested);
         assert_eq!(Gate::parse(Some("any")), Gate::Any);
-        assert!(!Gate::Off.takes(Some("0.1.10")));
-        assert!(Gate::Tested.takes(Some("0.1.10")));
-        assert!(!Gate::Tested.takes(Some("0.1.12")));
+        assert!(!Gate::Off.takes(Some("0.1.13")));
+        assert!(Gate::Tested.takes(Some("0.1.13")));
+        assert!(
+            !Gate::Tested.takes(Some("0.1.10")),
+            "no DPoP: only with `any`"
+        );
         assert!(!Gate::Tested.takes(None));
         assert!(Gate::Any.takes(Some("0.1.12")));
     }

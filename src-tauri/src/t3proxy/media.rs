@@ -13,8 +13,7 @@
 use super::auth::TicketUse;
 use super::runtime::{Power, Runtime};
 use super::{
-    M, Relay, client_authorized, query_param, query_without, relay, unauthorized, upstream,
-    upstream_bearer, wake,
+    M, Relay, client_authorized, query_param, query_without, relay, unauthorized, upstream, wake,
 };
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame as DownClose, Message as DownMsg, WebSocket, WebSocketUpgrade};
@@ -51,7 +50,7 @@ pub async fn stream(
     }
     let route = Relay {
         target,
-        authorization: upstream_bearer(&m),
+        authorize: true,
         wake: false,
     };
     relay(&m, parts, body, route).await
@@ -73,7 +72,7 @@ pub(super) async fn socket(
     {
         return *res;
     }
-    match upstream::connect(&m.upstream_url(), &m.upstream_token(), &target).await {
+    match m.connect_upstream(&target).await {
         Ok(up) => upgrade.on_upgrade(move |down| pump(m, down, up)),
         // The machine's own refusal (no device hub, say) reaches T3 Code as it was.
         Err(e) => match e.downcast_ref() {

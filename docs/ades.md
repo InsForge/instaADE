@@ -27,10 +27,10 @@ An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both th
 
 T3 Code keeps a WebSocket open to the sandbox's published port, and instabox counts an open connection to a published port as use, so a sandbox with T3 Code open never sleeps. The local proxy is a prototype that fixes this. It runs only when InstaADE starts with `INSTAADE_T3_PROXY=1` in its environment. Without the variable nothing changes.
 
-- **Install**, **Open in T3 Code** and **Pair again** pair T3 Code with a proxy on this computer, `http://localhost:<port>`, instead of the published port. Each sandbox keeps its own port, from 37800 up. The proxy is used only with the T3 Code versions it was tried with (0.1.10). With `INSTAADE_T3_PROXY=any` it is used with every version.
+- **Install**, **Open in T3 Code** and **Pair again** pair T3 Code with a proxy on this computer, `http://localhost:<port>`, instead of the published port. Each sandbox keeps its own port, from 37800 up. The proxy is used only with the T3 Code versions it was tried with (0.1.13). With `INSTAADE_T3_PROXY=any` it is used with every version.
 - The proxy holds the connection to the sandbox while you use T3 Code. After 90 seconds with no action from you and no agent working, it closes the connection. The sandbox then pauses after its own auto sleep time.
 - While the sandbox sleeps, the proxy answers T3 Code from what it recorded: the chat list, the chats it stored, settings and the like. Your next action, such as a message, wakes the sandbox, and T3 Code reconnects. A sandbox you paused yourself wakes only for your action, never for what T3 Code asks on its own.
-- The proxy talks to T3 on the sandbox with a T3 session of its own, made with `t3 auth session issue` and kept in the keychain.
+- The proxy talks to T3 on the sandbox with a DPoP session of its own: a key for each sandbox, paired with `t3 auth pairing create` and kept in the keychain with its token. The token lasts an hour and is renewed while you use T3 Code. When T3 refuses it and a new pairing fails too, T3 Code shows an error until you use **Open in T3 Code** again. A T3 older than 0.1.11 has no DPoP: the proxy uses a bearer session with it only with `INSTAADE_T3_PROXY=any`.
 - T3 Code saves a sandbox under the id of its T3 server. A sandbox already paired with its published port has that id too, so remove its environment in T3 Code first, then use **Open in T3 Code** again.
 
 ## cmux (macOS)

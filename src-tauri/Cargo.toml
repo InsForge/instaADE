@@ -42,6 +42,8 @@ axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 bytes = "1"
+# DPoP proofs (base64url JWTs) for the proxy's session upstream.
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"

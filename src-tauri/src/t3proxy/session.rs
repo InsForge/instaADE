@@ -15,6 +15,7 @@
 
 use super::cache::{Shell, refresh_server_time, request_key, sanitize_server_config};
 use super::classify::{self, recorded_stream, recorded_unary};
+use super::dpop::Refused;
 use super::runtime::{Power, Runtime};
 use super::threads::ThreadFlags;
 use super::{assets, upstream};
@@ -454,14 +455,10 @@ impl Session {
     fn connect(&mut self) {
         self.phase = Phase::Connecting;
         self.connect_attempts += 1;
-        let (url, token, query) = (
-            self.m.upstream_url(),
-            self.m.upstream_token(),
-            self.query.clone(),
-        );
+        let (m, query) = (self.m.clone(), self.query.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let up = upstream::connect(&url, &token, &upstream::rpc_target(&query)).await;
+            let up = m.connect_upstream(&upstream::rpc_target(&query)).await;
             let _ = tx.send(Internal::Connected(up.map(Box::new)));
         });
     }
@@ -514,6 +511,17 @@ impl Session {
             }
             Internal::Connected(Err(e)) => {
                 log_warn!("upstream connect for {}: {e:#}", self.m.id());
+                // T3 refused the proxy's session: say so to what waits, and stay asleep. No
+                // retry and no close, so T3 Code does not loop on it.
+                if let Some(refused) = e.downcast_ref::<Refused>() {
+                    let msg = refused.to_string();
+                    for req in std::mem::take(&mut self.held) {
+                        self.send(&exit_die(&req["id"], &msg)).await?;
+                    }
+                    self.connect_attempts = 0;
+                    self.phase = Phase::Asleep;
+                    return Ok(None);
+                }
                 if self.connect_attempts >= MAX_CONNECT_ATTEMPTS {
                     return Ok(Some("sandbox unreachable".into()));
                 }
