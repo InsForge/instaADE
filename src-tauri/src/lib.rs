@@ -15,6 +15,7 @@ pub mod process;
 pub mod sandbox;
 pub mod ssh;
 pub mod ssh_config;
+pub mod t3proxy;
 pub mod tray;
 pub mod updater;
 
@@ -161,6 +162,25 @@ pub fn run() {
                 login::quote_windows_run_entry(&handle.package_info().name);
             }
             core.set_start_at_login(starts_at_login);
+            // Prototype, off unless INSTAADE_T3_PROXY is set: the T3 local proxy.
+            if t3proxy::Gate::from_env().on() {
+                let source: t3proxy::hub::ClientSource = {
+                    let core = Arc::downgrade(&core);
+                    Arc::new(move || core.upgrade().and_then(|c| c.current_client()))
+                };
+                let hub = t3proxy::Hub::new(
+                    handle
+                        .path()
+                        .app_config_dir()
+                        .unwrap_or_default()
+                        .join("t3-proxy"),
+                    Arc::new(t3proxy::hub::Instabox::new(source)),
+                    Arc::new(t3proxy::hub::KeyringTokenStore),
+                    t3proxy::runtime::Tuning::default(),
+                );
+                core.set_t3_proxy(hub.clone());
+                tauri::async_runtime::spawn(async move { hub.start_saved().await });
+            }
             app.manage(core.clone());
             let updates = Arc::new(Updater::new(
                 handle.package_info().version.clone(),

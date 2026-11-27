@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -33,6 +33,7 @@ use crate::sandbox::view::{
 use crate::sandbox::{self, SandboxError, connect, lifecycle};
 use crate::ssh::{self, SshTokenStore};
 use crate::ssh_config;
+use crate::t3proxy;
 use crate::updater::UpdateView;
 
 const DEFAULT_API: &str = "https://api.instabox.sh";
@@ -711,6 +712,8 @@ pub struct Core {
     renewing: std::sync::atomic::AtomicBool,
     /// The sandboxes and ADEs whose probe an Open installs now (`refresh_probe`).
     probing: Mutex<HashSet<(String, Ade)>>,
+    /// The T3 local proxy (prototype). Set at startup only with `INSTAADE_T3_PROXY`.
+    t3_proxy: OnceLock<Arc<t3proxy::Hub>>,
     /// Test only: the probe installs Opens started, so a test can wait for them.
     #[cfg(test)]
     probe_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -852,6 +855,7 @@ impl Core {
             hook: Mutex::new(None),
             renewing: std::sync::atomic::AtomicBool::new(false),
             probing: Mutex::new(HashSet::new()),
+            t3_proxy: OnceLock::new(),
             #[cfg(test)]
             probe_tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -949,6 +953,57 @@ impl Core {
 
     fn client(&self) -> Res<Client> {
         self.signed_in().map(|(c, _)| c)
+    }
+
+    /// The instabox client of the account signed in now, if any (the T3 proxy reads with it).
+    pub fn current_client(&self) -> Option<Client> {
+        self.client().ok()
+    }
+
+    /// Turns the T3 local proxy on (prototype, `INSTAADE_T3_PROXY`): Open in T3 Code and Pair
+    /// again pair T3 Code with it from here on.
+    pub fn set_t3_proxy(&self, hub: Arc<t3proxy::Hub>) {
+        let _ = self.t3_proxy.set(hub);
+    }
+
+    /// The T3 proxy when it pairs `ade` with T3 Code at `desktop`: only T3, only with the flag,
+    /// only for a tested T3 Code version unless the flag is `any`.
+    fn t3_proxy_for(&self, ade: Ade, desktop: Option<&str>) -> Option<Arc<t3proxy::Hub>> {
+        if ade != Ade::T3 {
+            return None;
+        }
+        let hub = self.t3_proxy.get()?;
+        if !t3proxy::Gate::from_env().takes(desktop) {
+            self.log(format!(
+                "t3 proxy: T3 Code {} is not a version the proxy was tried with; pairing directly",
+                desktop.unwrap_or("(unknown)")
+            ));
+            return None;
+        }
+        Some(hub.clone())
+    }
+
+    /// Pairs T3 Code with the proxy of running sandbox `id`.
+    async fn proxy_pair_link(
+        &self,
+        hub: &Arc<t3proxy::Hub>,
+        client: &Client,
+        id: &str,
+        account: u64,
+    ) -> Res<String> {
+        let name = self
+            .read_in(account, |i| {
+                i.state
+                    .sandboxes
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.name.clone())
+            })
+            .flatten()
+            .unwrap_or_else(|| id.to_string());
+        hub.pair_link(client, id, &name)
+            .await
+            .map_err(|e| ErrorView::other(format!("The T3 proxy could not pair: {e:#}")))
     }
 
     fn gate(self: &Arc<Self>, account: u64) -> FlowGate {
@@ -1760,10 +1815,14 @@ impl Core {
                 // would only show "credential invalid".
                 pairing.map_err(ErrorView::from)?;
             }
-            // The port URL stays the same, so the app updates the environment it saved.
-            let link = connect::pair_link(&client, ade, id)
-                .await
-                .map_err(ErrorView::from)?;
+            let link = match self.t3_proxy_for(ade, version.as_deref()) {
+                // Prototype: T3 Code pairs with the sandbox's local proxy.
+                Some(hub) => self.proxy_pair_link(&hub, &client, id, account).await?,
+                // The port URL stays the same, so the app updates the environment it saved.
+                None => connect::pair_link(&client, ade, id)
+                    .await
+                    .map_err(ErrorView::from)?,
+            };
             self.open_for(account, &link).map(|()| None)
         };
         let out = self.act(account, r).await;
@@ -2094,11 +2153,20 @@ impl Core {
             // Like Open: a sandbox whose old setup would refuse this pairing is synced first,
             // and gets no link when that could not bring its setup up to date.
             let desktop = self.read_in(account, |i| i.sync_version(ade)).flatten();
-            let link = connect::pair_again(&client, ade, id, desktop.as_deref(), |v, out| {
-                self.record_sync(id, v, out, account)
-            })
-            .await
-            .map_err(ErrorView::from)?;
+            let link = if let Some(hub) = self.t3_proxy_for(ade, desktop.as_deref()) {
+                // Prototype: T3 Code pairs with the sandbox's local proxy, which talks to T3 with
+                // a bearer session: no sync is needed for the pairing.
+                sandbox::ensure_running(&client, id)
+                    .await
+                    .map_err(ErrorView::from)?;
+                self.proxy_pair_link(&hub, &client, id, account).await?
+            } else {
+                connect::pair_again(&client, ade, id, desktop.as_deref(), |v, out| {
+                    self.record_sync(id, v, out, account)
+                })
+                .await
+                .map_err(ErrorView::from)?
+            };
             linked.store(true, std::sync::atomic::Ordering::SeqCst);
             self.open_for(account, &link)
         };
@@ -2250,7 +2318,17 @@ impl Core {
                     _ if matches!(ade.open(), Open::Terminal(_)) => {
                         self.open_terminal(ade, &c.machine_id, account).await
                     }
-                    Some(link) => self.open_for(account, link).map(|()| None),
+                    Some(link) => match self.t3_proxy_for(ade, Some(version)) {
+                        // Prototype: T3 Code pairs with the sandbox's local proxy instead.
+                        Some(hub) => match self.current_client() {
+                            Some(client) => self
+                                .proxy_pair_link(&hub, &client, &c.machine_id, account)
+                                .await
+                                .and_then(|l| self.open_for(account, &l).map(|()| None)),
+                            None => Err(not_signed_in()),
+                        },
+                        None => self.open_for(account, link).map(|()| None),
+                    },
                     None => self.open_link(ade, &c.machine_id, account).await,
                 };
                 let out = self.settle_in(account, opened);
@@ -2574,12 +2652,14 @@ mod tests {
             id: id.into(),
             name: format!("name-{id}"),
             state: state.into(),
+            revision: None,
             template: TemplateRef { id: tpl.into() },
             spec: spec(4, 8192),
             auto_suspend_after_seconds: Some(900),
             max_run_minutes: -1,
             run_started_at: None,
             cooldown_until: None,
+            auto_suspended_at: None,
             metadata,
             org_id: org.into(),
             free: false,

@@ -23,6 +23,16 @@ The setup writes `~/.local/share/t3-instabox/setup` with the id of the setup the
 
 An older setup refuses a DPoP pairing. T3 Code pairs with DPoP only when both the desktop app and the T3 on the sandbox are 0.1.11-nightly.20261118.4903 or later. Only then does a pairing wait for the setup. When the setup is older, **Open**, **Pair again** and **Install** first bring it up to date. When T3 is busy or that fails, they do not pair, and show "T3 is busy on this sandbox. Try again when the agent is idle." or the error. When either side is older, the pairing uses a bearer token, which the older setup takes, and they pair as they always did. **Open** still syncs first, but a busy or failed refresh does not stop its pairing. **Pair again**, and **Install** on a sandbox with a newer T3, run no refresh. **Install** on a sandbox whose T3 is not newer runs the whole setup as always, and stops when it fails.
 
+### Local proxy (prototype, off by default)
+
+T3 Code keeps a WebSocket open to the sandbox's published port, and instabox counts an open connection to a published port as use, so a sandbox with T3 Code open never sleeps. The local proxy is a prototype that fixes this. It runs only when InstaADE starts with `INSTAADE_T3_PROXY=1` in its environment. Without the variable nothing changes.
+
+- **Install**, **Open in T3 Code** and **Pair again** pair T3 Code with a proxy on this computer, `http://localhost:<port>`, instead of the published port. Each sandbox keeps its own port, from 37800 up. The proxy is used only with the T3 Code versions it was tried with (0.1.10). With `INSTAADE_T3_PROXY=any` it is used with every version.
+- The proxy holds the connection to the sandbox while you use T3 Code. After 90 seconds with no action from you and no agent working, it closes the connection. The sandbox then pauses after its own auto sleep time.
+- While the sandbox sleeps, the proxy answers T3 Code from what it recorded: the chat list, the chats it stored, settings and the like. Your next action, such as a message, wakes the sandbox, and T3 Code reconnects. A sandbox you paused yourself wakes only for your action, never for what T3 Code asks on its own.
+- The proxy talks to T3 on the sandbox with a T3 session of its own, made with `t3 auth session issue` and kept in the keychain.
+- T3 Code saves a sandbox under the id of its T3 server. A sandbox already paired with its published port has that id too, so remove its environment in T3 Code first, then use **Open in T3 Code** again.
+
 ## cmux (macOS)
 
 cmux connects over SSH by itself and uploads its own remote part, at the version of the cmux app, so InstaADE installs nothing and no versions must match. On the sandbox it runs one command, `mkdir -p ~/.local/state && chmod go-w ~/.local ~/.local/state`, because cmux refuses a group-writable state directory. **Open in cmux** wakes the sandbox first, since the SSH gateway refuses a paused one and the link does not wake it. Then it opens a `cmux://ssh` link with an SSH token of the sandbox. When the sandbox does not wake, InstaADE shows the error and opens nothing.

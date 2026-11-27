@@ -24,6 +24,9 @@ pub struct Machine {
     pub id: String,
     pub name: String,
     pub state: String,
+    /// Moves on with every lifecycle change (a pause, a resume).
+    #[serde(default)]
+    pub revision: Option<i64>,
     pub template: TemplateRef,
     pub spec: MachineSpec,
     #[serde(default)]
@@ -34,6 +37,9 @@ pub struct Machine {
     pub run_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub cooldown_until: Option<DateTime<Utc>>,
+    /// When instabox paused the sandbox for idleness; none when its owner paused it.
+    #[serde(default)]
+    pub auto_suspended_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
