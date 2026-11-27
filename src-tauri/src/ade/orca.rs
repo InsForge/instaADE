@@ -1000,6 +1000,146 @@ mod tests {
         assert!(!p.ok && p.stdout.is_empty());
     }
 
+    /// Processes the test started, killed when it ends.
+    #[cfg(unix)]
+    struct Running(Vec<std::process::Child>);
+
+    #[cfg(unix)]
+    impl Drop for Running {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// A process whose command line is the relay's, `node relay.js <args>` with the socket
+    /// `sock` in the relay directory of `home` (as Orca 1.4.217 starts it there), so the
+    /// process list shows it. It is a shell waiting on its input, with no child of its own.
+    #[cfg(unix)]
+    fn relay_process(home: &Path, sock: &str, args: &[&str]) -> std::process::Child {
+        let dir = home.join(".orca-remote").join("relay-0.1.0+2f74d1118794");
+        let sock = dir.join(sock).display().to_string();
+        let credential = format!("{sock}.credential");
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "read x", "/usr/local/bin/node", "relay.js"])
+            .args(args)
+            .args(["--sock-path", &sock, "--credential-file", &credential])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Waits until this user's process list shows a command line with `needle`.
+    #[cfg(unix)]
+    fn wait_listed(needle: &str) {
+        for _ in 0..40 {
+            let out = std::process::Command::new("ps")
+                .args(["-A", "-ww", "-o", "args="])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&out.stdout).contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{needle} is not in the process list");
+    }
+
+    /// The probe's answer once the process list shows the relay processes (`ps` reads
+    /// them from the system, which a fresh process may not be in yet).
+    #[cfg(unix)]
+    fn answer_with_relay(home: &Path, want: &str) -> Option<serde_json::Value> {
+        let mut last = None;
+        for _ in 0..20 {
+            let answer = run_probe(home)?.answer();
+            if answer["reason"].as_str().is_some_and(|r| r.contains(want)) {
+                return Some(answer);
+            }
+            last = Some(answer);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_names_the_relay_of_an_older_orca_instead_of_no_server() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        if which::which("ps").is_err() {
+            eprintln!("ps not found: skipped");
+            return;
+        }
+        if run_probe(home.path()).is_none() {
+            return;
+        }
+        let sock = "relay-205b5dfead917383.sock";
+        let connected = "orca relay, no orcad (Orca 1.4.224 or older, app connected): its agents \
+                         run in terminals, which the tty signal counts";
+        let alone = connected.replace("app connected", "app not connected");
+        let mut running = Running(Vec::new());
+        // Another home's relay, and a command through the relay's CLI bridge (its shape in
+        // `~/.orca-relay/bin/orca`), are not this home's relay.
+        running
+            .0
+            .push(relay_process(other.path(), sock, &["--detached"]));
+        running
+            .0
+            .push(relay_process(home.path(), sock, &["--orca-cli", "status"]));
+        wait_listed(&other.path().display().to_string());
+        wait_listed("--orca-cli status");
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer(),
+            serde_json::json!({"busy": false, "reason": "no orca server"})
+        );
+        // The relay Orca leaves running: its terminals outlive the app.
+        running.0.push(relay_process(
+            home.path(),
+            sock,
+            &["--detached", "--grace-time", "0", "--log-file", "relay.log"],
+        ));
+        assert_eq!(
+            answer_with_relay(home.path(), "app not connected").unwrap(),
+            serde_json::json!({"busy": false, "reason": alone})
+        );
+        // A client of another relay's socket, one that no longer runs, is not this app, nor
+        // is a command through the CLI bridge on the relay's own socket.
+        running.0.push(relay_process(
+            home.path(),
+            "relay-0000000000000000.sock",
+            &["--connect"],
+        ));
+        running.0.push(relay_process(
+            home.path(),
+            sock,
+            &["--connect", "--orca-cli", "worktree", "ps"],
+        ));
+        wait_listed("relay-0000000000000000.sock");
+        wait_listed("--orca-cli worktree ps");
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer()["reason"],
+            alone.as_str()
+        );
+        // While the app is connected, its SSH session runs a client on the relay's socket.
+        running
+            .0
+            .push(relay_process(home.path(), sock, &["--connect"]));
+        assert_eq!(
+            answer_with_relay(home.path(), "app connected").unwrap(),
+            serde_json::json!({"busy": false, "reason": connected})
+        );
+        assert_eq!(cli_calls(home.path()), 0, "nothing asks the relay");
+        // An orcad beside it (a newer Orca took the host over) answers for its agents.
+        let working = lists(serde_json::json!([agent("working", 4)]), false);
+        orcad(home.path(), ".orca", std::process::id(), &working);
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer(),
+            serde_json::json!({"busy": true, "reason": "1 agents active (working)", "seq": 4})
+        );
+    }
+
     #[test]
     fn locate_and_the_signature_check_need_macos_or_windows() {
         if !cfg!(target_os = "macos") {

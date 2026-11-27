@@ -58,6 +58,8 @@ Host instabox-dev-1
 
 **Install Orca** and **Reconnect** add an activity probe in `/usr/local/lib/instabox/activity.d/orca`, so the sandbox does not sleep while an Orca agent works. Orca's server on the sandbox keeps running its agents after you quit Orca. An agent in a chat runs with no terminal, so without the probe the sandbox could pause under it. The probe asks Orca's server with Orca's own command, `orca agent list --json`, which the server puts in `~/.orca/cli/bin`. The answer takes about 0.2 seconds.
 
+That server, `orcad`, is what Orca 1.4.225 and later run on an SSH host. Orca 1.4.224 and older run a relay there instead, `~/.orca-remote/relay-<version>/relay.js`, which keeps its terminals after you quit Orca. The relay has no agent list on the sandbox: its own command asks the Orca app on your computer. So with a relay and no `orcad`, the probe says idle and names the relay, and whether the app is connected. The agents of such an Orca run in the relay's terminals, which the sandbox's terminal check counts.
+
 - An agent that is `working`, or in a state the probe does not know, keeps the sandbox awake.
 - Agents that are `waiting` or `blocked` on you, or `done`, let it sleep. So does a sandbox where Orca's server does not run. Then the probe does not call the server.
 - When the server does not answer within 4 seconds, or is too old for `agent list`, the sandbox sleeps by its terminals and CPU, as without the probe.
