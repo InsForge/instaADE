@@ -61,7 +61,7 @@ Host instabox-dev-1
 - When the server does not answer within 4 seconds, or is too old for `agent list`, the sandbox sleeps by its terminals and CPU, as without the probe.
 - Each call counts as use of Orca's server. So while the sandbox runs, the server does not stop after its 15 idle minutes. It uses no CPU while idle, and it sleeps with the sandbox.
 - When the probe cannot be written, such as on a sandbox without `sudo`, Orca still installs, without the probe.
-- **Open in Orca** runs nothing on the sandbox. On a sandbox that got Orca from an older InstaADE, click **Reconnect** once to add the probe.
+- **Open in Orca** on a sandbox without Orca sets it up as **Install Orca** does, probe included. On a sandbox that already has Orca, it runs nothing there. So on a sandbox that got Orca from an older InstaADE, click **Reconnect** once to add the probe.
 
 ## Paradev (macOS)
 

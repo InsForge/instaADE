@@ -55,17 +55,17 @@ pub const PROBE: Probe = Probe {
 
 const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
 
-/// Stages the probe and writes it only when it differs from the one in place. Orca works
-/// without the probe, so a sandbox where it cannot be written (no sudo) still gets Orca: the
-/// script says so on stderr and exits 0, and the sandbox sleeps by its terminals and CPU, as
-/// before.
+/// Stages the probe and writes it only when it differs from the one in place, or that one is
+/// not executable (the guest agent runs only executable files). Orca works without the probe,
+/// so a sandbox where it cannot be written (no sudo) still gets Orca: the script says so on
+/// stderr and exits 0, and the sandbox sleeps by its terminals and CPU, as before.
 const SETUP_TEMPLATE: &str = r##"probe=__PROBE_PATH__
 new=$(mktemp)
 trap 'rm -f "$new"' EXIT
 cat > "$new" <<'__PROBE_EOF__'
 __PROBE__
 __PROBE_EOF__
-if ! cmp -s "$new" "$probe"; then
+if ! cmp -s "$new" "$probe" || [ ! -x "$probe" ]; then
   { sudo install -d -m 0755 __ACTIVITY_DIR__ && sudo install -m 0755 "$new" "$probe"; } ||
     echo "The Orca activity probe was not installed" >&2
 fi
@@ -677,6 +677,12 @@ mod tests {
         assert!(run_setup(root.path(), &sudo).0);
         assert_eq!(std::fs::read_to_string(&probe).unwrap(), PROBE.script);
         assert_eq!(calls(), 4);
+        // The same probe, but not executable, so the guest agent skips it: written again.
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(run_setup(root.path(), &sudo).0);
+        let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(calls(), 6);
         // Without a sudo that works, Orca still installs: the setup exits 0 and says why.
         std::fs::remove_file(&probe).unwrap();
         let (ok, err) = run_setup(root.path(), "exit 1");
