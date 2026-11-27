@@ -16,9 +16,9 @@
 
 <p align="center">
   <img src="docs/images/list.png" alt="Sandbox list in cmux mode" width="200">
-  <img src="docs/images/switcher.png" alt="ADE switcher with T3 Code, cmux, Orca and Paradev" width="200">
+  <img src="docs/images/switcher.png" alt="ADE switcher with T3 Code, cmux, Orca, Paradev, Paseo and Herdr" width="200">
   <img src="docs/images/menu.png" alt="Sandbox actions in Paradev mode" width="200">
-  <img src="docs/images/details.png" alt="Sandbox details with T3 Code and cmux connected, and Orca and Paradev to add" width="200">
+  <img src="docs/images/details.png" alt="Sandbox details with T3 Code and cmux connected, and Orca, Paradev, Paseo and Herdr to add" width="200">
 </p>
 
 ## Getting Started
@@ -34,9 +34,9 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
    - InstaADE was called Instabox before. On macOS, InstaADE asks a running Instabox to quit, or asks you to quit it when it does not, and offers to move it to the Trash. On Windows, the installer removes Instabox first. Your sign-in, your data and Start at login stay.
 3. Click the InstaADE icon in the menu bar (macOS) or the system tray (Windows; at first it may be under the **^** arrow). If you cannot find it, see [Troubleshooting](#troubleshooting).
 4. Sign in with GitHub or Google.
-5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca, Paradev, Paseo or Herdr in the menu at the top (**InstaBox** keeps to sandboxes only). If you used T3 Code with InstaADE before, it starts in T3 Code.
+5. To open sandboxes in an ADE, pick T3 Code, cmux, Orca, Paradev, Paseo or Herdr in the menu at the top (**InstaBox** keeps to sandboxes only). Until you pick one, InstaADE starts in T3 Code when T3 Code is on this computer or one of your sandboxes has T3.
 6. Click **New sandbox**, pick a size, then click **Create sandbox**.
-7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaADE names under **Settings**, **SSH Hosts**, and click **Import** there first if it is not listed. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaADE copied, then click **Install Paradev** again. In Paseo, finish or skip its setup if it shows one, then add the address InstaADE copied once, under **Settings**, **Switch host**, **Add host**, **Remote SSH**. Herdr opens in your terminal with nothing to confirm.
+7. Confirm the new environment in T3 Code, or the workspace in cmux. In Orca, connect the host InstaADE names under **Settings**, **SSH Hosts**, and click **Import** there first if it is not listed. In Paradev, click **Set up a host over SSH**, paste the SSH address InstaADE copied, then click **Install Paradev** again. In Paseo, finish or skip its setup if it shows one, then add the sandbox's address once, under **Settings**, **Switch host**, **Add host**, **Remote SSH**. On macOS, InstaADE copies the address. On Windows, it shows the address in its message. Herdr opens in your terminal with nothing to confirm.
 
 ## Features
 
@@ -49,7 +49,7 @@ You need macOS or Windows (x64) and an [instabox](https://instabox.sh) account. 
 - Copy the SSH command or open it in a terminal
 - Sign in to Claude Code or Codex on the sandbox
 - Starts at login (turn it off in Settings)
-- Updates itself when you click **Update** in Settings. A dot on the Settings button means a new version is out
+- Updates itself when you click **Update** in Settings. A dot on the Settings button means a new version is out. When you are signed out, the sign-in page offers **Update** under the sign-in buttons
 
 ## Supported ADEs
 
@@ -68,7 +68,7 @@ Is your favorite ADE missing? Add it, or ask for it in an issue. See [CONTRIBUTI
 - **cmux**: You need the cmux app in Applications. **Install cmux** and **Open in cmux** open the sandbox in cmux, which connects to it over SSH. InstaADE installs nothing on the sandbox for cmux.
 - **Orca**: You need the Orca app, in Applications on macOS. **Install Orca** and **Open in Orca** wake the sandbox, add it as an SSH host and start Orca. Then, in Orca, open **Settings**, then **SSH Hosts**, connect the host InstaADE names, and open `/data/home`. Orca imports hosts only when it starts, so when it was already running, click **Import** there first.
 - **Paradev**: You need the Paradev app in Applications, not its Canary build. **Install Paradev** wakes the sandbox, puts its SSH address on the clipboard for one minute, and opens Paradev's host settings. In Paradev, click **Set up a host over SSH** and paste the address, then click **Install Paradev** in InstaADE again to open a workspace on the sandbox.
-- **Paseo**: You need the Paseo app, in Applications on macOS. **Install Paseo** installs the Paseo daemon on the sandbox. **Install Paseo** and **Open in Paseo** wake the sandbox, add it as an SSH host, copy its address (`ssh://instabox-<name>`) and start Paseo. Add the address in Paseo once, under **Settings**, **Switch host**, **Add host**, **Remote SSH**. The first time, Paseo shows its setup before its window: finish or skip it.
+- **Paseo**: You need the Paseo app, in Applications on macOS. **Install Paseo** installs the Paseo daemon on the sandbox. **Install Paseo** and **Open in Paseo** wake the sandbox, add it as an SSH host, copy its address (`ssh://instabox-<name>`) and start Paseo. On Windows, InstaADE does not copy the address: it shows it in its message. Add the address in Paseo once, under **Settings**, **Switch host**, **Add host**, **Remote SSH**. The first time, Paseo shows its setup before its window: finish or skip it.
 - **Herdr**: You need no Herdr app, only the OpenSSH client, which macOS has and recent Windows 10 and Windows 11 install by default. **Install Herdr** installs Herdr on the sandbox, then opens your terminal with an SSH session that runs Herdr there. **Open in Herdr** wakes the sandbox and does the same. Closing the terminal leaves Herdr and its agents running on the sandbox, and the next **Open in Herdr** attaches to them again.
 
 **Your SSH config**: InstaADE changes it only for Orca and Paseo. It adds one line at the top of `~/.ssh/config`, `Include ~/.ssh/instabox/config`, and copies the file to `~/.ssh/config.instabox.bak` before its first change. It keeps their hosts in `~/.ssh/instabox/config`. That file holds SSH tokens, and on macOS only you can read it.
