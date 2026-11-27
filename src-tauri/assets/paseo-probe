@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# instabox activity probe for Paseo (the instabox idle-suspend contract). instabox-guest-agent
+# runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
+#   {"busy": bool, "seq": <newest write to Paseo's agent records>, "reason": "..."}
+# It finds the verdict first and reads seq last, with what is left of its time, so a large
+# agent record tree cannot use up the 5 s.
+# A failure or a timeout counts as idle on the server, which then goes by tty and cpu.
+#
+# Paseo's daemon runs agents on pipes, not a pty, so once the desktop app quits the tty signal
+# misses them. This asks the daemon InstaADE runs on 127.0.0.1:6767 (the paseo-instabox
+# service) with the Paseo CLI: `paseo ls` for each agent's status and, only when an agent is
+# active, `paseo permit ls` for the permissions and questions that wait on a person. Each call
+# takes about 0.4 s. The guest's PATH may not reach the CLI (npm's global bin is /opt/npm/bin
+# on the standard sandbox), so the setup links it as ~/.local/share/paseo-instabox/paseo.
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+DAEMON = "127.0.0.1:6767"
+# Paseo's agent statuses are initializing, idle, running, error and closed. An agent that is
+# idle, errored or closed is done. Every other status ("running", "initializing" and any new
+# one) is active, and busy unless the agent waits on a person: a pending permission or question
+# is idle like T3's "waiting", so a forgotten question does not keep the machine up forever.
+IDLE_STATUSES = ("idle", "error", "closed")
+# The probe answers within this long, inside the guest's 5 s.
+BUDGET = 4.0
+
+
+def say(busy, reason, seq):
+    out = {"busy": busy, "reason": reason}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def daemon():
+    return os.environ.get("INSTABOX_PASEO_DAEMON") or DAEMON  # tests only
+
+
+def daemon_answers(deadline):
+    timeout = min(1.0, max(deadline - time.monotonic(), 0.01))
+    try:
+        with urllib.request.urlopen(f"http://{daemon()}/api/health", timeout=timeout) as r:
+            return r.status == 200
+    except OSError:
+        return False
+
+
+def cli():
+    linked = os.path.join(os.environ["HOME"], ".local/share/paseo-instabox/paseo")
+    if os.access(linked, os.X_OK):
+        return linked
+    found = shutil.which("paseo")
+    if not found:
+        raise RuntimeError("no paseo CLI")
+    return found
+
+
+def seq(deadline):
+    # The daemon writes an agent's record (~/.paseo/agents/<project>/<id>.json) at every state
+    # change, so a turn that starts and ends between two readings still moves the newest write.
+    # None when the walk does not finish by the deadline: the verdict goes out without a seq.
+    # A partial newest write would differ from one reading to the next, and each change
+    # restarts the server's idle clock.
+    newest = 0
+    for top, _, files in os.walk(os.path.join(os.environ["HOME"], ".paseo/agents")):
+        for name in files:
+            if time.monotonic() > deadline:
+                return None
+            if name.endswith(".json"):
+                try:
+                    newest = max(newest, os.stat(os.path.join(top, name)).st_mtime_ns)
+                except FileNotFoundError:
+                    pass
+    return newest // 1_000_000
+
+
+def ask(paseo, args, deadline):
+    cmd = [paseo, *args, "--host", daemon(), "--json"]
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = p.communicate(timeout=max(deadline - time.monotonic(), 0.01))
+    except subprocess.TimeoutExpired:
+        # Only the CLI is waited for: a child it left could hold the pipes open.
+        p.kill()
+        p.wait()
+        raise RuntimeError(f"paseo {args[0]} did not answer in time") from None
+    if p.returncode != 0:
+        msg = err.decode(errors="replace").strip()[-200:]
+        raise RuntimeError(f"paseo {args[0]} exited {p.returncode}: {msg}")
+    return json.loads(out)
+
+
+def verdict(deadline):
+    if not daemon_answers(deadline):
+        return False, "no paseo server"
+    paseo = cli()
+    agents = ask(paseo, ["ls", "-g", "--background"], deadline)
+    active = [a for a in agents if a["status"] not in IDLE_STATUSES]
+    if not active:
+        return False, "no agents working"
+    asking = {p["agentId"] for p in ask(paseo, ["permit", "ls"], deadline)}
+    working = [str(a["status"]) for a in active if a["id"] not in asking]
+    if working:
+        return True, f"{plural(len(working), 'agent')} working ({','.join(sorted(set(working)))})"
+    return False, f"{plural(len(active), 'agent')} waiting for the user"
+
+
+def main():
+    deadline = time.monotonic() + BUDGET
+    busy, reason = verdict(deadline)
+    say(busy, reason, seq(deadline))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001: any failure is the probe's failure
+        print(f"paseo probe: {e}", file=sys.stderr)
+        sys.exit(1)

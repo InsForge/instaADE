@@ -4,6 +4,8 @@ The README's [Supported ADEs](../README.md#supported-ades) says what you need an
 
 When an ADE's app is installed more than once, such as in both `/Applications` and `~/Applications`, InstaADE uses the real copy with the newest version. The version it shows is the copy it opens.
 
+Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
+
 ## T3 Code
 
 InstaADE installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
@@ -65,17 +67,29 @@ Host instabox-dev-1
 
 ## Paradev (macOS)
 
-Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaADE installs nothing and hands the setup to Paradev:
+Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaADE hands the setup to Paradev, and adds only an idle probe once the host runs:
 
 1. **Install Paradev** wakes the sandbox, copies its SSH address, `ssh://<SSH token>@<gateway>:<port>`, and opens Paradev's host settings. A minute later InstaADE clears the address from the clipboard, unless you copied something else since. When InstaADE quits before then, it clears the address on the way out by the same rule.
 2. In Paradev, click **Set up a host over SSH** and paste the address.
-3. Click **Install Paradev** again. InstaADE checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get `paradev` in its mark, and a new workspace on it opens in Paradev.
+3. Click **Install Paradev** again. InstaADE checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get the idle probe and `paradev` in its mark, and a new workspace on it opens in Paradev.
 
 **Open in Paradev** wakes the sandbox, since Paradev does not wake a sleeping one, reads its machine id, and opens `superset://new-workspace?host=<host id>`, with the host id Paradev derives from that machine id. **Reconnect** checks the host again.
 
 The address holds an SSH token, so InstaADE copies it, and opens Paradev's links, only for the real Paradev app in `/Applications` or `~/Applications`, named `Paradev.app` or, before the rename, `Superset.app`. Its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaADE checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler. A Mac can have both `Paradev.app` and `Superset.app`, with the same identifier. InstaADE then uses the newest, and opens the links in it by its path, never in the copy macOS would pick.
 
-Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+### The Paradev probe
+
+Paradev's host reaches Paradev through its relay, which the sandbox's idle check does not count, and Paradev's chat agents run without a terminal. So, by its terminals and CPU alone, the sandbox could sleep under a working agent. When `superset-host` is active, the command that checks the host also installs an activity probe in `/usr/local/lib/instabox/activity.d/paradev`, or brings it up to date. **Install Paradev**, **Reconnect** and **Open in Paradev** all run that command, so a sandbox set up before the probe existed gets it at its next **Open in Paradev**. When the probe cannot be installed, the check still answers as before.
+
+The probe reads the host's address and token from `~/.paradev/host/<org>/manifest.json`, which the host writes at every start (`~/.superset` before the rename), and asks the host for its agents. It sends the token only to an address on the sandbox, follows no redirect, and never prints it.
+
+- An agent keeps the sandbox awake while its last event is `Start` (a turn in progress) or `Attached` (an agent that is starting), or an event the probe does not know.
+- An agent that waits for you (`PermissionRequest`), is done (`Stop`) or failed (`Failed`) does not, unless one of its subagents still runs (a subagent can run in the background after its agent's turn ends). Paradev drops a subagent it has not heard from in 10 minutes.
+- A terminal agent counts for at most 30 minutes after its last hook, or the last hook of one of its running subagents. Claude Code fires no hook when you interrupt it, so its last event stays `Start`. A working agent fires a hook after every tool call.
+- A chat agent counts for at most 6 hours after its turn started, since Paradev records a chat agent's state only when it changes.
+- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count. An agent whose event has no time counts only by the hooks of its running subagents.
+- Without a host, or when the host does not run, the probe says idle.
+- When the probe fails, for example when the host turns its token down or answers in a form the probe does not know, it exits with an error. The sandbox server counts that as idle.
 
 ## Paseo
 
@@ -86,7 +100,7 @@ Paseo runs a daemon on every machine it works on, and its desktop app connects t
 3. InstaADE writes the sandbox as a host in `~/.ssh/instabox/config`, the same host as for [Orca](#orca), with the same `Include` line, token renewal and cleanup. Then it copies `ssh://instabox-<name>` and starts Paseo. The address holds no token: ssh reads the login from the host.
 4. In Paseo, open **Settings**, click **Switch host**, then **Add host** and **Remote SSH**. Paste the address as the **SSH host** and click **Connect**. Paseo keeps the host. The first time Paseo starts, it shows its setup (**Welcome to Paseo**) before its window: finish it or click **Skip setup**.
 
-**Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. It runs nothing on the sandbox. **Reconnect** runs the setup again, which starts a stopped daemon.
+**Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. On the sandbox it only brings the probe up to date, in the background. **Reconnect** runs the setup again, which starts a stopped daemon and brings the probe up to date.
 
 InstaADE never updates or restarts a Paseo the sandbox already has: the daemon may be running agents, and Paseo's app and daemon work across versions. To update it, run `npm install -g @getpaseo/cli` on the sandbox, then `sudo systemctl restart paseo-instabox`.
 
@@ -97,7 +111,15 @@ Paseo reads the host, which holds an SSH token, so InstaADE starts only the real
 - On macOS, Paseo in `/Applications` or `~/Applications`. Its bundle identifier must be `sh.paseo.desktop`, and `codesign` must find it signed with Paseo's Developer ID (team `99ZMJMKU9Y`). InstaADE checks this when it looks for Paseo, again before it wakes, creates or marks a sandbox for Paseo, and again after the wake, right before it makes or loads the token.
 - On Windows, `Paseo.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Paseo` or `%ProgramFiles%\Paseo`). InstaADE starts it only when the file's version resource names the product Paseo and holds a version, read from the file each time. Paseo's Windows app is not signed, so there is no signature to check.
 
-Paseo has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+### The Paseo probe
+
+Paseo's daemon runs its agents without a terminal. Once you quit Paseo, the sandbox's terminals and CPU can look idle under a working agent, so the sandbox could sleep under it. The setup, which **Install Paseo** and **Reconnect** run, also installs an activity probe in `/usr/local/lib/instabox/activity.d/paseo`, or brings it up to date. **Open in Paseo** installs or updates the probe and the CLI link (below) in the background, so a sandbox set up before the probe existed gets it at its next Open.
+
+The probe asks the daemon on `127.0.0.1:6767` with the Paseo CLI: `paseo ls` for the agents, and `paseo permit ls` for the permissions and questions that wait for you. It runs with a short PATH, so the setup links the CLI as `~/.local/share/paseo-instabox/paseo`.
+
+- An agent keeps the sandbox awake while it runs or starts, or has a status the probe does not know.
+- An agent that waits for your permission or answer does not, so a question you forgot does not keep the sandbox awake.
+- Without a daemon, or with no agent at work, the probe says idle.
 
 ## Herdr
 

@@ -173,6 +173,55 @@ impl Probe {
     }
 }
 
+/// A probe that Open installs or updates on the sandbox in the background, for an ADE whose
+/// Open runs nothing there (`Ade::probe_on_open`). The setup installs it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenProbe {
+    pub probe: Probe,
+    /// Shell that runs first, as the user (Paseo links its CLI for the probe). Empty: none.
+    pub prep: &'static str,
+}
+
+const OPEN_PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
+
+impl OpenProbe {
+    /// Runs `prep`, then writes the probe to a staged file and installs it with mode 0755,
+    /// unless the one in place has the same content and mode.
+    pub fn script(&self) -> String {
+        assert!(
+            !self.probe.script.contains(OPEN_PROBE_EOF),
+            "{OPEN_PROBE_EOF} is in the probe"
+        );
+        let probe = self
+            .probe
+            .script
+            .strip_suffix('\n')
+            .unwrap_or(self.probe.script);
+        let prep = match self.prep.strip_suffix('\n').unwrap_or(self.prep) {
+            "" => String::new(),
+            p => format!("{p}\n"),
+        };
+        format!(
+            "set -eu\n{prep}probe={path}\nnew=$(mktemp)\ntrap 'rm -f \"$new\"' EXIT\n\
+             cat > \"$new\" <<'{OPEN_PROBE_EOF}'\n{probe}\n{OPEN_PROBE_EOF}\n\
+             if cmp -s \"$new\" \"$probe\" && [ -n \"$(find \"$probe\" -perm 755)\" ]; then exit 0; fi\n\
+             sudo -n install -d -m 0755 {ACTIVITY_DIR}\n\
+             sudo -n install -m 0755 \"$new\" \"$probe\"\n",
+            path = self.probe.path(),
+        )
+    }
+
+    /// Names `script`: the first 16 hex digits of its SHA-256. A new probe or prep gives a
+    /// new hash, which Open installs again.
+    pub fn hash(&self) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, self.script().as_bytes());
+        digest.as_ref()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 impl Ade {
     /// The ADE with this id, if the app knows it.
     pub fn from_id(id: &str) -> Option<Ade> {
@@ -364,8 +413,8 @@ impl Ade {
     /// exits `SETUP_EXIT_BUSY` when the ADE is busy and the update waits. cmux runs its prep
     /// command, and `version` does not apply. Paradev's app sets its host up itself: this only
     /// reads whether the host runs. Paseo installs its CLI at `version` when the sandbox has
-    /// none, and runs its daemon as a service (`SshHost::setup`). Herdr is installed when the
-    /// sandbox lacks it, at Herdr's latest release, and its version printed.
+    /// none, runs its daemon as a service and installs its probe (`SshHost::setup`). Herdr is
+    /// installed when the sandbox lacks it, at Herdr's latest release, and its version printed.
     pub fn setup_script(self, version: &str) -> String {
         match self {
             Ade::T3 => t3::setup_script(version),
@@ -438,7 +487,21 @@ impl Ade {
             Ade::Cmux => None,
             Ade::Orca => Some(orca::PROBE),
             Ade::Paradev => None,
-            Ade::Paseo => None,
+            Ade::Paseo => Some(paseo::PROBE),
+            Ade::Herdr => None,
+        }
+    }
+
+    /// The probe Open installs or updates in the background, for an ADE that has a probe and
+    /// whose Open runs nothing on the sandbox. None: Open leaves the probe to the setup (T3's
+    /// Open syncs its setup, probe included) or the ADE has none.
+    pub fn probe_on_open(self) -> Option<OpenProbe> {
+        match self {
+            Ade::T3 => None,
+            Ade::Cmux => None,
+            Ade::Orca => None,
+            Ade::Paradev => None,
+            Ade::Paseo => Some(paseo::OPEN_PROBE),
             Ade::Herdr => None,
         }
     }
@@ -706,7 +769,8 @@ mod tests {
             "https://github.com/paradevai/paradev/releases/latest"
         );
         assert_eq!(p.url_scheme(), "superset");
-        // InstaADE installs, keeps in step and probes nothing: Paradev's app sets its host up.
+        // Paradev's app sets its host up, so InstaADE keeps nothing in step and reinstalls
+        // nothing. Its host check installs only the idle probe (`paradev::HOST_SCRIPT`).
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(p.port(), None);
@@ -739,7 +803,8 @@ mod tests {
             "https://github.com/getpaseo/paseo/releases/latest"
         );
         assert_eq!(p.url_scheme(), "", "Paseo's links open agents, not hosts");
-        // InstaADE installs Paseo's daemon, but keeps no version in step and has no probe yet.
+        // InstaADE installs Paseo's daemon and its probe, but keeps no version in step, so
+        // there is nothing to reinstall.
         assert!(!p.pins_local_version());
         assert!(!p.reinstalls());
         assert_eq!(
@@ -749,7 +814,11 @@ mod tests {
         );
         assert_eq!(p.version_script(), None);
         assert_eq!(p.stop_script(), None);
-        assert_eq!(p.probe(), None);
+        assert_eq!(p.probe(), Some(paseo::PROBE));
+        assert_eq!(
+            p.probe().map(|p| p.path()).as_deref(),
+            Some("/usr/local/lib/instabox/activity.d/paseo")
+        );
         assert_eq!(p.parse_version("0.17.4"), None);
         assert_eq!(p.refresh_script(), None);
         assert!(p.setup_current(""));
@@ -970,5 +1039,130 @@ mod tests {
         assert!(parse_probe(r#"{"busy":true,"reason":"x"}"#).busy);
         assert!(parse_probe("").busy);
         assert!(parse_probe(r#"{"reason":"x"}"#).busy);
+    }
+
+    #[test]
+    fn only_paseo_installs_its_probe_on_open_for_now() {
+        let on_open: Vec<Ade> = ALL
+            .iter()
+            .copied()
+            .filter(|a| a.probe_on_open().is_some())
+            .collect();
+        assert_eq!(on_open, [Ade::Paseo]);
+        for a in on_open {
+            // The probe its setup installs, for an ADE whose Open runs nothing on the sandbox.
+            assert_eq!(a.probe_on_open().map(|o| o.probe), a.probe());
+            assert!(matches!(a.open(), Open::SshHost(_) | Open::Host(_)));
+        }
+    }
+
+    const DEMO: OpenProbe = OpenProbe {
+        probe: Probe {
+            name: "demo",
+            script: "#!/bin/sh\necho '{\"busy\": false}'\n",
+        },
+        prep: "",
+    };
+
+    #[test]
+    fn the_open_probe_script_stages_the_probe_and_installs_it_only_when_it_differs() {
+        let s = DEMO.script();
+        assert!(s.starts_with("set -eu\nprobe=/usr/local/lib/instabox/activity.d/demo\n"));
+        assert!(s.contains(&format!(
+            "cat > \"$new\" <<'{OPEN_PROBE_EOF}'\n#!/bin/sh\necho '{{\"busy\": false}}'\n{OPEN_PROBE_EOF}\n"
+        )));
+        assert!(s.contains(
+            "if cmp -s \"$new\" \"$probe\" && [ -n \"$(find \"$probe\" -perm 755)\" ]; then exit 0; fi\n"
+        ));
+        assert!(s.ends_with(
+            "sudo -n install -d -m 0755 /usr/local/lib/instabox/activity.d\n\
+             sudo -n install -m 0755 \"$new\" \"$probe\"\n"
+        ));
+        // A prep goes first, and changes the hash, as a new probe does.
+        let prep = OpenProbe {
+            prep: "echo prep",
+            ..DEMO
+        };
+        assert!(prep.script().starts_with("set -eu\necho prep\nprobe="));
+        let other = OpenProbe {
+            probe: Probe {
+                name: "demo",
+                script: "#!/bin/sh\necho '{\"busy\": true}'\n",
+            },
+            ..DEMO
+        };
+        assert_eq!(DEMO.hash(), DEMO.hash());
+        assert_eq!(DEMO.hash().len(), 16);
+        assert_ne!(DEMO.hash(), prep.hash());
+        assert_ne!(DEMO.hash(), other.hash());
+    }
+
+    /// Runs `DEMO`'s script with `sh`, with its activity directory in `dir` and a stand-in
+    /// `sudo` that logs each call and runs it, or fails when `sudo_fails`. Returns the exit
+    /// code and the sudo calls.
+    #[cfg(unix)]
+    fn run_open_probe(dir: &Path, sudo_fails: bool) -> (i32, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let log = dir.join("sudo.log");
+        let _ = std::fs::remove_file(&log);
+        let sudo = bin.path().join("sudo");
+        let run = if sudo_fails {
+            "exit 1"
+        } else {
+            "[ \"$1\" = -n ] && shift\nexec \"$@\""
+        };
+        std::fs::write(
+            &sudo,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{run}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let activity = dir.join("activity.d").display().to_string();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(DEMO.script().replace(ACTIVITY_DIR, &activity))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+            .output()
+            .unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        (
+            out.status.code().unwrap_or(-1),
+            calls.lines().map(str::to_string).collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_probe_script_skips_a_probe_with_the_same_content_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("activity.d/demo");
+        let mode = || std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777;
+        // None yet: installed.
+        let (code, calls) = run_open_probe(dir.path(), false);
+        assert_eq!(code, 0);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].starts_with("-n install -m 0755 "), "{calls:?}");
+        assert_eq!(
+            std::fs::read_to_string(&installed).unwrap(),
+            DEMO.probe.script
+        );
+        assert_eq!(mode(), 0o755);
+        // The same content and mode: no sudo at all.
+        assert_eq!(run_open_probe(dir.path(), false), (0, vec![]));
+        // Another mode, or other content: installed again.
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(run_open_probe(dir.path(), false).1.len(), 2);
+        assert_eq!(mode(), 0o755);
+        std::fs::write(&installed, "old probe\n").unwrap();
+        assert_eq!(run_open_probe(dir.path(), false).1.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&installed).unwrap(),
+            DEMO.probe.script
+        );
+        // A failing install fails the script, so Open records nothing.
+        std::fs::write(&installed, "old probe\n").unwrap();
+        assert_ne!(run_open_probe(dir.path(), true).0, 0);
     }
 }

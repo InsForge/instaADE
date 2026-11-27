@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# instabox activity probe for Paradev (the instabox idle-suspend contract). instabox-guest-agent
+# runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
+#   {"busy": bool, "seq": <newest agent event, ms>, "reason": "..."}
+# A failure, a timeout or anything else on stdout counts as idle on the server.
+#
+# Paradev's host service (`superset-host`) talks to Paradev through an outbound relay, which
+# the idle loop does not count, and its chat agents run on pipes, not a pty. So the probe asks
+# the host service. Each org's host writes its loopback endpoint and its token to
+# ~/.paradev/host/<org>/manifest.json at every start, and `terminalAgents.list` answers with
+# the live agents of its terminals and chats, each with its last lifecycle event. The token
+# goes only into the request's Authorization header: the probe never prints it.
+import glob
+import json
+import os
+import signal
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+START = time.monotonic()
+
+# Paradev's lifecycle events (host-service events/map-event-type.ts). These wait on a person
+# or end a turn, so they are idle. Every other event is busy: "Start" (a turn in progress),
+# "Attached" (an agent that is starting) and any event this probe does not know.
+IDLE_EVENTS = {"PermissionRequest": "waiting", "Stop": "done", "Failed": "failed"}
+BUSY_LABELS = {"Start": "working", "Attached": "starting"}
+
+# A busy event counts only while it is this recent (ms). After that the agent is "stale",
+# which is idle, and so is an agent whose event has no time.
+# - "Attached" is an agent's launch. One launched with a prompt starts its turn within seconds;
+#   one still at "Attached" after this waits for its first prompt.
+STARTING_MS = 5 * 60_000
+# - A terminal agent reports through hooks, and some ends fire none: Claude Code fires no Stop
+#   hook on an interrupt, so a "Start" can outlive its turn. A working agent fires a hook after
+#   every tool call (Claude Code's longest shell call is 10 minutes by default), and the hooks
+#   of its running subagents count too.
+TERMINAL_MS = 30 * 60_000
+# - A chat agent's state comes from Paradev's chat runtime, interrupts included, but is stamped
+#   only when it changes, so its time is the start of the turn. This only bounds a stuck one.
+CHAT_MS = 6 * 60 * 60_000
+
+APP_DIRS = (".paradev", ".superset")  # .superset: Paradev's folder before the rename
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+TIMEOUT = 2  # seconds for one host at most
+DEADLINE = 4  # seconds for all hosts: the guest agent stops the probe at 5
+MAX_BODY = 8 << 20
+
+secrets = []  # the tokens read, kept out of anything the probe prints
+
+
+def say(busy, reason, seq=None):
+    out = {"busy": busy, "reason": reason[:200]}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
+
+
+def manifests():
+    home = os.environ["HOME"]
+    seen, found = set(), []
+    for d in APP_DIRS:
+        for path in sorted(glob.glob(os.path.join(home, d, "host", "*", "manifest.json"))):
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            try:
+                with open(path) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(m, dict):
+                if isinstance(m.get("authToken"), str):
+                    secrets.append(m["authToken"])
+                found.append(m)
+    return found
+
+
+def alive(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return True  # no pid to check: the request tells
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def too_slow(signum, frame):
+    raise TimeoutError("paradev host answered too slowly")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: urllib would send the token on to the new address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def agents_of(manifest, timeout):
+    """The host's live agents, or None when nothing listens at its endpoint."""
+    endpoint, token = manifest.get("endpoint"), manifest.get("authToken")
+    if not isinstance(endpoint, str) or not isinstance(token, str) or not token:
+        raise ValueError("manifest without endpoint or token")
+    url = urllib.parse.urlsplit(endpoint)
+    if url.scheme != "http" or url.hostname not in LOOPBACK or url.port is None:
+        raise ValueError("manifest endpoint is not on this machine")
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/trpc/terminalAgents.list",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+    )
+    # No proxy and no redirect: the token goes to the loopback endpoint only.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            body = json.loads(r.read(MAX_BODY))
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ConnectionRefusedError):
+            return None
+        raise
+    # A tRPC query's answer. The host serializes with superjson:
+    # {"result": {"data": {"json": [...]}}}
+    data = body["result"]["data"]
+    if isinstance(data, dict) and "json" in data:
+        data = data["json"]
+    if not isinstance(data, list):
+        raise ValueError("unexpected terminalAgents.list answer")
+    return data
+
+
+def stamp(value):
+    """An event time in ms, or None when it is missing or not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def subagent_times(agent):
+    """When each running subagent was last heard from. Paradev drops a subagent it has not
+    heard from in 10 minutes."""
+    subs = agent.get("subagents")
+    if not isinstance(subs, list):
+        return []
+    running = [s for s in subs if isinstance(s, dict) and s.get("endedAt") is None]
+    return [t for t in (stamp(s.get("lastEventAt")) for s in running) if t is not None]
+
+
+def times(agent):
+    """Every event time of the agent: its own and its running subagents'."""
+    own = stamp(agent.get("lastEventAt"))
+    return ([own] if own is not None else []) + subagent_times(agent)
+
+
+def label(agent, now):
+    """What the agent does: a label, and whether that is busy."""
+    event = agent.get("lastEventType")
+    if event in IDLE_EVENTS:
+        # A subagent can run on after its agent's turn ended (one sent to the background).
+        subs = subagent_times(agent)
+        if subs and now - max(subs) < TERMINAL_MS:
+            return "subagent", True
+        return IDLE_EVENTS[event], False
+    heard = times(agent)
+    if not heard:
+        return "stale", False
+    last = max(heard)
+    if event == "Attached":
+        limit = STARTING_MS
+    elif agent.get("chatSessionId"):
+        limit = CHAT_MS
+    else:
+        limit = TERMINAL_MS
+    if now - last >= limit:
+        return "stale", False
+    return BUSY_LABELS.get(event, "other"), True
+
+
+def tally(labels):
+    order = ("working", "starting", "subagent", "other", "waiting", "done", "failed", "stale")
+    return ", ".join(f"{labels.count(k)} {k}" for k in order if k in labels)
+
+
+def main():
+    found = manifests()
+    if not found:
+        say(False, "no paradev host")
+        return
+    agents, errors, answered = [], [], False
+    # The socket timeout bounds each read, not the whole answer: a host that sends it a few
+    # bytes at a time would never time out. The alarm bounds the whole request.
+    signal.signal(signal.SIGALRM, too_slow)
+    for m in found:
+        if not alive(m.get("pid")):
+            continue
+        left = DEADLINE - (time.monotonic() - START)
+        if left < 0.1:
+            errors.append(TimeoutError("no time left to ask another paradev host"))
+            continue
+        budget = min(TIMEOUT, left)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, budget)
+            listed = agents_of(m, budget)
+        except Exception as e:  # noqa: BLE001: one host's failure, raised below if it matters
+            errors.append(e)
+            continue
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        if listed is not None:
+            answered = True
+            agents.extend(a for a in listed if isinstance(a, dict) and a.get("endedAt") is None)
+    now = int(time.time() * 1000)
+    labels = [label(a, now) for a in agents]
+    names = [n for n, _ in labels]
+    # Changes whenever an agent's state does: a turn that starts and ends between two
+    # readings still moves it.
+    seq = max((t for a in agents for t in times(a)), default=0)
+    busy = sum(1 for _, b in labels if b)
+    if busy:
+        say(True, f"{busy} agent{'s' if busy != 1 else ''} busy ({tally(names)})", seq)
+    elif errors:
+        raise errors[0]
+    elif not answered:
+        say(False, "paradev host not running")
+    elif not agents:
+        say(False, "no paradev agents", seq)
+    else:
+        say(False, f"no busy agents ({tally(names)})", seq)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001: any failure is the probe's failure
+        msg = f"{type(e).__name__}: {e}"
+        for s in secrets:
+            if s:
+                msg = msg.replace(s, "***")
+        print(f"paradev probe: {msg}", file=sys.stderr)
+        sys.exit(1)

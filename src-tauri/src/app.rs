@@ -45,6 +45,8 @@ const HIDDEN_REFRESH: Duration = Duration::from_secs(30);
 pub const FULL_REFRESH: Duration = Duration::from_secs(300);
 /// The longest a quit waits to clear a copied secret.
 const QUIT_WAIT: Duration = Duration::from_secs(1);
+/// The longest the probe install an Open starts may run on the sandbox (`Core::refresh_probe`).
+const PROBE_TIMEOUT_SECS: u32 = 60;
 
 /// Called with the whole state after every change.
 pub type Emitter = Arc<dyn Fn(&AppState) + Send + Sync>;
@@ -172,6 +174,9 @@ pub struct Data {
     pub connected: HashSet<String>,
     /// The user `connected` was loaded for. `None` until the account is known.
     pub connected_user: Option<i64>,
+    /// The hash of the probe an Open installed or found on each sandbox, per ADE
+    /// (`Ade::probe_on_open`). Kept while the app runs, for the signed-in account.
+    pub open_probes: HashMap<(String, Ade), String>,
 }
 
 impl Data {
@@ -704,6 +709,11 @@ pub struct Core {
     hook: Mutex<Option<Hook>>,
     /// A pass of `renew_ssh_hosts` is running.
     renewing: std::sync::atomic::AtomicBool,
+    /// The sandboxes and ADEs whose probe an Open installs now (`refresh_probe`).
+    probing: Mutex<HashSet<(String, Ade)>>,
+    /// Test only: the probe installs Opens started, so a test can wait for them.
+    #[cfg(test)]
+    probe_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Test only: every line `log` wrote.
     #[cfg(test)]
     logs: Mutex<Vec<String>>,
@@ -841,6 +851,9 @@ impl Core {
             #[cfg(test)]
             hook: Mutex::new(None),
             renewing: std::sync::atomic::AtomicBool::new(false),
+            probing: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            probe_tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
             logs: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
@@ -1753,7 +1766,100 @@ impl Core {
                 .map_err(ErrorView::from)?;
             self.open_for(account, &link).map(|()| None)
         };
-        self.act(account, r).await
+        let out = self.act(account, r).await;
+        if out.is_ok() {
+            self.refresh_probe(ade, id, account);
+        }
+        out
+    }
+
+    /// After an Open of sandbox `id` in `ade` that ran nothing there, installs or updates the
+    /// ADE's probe in the background (`Ade::probe_on_open`). Once per sandbox and probe hash
+    /// while the app runs: it skips a sandbox whose record (`Data::open_probes`) has this hash,
+    /// one whose setup is in progress (the setup installs the probe), and one it already works
+    /// on. Open never waits for it. A failure is only logged and records nothing, so the next
+    /// Open tries again.
+    fn refresh_probe(self: &Arc<Self>, ade: Ade, id: &str, account: u64) {
+        let Some(probe) = ade.probe_on_open() else {
+            return;
+        };
+        let hash = probe.hash();
+        let key = (id.to_string(), ade);
+        let client = self
+            .read_in(account, |i| {
+                let current = i.data.open_probes.get(&key) == Some(&hash);
+                let setting_up = i
+                    .state
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.machine_id.as_deref() == Some(id) && p.error.is_none());
+                (!current && !setting_up)
+                    .then(|| i.client.clone())
+                    .flatten()
+            })
+            .flatten();
+        let Some(client) = client else {
+            return;
+        };
+        let mut probing = self.probing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !probing.insert(key.clone()) {
+            return;
+        }
+        drop(probing);
+        let core = self.clone();
+        let task = tokio::spawn(async move {
+            let req = crate::api::ExecRequest {
+                cmd: probe.script(),
+                timeout_seconds: Some(PROBE_TIMEOUT_SECS),
+            };
+            let failed = match client.exec(&key.0, &req).await {
+                Ok(r) if r.exit_code == 0 && !r.timed_out => {
+                    core.update_in(account, |i| {
+                        i.data.open_probes.insert(key.clone(), hash);
+                    });
+                    None
+                }
+                Ok(r) if r.timed_out => Some(format!("timed out after {PROBE_TIMEOUT_SECS} s")),
+                Ok(r) => Some(format!(
+                    "exit {}: {}",
+                    r.exit_code,
+                    r.stderr.trim().chars().take(200).collect::<String>()
+                )),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(why) = failed {
+                core.log(format!(
+                    "{}: could not install its idle probe on sandbox {}: {why}",
+                    key.1.name(),
+                    key.0
+                ));
+            }
+            core.probing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        });
+        #[cfg(test)]
+        self.probe_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(task);
+        #[cfg(not(test))]
+        drop(task);
+    }
+
+    /// Test only: waits for every probe install an Open started.
+    #[cfg(test)]
+    async fn probes_settled(&self) {
+        let tasks: Vec<_> = self
+            .probe_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
     }
 
     /// Opens a link ADE's link to sandbox `id`. The link holds an SSH token, so it opens only
@@ -2240,6 +2346,7 @@ impl Core {
                 i.data.ade_versions.remove(id);
                 i.data.update_pending.remove(id);
                 i.data.desktop_behind.remove(id);
+                i.data.open_probes.retain(|(m, _), _| m != id);
                 // A progress of this sandbox can only retry a sandbox that is gone.
                 let of_this = i.state.progress.as_ref().map(|p| p.machine_id.as_deref());
                 if of_this == Some(Some(id)) {
@@ -2513,6 +2620,7 @@ mod tests {
             desktop_behind: HashSet::from(["g".to_string()]),
             connected: HashSet::from(["a".to_string(), "b".to_string(), "e".to_string()]),
             connected_user: Some(7),
+            open_probes: HashMap::new(),
         }
     }
 
@@ -6739,7 +6847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_in_paseo_runs_nothing_on_the_sandbox_and_copies_the_address_again() {
+    async fn open_in_paseo_installs_only_the_probe_and_copies_the_address_again() {
         let (server, base) =
             cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
                 .await;
@@ -6749,10 +6857,9 @@ mod tests {
             let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
             assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
         }
-        assert!(
-            exec_cmds(&server).await.is_empty(),
-            "the daemon runs already"
-        );
+        p.core.probes_settled().await;
+        // The daemon runs already: no setup, only the probe, once.
+        assert_eq!(exec_cmds(&server).await, [ade::paseo::OPEN_PROBE.script()]);
         let r = requests(&server).await;
         assert!(!r.iter().any(|x| x.starts_with("PATCH")), "{r:?}");
         assert_eq!(r.iter().filter(|x| x.ends_with("/ssh-tokens")).count(), 1);
@@ -6762,6 +6869,154 @@ mod tests {
             ["ssh://instabox-dev-1", "ssh://instabox-dev-1"]
         );
         assert_eq!(p.opened.lock().unwrap().len(), 2);
+    }
+
+    /// The probe hash Open recorded for sandbox m1 in Paseo.
+    fn open_probe_of(p: &PaseoCore) -> Option<String> {
+        p.core
+            .lock()
+            .data
+            .open_probes
+            .get(&("m1".to_string(), Ade::Paseo))
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn opening_paseo_installs_its_probe_once_per_sandbox_and_probe_hash() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        p.core.refresh(false).await;
+        let probe = ade::paseo::OPEN_PROBE;
+        // The first Open installs it, and records its hash only once that succeeded.
+        assert_eq!(open_probe_of(&p), None);
+        p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await, [probe.script()]);
+        assert_eq!(open_probe_of(&p), Some(probe.hash()));
+        // The same hash: nothing runs.
+        p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await.len(), 1);
+        // An older probe on record (an earlier build's): this Open installs it again.
+        p.core.update(|i| {
+            i.data
+                .open_probes
+                .insert(("m1".into(), Ade::Paseo), "0000000000000000".into())
+        });
+        p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await, [probe.script(), probe.script()]);
+        assert_eq!(open_probe_of(&p), Some(probe.hash()));
+        // A deleted sandbox loses its record.
+        Mock::given(method("DELETE"))
+            .and(path("/v1/machines/m1"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "id": "op9", "machineId": "m1", "type": "delete", "state": "succeeded",
+                "machine": null
+            })))
+            .mount(&server)
+            .await;
+        p.core.delete("m1").await.unwrap();
+        assert_eq!(open_probe_of(&p), None);
+    }
+
+    #[tokio::test]
+    async fn a_probe_install_that_fails_or_hangs_neither_slows_nor_fails_open_and_records_nothing()
+    {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/exec"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!(
+                        {"stdout": "", "stderr": "sudo: a password is required", "exitCode": 1}
+                    ))
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        p.core.refresh(false).await;
+        let start = Instant::now();
+        let notice = p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2), "Open waited");
+        assert_eq!(notice.as_deref(), Some(PASEO_NOTICE));
+        assert_eq!(*p.opened.lock().unwrap(), [p.app.display().to_string()]);
+        p.core.probes_settled().await;
+        let s = p.core.state();
+        assert_eq!((s.error, s.progress), (None, None), "the user sees nothing");
+        assert_eq!(open_probe_of(&p), None);
+        let logs = p.core.logs.lock().unwrap().clone();
+        assert!(
+            logs.contains(
+                &"Paseo: could not install its idle probe on sandbox m1: exit 1: sudo: a \
+                  password is required"
+                    .to_string()
+            ),
+            "{logs:?}"
+        );
+        // Nothing on record: the next Open tries again.
+        p.core.open_in_ade("m1", Some(Ade::Paseo)).await.unwrap();
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_probe_install_runs_beside_a_setup_of_the_same_sandbox_or_another_install() {
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "paseo", "instabox-ades": "paseo"}))
+                .await;
+        let p = paseo_core(&base, OrcaHere::Real, true);
+        p.core.refresh(false).await;
+        let account = p.core.account();
+        let setup = |id: &str, error: Option<ErrorView>| ProgressView {
+            kind: "connect".into(),
+            step: "installing".into(),
+            machine_id: Some(id.into()),
+            ade: Some(Ade::Paseo),
+            error,
+        };
+        // A setup of this sandbox runs: it installs the probe itself.
+        p.core
+            .update(|i| i.state.progress = Some(setup("m1", None)));
+        p.core.refresh_probe(Ade::Paseo, "m1", account);
+        p.core.probes_settled().await;
+        assert!(exec_cmds(&server).await.is_empty());
+        // A failed setup, or one of another sandbox, runs no longer.
+        for progress in [setup("m1", Some(ErrorView::other("x"))), setup("m2", None)] {
+            p.core.update(|i| {
+                i.state.progress = Some(progress);
+                i.data.open_probes.clear();
+            });
+            p.core.refresh_probe(Ade::Paseo, "m1", account);
+            p.core.probes_settled().await;
+        }
+        assert_eq!(exec_cmds(&server).await.len(), 2);
+        // One install at a time per sandbox and ADE.
+        p.core.update(|i| i.data.open_probes.clear());
+        p.core
+            .probing
+            .lock()
+            .unwrap()
+            .insert(("m1".into(), Ade::Paseo));
+        p.core.refresh_probe(Ade::Paseo, "m1", account);
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await.len(), 2);
+        // An ADE with no probe for Open, or another account's flow, runs nothing.
+        p.core.probing.lock().unwrap().clear();
+        p.core.refresh_probe(Ade::Orca, "m1", account);
+        p.core.refresh_probe(Ade::Paseo, "m1", account + 1);
+        p.core.probes_settled().await;
+        assert_eq!(exec_cmds(&server).await.len(), 2);
     }
 
     #[tokio::test]

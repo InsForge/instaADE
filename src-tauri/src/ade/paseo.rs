@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Platform, SshHost, orca, t3};
+use crate::ade::{OpenProbe, Platform, Probe, SshHost, orca, t3};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "paseo";
@@ -194,12 +194,37 @@ pub fn verify_exe(exe: &Path) -> bool {
 
 // ---- the sandbox ----
 
+/// The activity probe, written to the sandbox by the setup. It asks the daemon with the Paseo
+/// CLI whether an agent works, so the sandbox sleeps only when none does.
+pub const PROBE: Probe = Probe {
+    name: "paseo",
+    script: include_str!("../../assets/paseo-probe"),
+};
+
+const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
+
+/// The probe Open installs or updates in the background (`Ade::probe_on_open`), with the CLI
+/// link the setup makes for it. Without a `paseo`, only the probe goes in. It then says there
+/// is no daemon, or, when one answers, fails for want of the CLI, which counts as idle.
+pub const OPEN_PROBE: OpenProbe = OpenProbe {
+    probe: PROBE,
+    prep: r#"if cli=$(command -v paseo); then
+  dir="$HOME/.local/share/paseo-instabox"
+  (umask 077; mkdir -p "$dir")
+  ln -sfn "$cli" "$dir/paseo"
+fi"#,
+};
+
 /// Installs the Paseo CLI `$v` with npm when the sandbox has no `paseo`, and runs its daemon as
 /// the `paseo-instabox` service, on 127.0.0.1:6767 only. A `paseo` the sandbox already has
 /// stays, whatever its version: Paseo's app and daemon work across versions. The service
 /// starts at boot, runs `paseo daemon run` in a login shell, so the daemon finds the agent CLIs
 /// on the user's PATH, and restarts when it fails. A running daemon is never restarted: it may
 /// be running agents. Then it waits until the daemon answers.
+///
+/// It also installs the activity probe (`PROBE`), and links the CLI as `$dir/paseo` for it:
+/// the probe runs with a PATH that may not reach npm's global bin. Neither touches the daemon,
+/// so the setup never waits for an idle Paseo.
 const SETUP_TEMPLATE: &str = r##"set -eu
 v=__VERSION__
 if ! command -v paseo >/dev/null 2>&1; then
@@ -207,9 +232,14 @@ if ! command -v paseo >/dev/null 2>&1; then
   npm install -g --no-fund --no-audit "@getpaseo/cli@$v"
   command -v paseo >/dev/null 2>&1 || { echo "npm installed Paseo, but paseo is not on the PATH" >&2; exit 1; }
 fi
+cli=$(command -v paseo)
 dir="$HOME/.local/share/paseo-instabox"
+probe=/usr/local/lib/instabox/activity.d/paseo
 new=$(mktemp -d)
 trap 'rm -rf "$new"' EXIT
+cat > "$new/paseo-probe" <<'__PROBE_EOF__'
+__PROBE__
+__PROBE_EOF__
 cat > "$new/paseo-instabox.service" <<U
 [Unit]
 Description=Paseo daemon on Instabox
@@ -235,7 +265,10 @@ cat > "$dir/start.new" <<'S'
 exec paseo daemon run
 S
 chmod 0700 "$dir/start.new"
-mv -f "$dir/start.new" "$dir/start")
+mv -f "$dir/start.new" "$dir/start"
+ln -sfn "$cli" "$dir/paseo")
+sudo install -d -m 0755 /usr/local/lib/instabox/activity.d
+sudo install -m 0755 "$new/paseo-probe" "$probe"
 sudo install -m 0644 "$new/paseo-instabox.service" /etc/systemd/system/paseo-instabox.service
 sudo systemctl daemon-reload
 sudo systemctl enable -q paseo-instabox
@@ -255,9 +288,16 @@ pub fn setup_script(version: &str) -> String {
     if !t3::valid_version(version) {
         return "echo 'invalid Paseo version' >&2; exit 1".to_string();
     }
+    assert!(
+        !PROBE.script.contains(PROBE_EOF),
+        "{PROBE_EOF} is in the probe"
+    );
+    let probe = PROBE.script.strip_suffix('\n').unwrap_or(PROBE.script);
     SETUP_TEMPLATE
         .replace("__VERSION__", version)
         .replace("__PORT__", &DAEMON_PORT.to_string())
+        .replace("__PROBE_EOF__", PROBE_EOF)
+        .replace("__PROBE__", probe)
 }
 
 #[cfg(test)]
@@ -425,8 +465,51 @@ mod tests {
         // Nothing listens anywhere but the loopback, and a running daemon is never restarted.
         assert!(!s.contains("0.0.0.0"));
         assert!(!s.contains("systemctl restart"));
-        assert!(!s.contains("__"), "every placeholder is filled");
+        // The probe is Python and has `__name__`: every placeholder outside it is filled.
+        let probe = PROBE.script.strip_suffix('\n').unwrap();
+        assert!(!s.replace(probe, "").contains("__"));
         assert_eq!(DAEMON_PORT, 6767);
+    }
+
+    #[test]
+    fn the_setup_installs_the_probe_where_it_is_run_and_links_the_cli_for_it() {
+        let s = setup_script("0.17.4");
+        let probe = PROBE.script.strip_suffix('\n').unwrap();
+        assert_eq!(PROBE.path(), "/usr/local/lib/instabox/activity.d/paseo");
+        assert!(s.contains(&format!("\nprobe={}\n", PROBE.path())));
+        assert!(s.contains(&format!(
+            "cat > \"$new/paseo-probe\" <<'{PROBE_EOF}'\n{probe}\n{PROBE_EOF}\n"
+        )));
+        assert!(s.contains(&format!(
+            "\nsudo install -d -m 0755 {}\nsudo install -m 0755 \"$new/paseo-probe\" \"$probe\"\n",
+            crate::ade::ACTIVITY_DIR
+        )));
+        // The CLI the setup found or installed, linked where the probe looks first.
+        let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at("npm install -g") < at("\ncli=$(command -v paseo)\n"));
+        assert!(at("\ncli=$(command -v paseo)\n") < at("ln -sfn \"$cli\" \"$dir/paseo\""));
+        assert!(
+            PROBE
+                .script
+                .contains("\".local/share/paseo-instabox/paseo\"")
+        );
+        // The probe asks the daemon the setup runs.
+        assert!(
+            PROBE
+                .script
+                .contains(&format!("DAEMON = \"127.0.0.1:{DAEMON_PORT}\"\n"))
+        );
+        // Neither touches the daemon, so the setup never waits for an idle Paseo.
+        assert!(!s.contains("exit 3"));
+        assert_eq!(crate::ade::Ade::Paseo.probe(), Some(PROBE));
+    }
+
+    #[test]
+    fn the_probe_is_python_and_ends_no_heredoc_early() {
+        assert!(PROBE.script.starts_with("#!/usr/bin/env python3\n"));
+        assert!(!PROBE.script.contains(PROBE_EOF));
+        // A CRLF checkout (Windows) would break the script on the sandbox.
+        assert!(!PROBE.script.contains('\r'));
     }
 
     #[test]
@@ -451,16 +534,29 @@ mod tests {
         assert!(st.success());
     }
 
+    /// What `run_setup` saw.
+    #[cfg(unix)]
+    struct SetupRun {
+        code: i32,
+        log: String,
+        start: String,
+        /// The file `sudo install -m 0755` was given: the staged probe.
+        probe: String,
+        /// Where `$dir/paseo` links to, and where `paseo` was on the PATH.
+        link: Option<PathBuf>,
+        cli: PathBuf,
+    }
+
     /// Runs the setup with `sh`, on stand-ins for `paseo`, `npm`, `sudo`, `systemctl` and
     /// `curl` that log their arguments. `paseo` is on the PATH when `installed`, `npm` adds it
-    /// otherwise; the daemon runs when `active`. Returns the exit code, the log and the start
-    /// script it wrote.
+    /// otherwise; the daemon runs when `active`.
     #[cfg(unix)]
-    fn run_setup(installed: bool, active: bool) -> (i32, String, String) {
+    fn run_setup(installed: bool, active: bool) -> SetupRun {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let log = home.path().join("log");
+        let staged = home.path().join("staged-probe");
         let tool = |name: &str, body: &str| {
             let p = bin.path().join(name);
             std::fs::write(
@@ -490,7 +586,13 @@ mod tests {
                 dir = bin.path().display()
             ),
         );
-        tool("sudo", "exit 0");
+        tool(
+            "sudo",
+            &format!(
+                "[ \"$1 $2 $3\" = 'install -m 0755' ] && cp \"$4\" '{}'; exit 0",
+                staged.display()
+            ),
+        );
         tool(
             "systemctl",
             if active {
@@ -507,19 +609,23 @@ mod tests {
             .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
             .output()
             .unwrap();
-        let start = home.path().join(".local/share/paseo-instabox/start");
-        (
-            out.status.code().unwrap_or(-1),
-            std::fs::read_to_string(&log).unwrap_or_default(),
-            std::fs::read_to_string(start).unwrap_or_default(),
-        )
+        let dir = home.path().join(".local/share/paseo-instabox");
+        SetupRun {
+            code: out.status.code().unwrap_or(-1),
+            log: std::fs::read_to_string(&log).unwrap_or_default(),
+            start: std::fs::read_to_string(dir.join("start")).unwrap_or_default(),
+            probe: std::fs::read_to_string(&staged).unwrap_or_default(),
+            link: std::fs::read_link(dir.join("paseo")).ok(),
+            cli: bin.path().join("paseo"),
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn the_setup_installs_paseo_only_when_missing_and_starts_only_a_stopped_daemon() {
-        let (code, log, start) = run_setup(false, false);
-        assert_eq!(code, 0, "{log}");
+        let r = run_setup(false, false);
+        let log = &r.log;
+        assert_eq!(r.code, 0, "{log}");
         assert!(
             log.contains("npm install -g --no-fund --no-audit @getpaseo/cli@0.17.4\n"),
             "{log}"
@@ -530,14 +636,434 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("curl -fs -o /dev/null http://127.0.0.1:6767/api/health\n"));
-        assert_eq!(start, "#!/bin/bash -l\nexec paseo daemon run\n");
+        assert_eq!(r.start, "#!/bin/bash -l\nexec paseo daemon run\n");
 
         // A Paseo already there stays, whatever its version, and a running daemon keeps
         // running: it may be running agents.
-        let (code, log, _) = run_setup(true, true);
-        assert_eq!(code, 0, "{log}");
+        let r = run_setup(true, true);
+        let log = &r.log;
+        assert_eq!(r.code, 0, "{log}");
         assert!(!log.contains("npm"), "{log}");
         assert!(!log.contains("systemctl start"), "{log}");
         assert!(log.contains("sudo systemctl daemon-reload\n"));
+    }
+
+    /// Every setup, also on a sandbox whose daemon runs (Reconnect), installs the probe as it is
+    /// in this build and links the CLI it found or installed.
+    #[cfg(unix)]
+    #[test]
+    fn the_setup_installs_the_probe_and_links_the_cli_also_beside_a_running_daemon() {
+        for (installed, active) in [(false, false), (true, true)] {
+            let r = run_setup(installed, active);
+            assert_eq!(r.code, 0, "{}", r.log);
+            assert_eq!(r.probe, PROBE.script, "the probe arrives byte for byte");
+            assert!(
+                r.log
+                    .contains("sudo install -d -m 0755 /usr/local/lib/instabox/activity.d\n"),
+                "{}",
+                r.log
+            );
+            let install = r
+                .log
+                .lines()
+                .find(|l| l.starts_with("sudo install -m 0755 "))
+                .unwrap();
+            assert!(
+                install.ends_with("/paseo-probe /usr/local/lib/instabox/activity.d/paseo"),
+                "{install}"
+            );
+            assert_eq!(r.link.as_deref(), Some(r.cli.as_path()));
+        }
+    }
+
+    /// What Open runs: the probe the setup installs, and the same CLI link, which it makes only
+    /// when the sandbox has a `paseo`. Either way the probe goes in.
+    #[cfg(unix)]
+    #[test]
+    fn open_installs_the_setups_probe_and_links_the_cli_when_there_is_one() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(OPEN_PROBE.probe, PROBE);
+        assert_eq!(crate::ade::Ade::Paseo.probe_on_open(), Some(OPEN_PROBE));
+        for installed in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let log = home.path().join("sudo.log");
+            let sudo = bin.path().join("sudo");
+            std::fs::write(
+                &sudo,
+                format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cli = bin.path().join("paseo");
+            if installed {
+                std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(OPEN_PROBE.script())
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let link = home.path().join(".local/share/paseo-instabox/paseo");
+            assert_eq!(
+                std::fs::read_link(&link).ok(),
+                installed.then(|| cli.clone())
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                calls.ends_with(" /usr/local/lib/instabox/activity.d/paseo\n"),
+                "{calls}"
+            );
+        }
+    }
+
+    // ---- the probe, run with python3 on a stand-in for the Paseo CLI ----
+
+    /// The daemon's health check: a server on 127.0.0.1 that answers every request with 200.
+    /// Returns its address.
+    #[cfg(unix)]
+    fn healthy_daemon() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        addr
+    }
+
+    /// An address where nothing listens: the daemon is down.
+    #[cfg(unix)]
+    fn stopped_daemon() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    /// A home for the probe, with a stand-in `paseo` that logs its arguments and prints
+    /// `ls.json` for `ls` and `permit.json` for `permit ls`.
+    #[cfg(unix)]
+    struct ProbeHome {
+        home: tempfile::TempDir,
+        bin: tempfile::TempDir,
+        daemon: String,
+    }
+
+    #[cfg(unix)]
+    impl ProbeHome {
+        /// The stand-in CLI as the setup links it (`linked`), else on the PATH, with `body`
+        /// run after it logs its arguments.
+        fn new(daemon: String, linked: bool, body: &str) -> ProbeHome {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let h = home.path().display();
+            let cli = if linked {
+                let dir = home.path().join(".local/share/paseo-instabox");
+                std::fs::create_dir_all(&dir).unwrap();
+                dir.join("paseo")
+            } else {
+                bin.path().join("paseo")
+            };
+            std::fs::write(
+                &cli,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{h}/calls'\n{body}\n\
+                     case \"$1\" in ls) cat '{h}/ls.json';; permit) cat '{h}/permit.json';; esac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ProbeHome { home, bin, daemon }
+        }
+
+        fn answers(&self, ls: &str, permit: &str) -> &Self {
+            std::fs::write(self.home.path().join("ls.json"), ls).unwrap();
+            std::fs::write(self.home.path().join("permit.json"), permit).unwrap();
+            self
+        }
+
+        /// Runs the probe as the guest does: an empty environment but HOME, a short PATH and
+        /// the daemon's address (tests only). Returns the exit code, stdout and stderr.
+        fn run(&self, python: &Path) -> (i32, String, String) {
+            self.run_with(python, &[])
+        }
+
+        /// `run`, with `env` added to the environment.
+        fn run_with(&self, python: &Path, env: &[(&str, &Path)]) -> (i32, String, String) {
+            let probe = self.home.path().join("paseo-probe");
+            std::fs::write(&probe, PROBE.script).unwrap();
+            let out = std::process::Command::new(python)
+                .arg(&probe)
+                .env_clear()
+                .envs(env.iter().copied())
+                .env("HOME", self.home.path())
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", self.bin.path().display()),
+                )
+                .env("LANG", "C.UTF-8")
+                .env("INSTABOX_PASEO_DAEMON", &self.daemon)
+                .current_dir(self.home.path())
+                .output()
+                .unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8(out.stdout).unwrap(),
+                String::from_utf8(out.stderr).unwrap(),
+            )
+        }
+
+        /// The probe's answer, which must be one JSON line with `busy`, `seq` and `reason`, as
+        /// the guest-agent reads it.
+        fn answer(&self, python: &Path) -> (bool, i64, String) {
+            let (code, out, err) = self.run(python);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out.lines().count(), 1, "{out}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            let parsed = crate::ade::parse_probe(&out);
+            assert_eq!(v["busy"].as_bool(), Some(parsed.busy));
+            (
+                parsed.busy,
+                v["seq"].as_i64().unwrap(),
+                v["reason"].as_str().unwrap().to_string(),
+            )
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.home.path().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    fn python() -> Option<PathBuf> {
+        let found = which::which("python3").ok();
+        if found.is_none() {
+            eprintln!("python3 not found: skipped");
+        }
+        found
+    }
+
+    #[cfg(unix)]
+    fn agent(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "shortId": &id[..1], "name": "-", "provider": "claude",
+            "status": status, "cwd": "~", "background": false, "labels": {}})
+    }
+
+    #[cfg(unix)]
+    fn permit(agent_id: &str) -> serde_json::Value {
+        serde_json::json!({"id": "req-1", "agentId": agent_id, "agentShortId": &agent_id[..1],
+            "name": "Bash", "description": "-"})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_is_busy_only_while_an_agent_works_and_not_while_it_waits_for_the_user() {
+        let Some(python) = python() else { return };
+        let json = |v: Vec<serde_json::Value>| serde_json::Value::Array(v).to_string();
+        let p = ProbeHome::new(healthy_daemon(), true, "");
+        let ls = format!("--host {} --json", p.daemon);
+        for (agents, permits, want) in [
+            (vec![], vec![], (false, "no agents working")),
+            (
+                vec![
+                    agent("a", "idle"),
+                    agent("b", "error"),
+                    agent("c", "closed"),
+                ],
+                vec![],
+                (false, "no agents working"),
+            ),
+            (
+                vec![agent("a", "running"), agent("b", "idle")],
+                vec![],
+                (true, "1 agent working (running)"),
+            ),
+            // Running with a pending permission or question: it waits for the user.
+            (
+                vec![agent("a", "running")],
+                vec![permit("a")],
+                (false, "1 agent waiting for the user"),
+            ),
+            (
+                vec![agent("a", "running"), agent("b", "running")],
+                vec![permit("a"), permit("b")],
+                (false, "2 agents waiting for the user"),
+            ),
+            (
+                vec![agent("a", "running"), agent("b", "running")],
+                vec![permit("a")],
+                (true, "1 agent working (running)"),
+            ),
+            // Starting, and a status this probe does not know, are busy.
+            (
+                vec![agent("a", "initializing"), agent("b", "thinking")],
+                vec![],
+                (true, "2 agents working (initializing,thinking)"),
+            ),
+        ] {
+            let _ = std::fs::remove_file(p.home.path().join("calls"));
+            p.answers(&json(agents.clone()), &json(permits));
+            let (busy, _, reason) = p.answer(&python);
+            assert_eq!((busy, reason.as_str()), want, "{agents:?}");
+            // The permissions are asked only when an agent is active.
+            let mut calls = vec![format!("ls -g --background {ls}")];
+            if agents
+                .iter()
+                .any(|a| !["idle", "error", "closed"].contains(&a["status"].as_str().unwrap()))
+            {
+                calls.push(format!("permit ls {ls}"));
+            }
+            assert_eq!(p.calls(), calls);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_is_idle_without_a_daemon_and_does_not_run_the_cli() {
+        let Some(python) = python() else { return };
+        let p = ProbeHome::new(stopped_daemon(), true, "");
+        p.answers(
+            &serde_json::json!([agent("a", "running")]).to_string(),
+            "[]",
+        );
+        assert_eq!(p.answer(&python), (false, 0, "no paseo server".into()));
+        assert!(p.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_finds_the_cli_on_the_path_when_it_is_not_linked() {
+        let Some(python) = python() else { return };
+        let p = ProbeHome::new(healthy_daemon(), false, "");
+        p.answers(
+            &serde_json::json!([agent("a", "running")]).to_string(),
+            "[]",
+        );
+        assert!(p.answer(&python).0);
+        assert_eq!(p.calls().len(), 2);
+        // Neither linked nor on the PATH: the probe fails, which the server reads as idle.
+        std::fs::remove_file(p.bin.path().join("paseo")).unwrap();
+        let (code, out, err) = p.run(&python);
+        assert_ne!(code, 0);
+        assert_eq!(out, "");
+        assert!(err.contains("no paseo CLI"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cli_that_fails_prints_junk_or_hangs_fails_the_probe_within_the_guest_timeout() {
+        let Some(python) = python() else { return };
+        for (body, says) in [
+            (
+                "echo 'Cannot connect' >&2; exit 1",
+                "exited 1: Cannot connect",
+            ),
+            ("echo 'not json'; exit 0", "paseo probe:"),
+            ("sleep 10", "did not answer in time"),
+        ] {
+            let p = ProbeHome::new(healthy_daemon(), true, body);
+            p.answers("[]", "[]");
+            let start = std::time::Instant::now();
+            let (code, out, err) = p.run(&python);
+            assert!(start.elapsed() < Duration::from_secs(5), "{body}");
+            assert_ne!(code, 0, "{body}");
+            assert_eq!(out, "", "{body}");
+            assert!(err.contains(says), "{body}: {err}");
+        }
+    }
+
+    /// A record tree that takes longer to read than the probe has: 200 records whose every
+    /// `stat` takes 50 ms, 10 s in all. The probe still answers within the guest's 5 s, with
+    /// its verdict and without a seq.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_tree_too_slow_to_read_leaves_out_the_seq_but_not_the_verdict() {
+        let Some(python) = python() else { return };
+        let p = ProbeHome::new(healthy_daemon(), true, "");
+        p.answers(
+            &serde_json::json!([agent("a", "running")]).to_string(),
+            "[]",
+        );
+        let records = p.home.path().join(".paseo/agents/-data-home-app");
+        std::fs::create_dir_all(&records).unwrap();
+        for i in 0..200 {
+            std::fs::write(records.join(format!("{i}.json")), "{}").unwrap();
+        }
+        // Python loads sitecustomize from PYTHONPATH at startup: it slows the records' stat.
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(
+            site.path().join("sitecustomize.py"),
+            "import os, time\n_stat = os.stat\n\n\ndef stat(path, *a, **k):\n    \
+             if \"/.paseo/agents/\" in os.fspath(path):\n        time.sleep(0.05)\n    \
+             return _stat(path, *a, **k)\n\n\nos.stat = stat\n",
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let (code, out, err) = p.run_with(&python, &[("PYTHONPATH", site.path())]);
+        let took = start.elapsed();
+        assert_eq!(code, 0, "{err}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["busy"], true, "{out}");
+        assert_eq!(v["reason"], "1 agent working (running)");
+        assert!(v.get("seq").is_none(), "{out}");
+        // Without the slow stat, the same tree gives its seq.
+        assert!(p.answer(&python).1 > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_seq_is_the_newest_write_to_the_agent_records() {
+        let Some(python) = python() else { return };
+        let p = ProbeHome::new(healthy_daemon(), true, "");
+        p.answers("[]", "[]");
+        assert_eq!(p.answer(&python).1, 0, "no records yet");
+        let agents = p.home.path().join(".paseo/agents");
+        let at = |rel: &str, ms: u64| {
+            let path = agents.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+            let t = std::time::UNIX_EPOCH + Duration::from_millis(ms);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        at("-data-home-app/a.json", 1_795_755_765_802);
+        at("-data-home-web/b.json", 1_795_755_700_000);
+        at("-data-home-web/notes.txt", 1_895_755_700_000);
+        assert_eq!(p.answer(&python).1, 1_795_755_765_802);
+        // A turn that starts and ends between two readings rewrites its record.
+        at("-data-home-web/b.json", 1_795_755_825_830);
+        let (busy, seq, _) = p.answer(&python);
+        assert_eq!((busy, seq), (false, 1_795_755_825_830));
+        // The seq comes with every answer, also without a daemon.
+        let down = ProbeHome {
+            daemon: stopped_daemon(),
+            ..p
+        };
+        assert_eq!(
+            down.answer(&python),
+            (false, 1_795_755_825_830, "no paseo server".into())
+        );
     }
 }
