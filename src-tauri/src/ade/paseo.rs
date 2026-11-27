@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Platform, Probe, SshHost, orca, t3};
+use crate::ade::{OpenProbe, Platform, Probe, SshHost, orca, t3};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "paseo";
@@ -202,6 +202,18 @@ pub const PROBE: Probe = Probe {
 };
 
 const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
+
+/// The probe Open installs or updates in the background (`Ade::probe_on_open`), with the CLI
+/// link the setup makes for it. Without a `paseo`, only the probe goes in: it then says there
+/// is no daemon.
+pub const OPEN_PROBE: OpenProbe = OpenProbe {
+    probe: PROBE,
+    prep: r#"if cli=$(command -v paseo); then
+  dir="$HOME/.local/share/paseo-instabox"
+  (umask 077; mkdir -p "$dir")
+  ln -sfn "$cli" "$dir/paseo"
+fi"#,
+};
 
 /// Installs the Paseo CLI `$v` with npm when the sandbox has no `paseo`, and runs its daemon as
 /// the `paseo-instabox` service, on 127.0.0.1:6767 only. A `paseo` the sandbox already has
@@ -661,6 +673,51 @@ mod tests {
                 "{install}"
             );
             assert_eq!(r.link.as_deref(), Some(r.cli.as_path()));
+        }
+    }
+
+    /// What Open runs: the probe the setup installs, and the same CLI link, which it makes only
+    /// when the sandbox has a `paseo`. Either way the probe goes in.
+    #[cfg(unix)]
+    #[test]
+    fn open_installs_the_setups_probe_and_links_the_cli_when_there_is_one() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(OPEN_PROBE.probe, PROBE);
+        assert_eq!(crate::ade::Ade::Paseo.probe_on_open(), Some(OPEN_PROBE));
+        for installed in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let log = home.path().join("sudo.log");
+            let sudo = bin.path().join("sudo");
+            std::fs::write(
+                &sudo,
+                format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cli = bin.path().join("paseo");
+            if installed {
+                std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(OPEN_PROBE.script())
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let link = home.path().join(".local/share/paseo-instabox/paseo");
+            assert_eq!(
+                std::fs::read_link(&link).ok(),
+                installed.then(|| cli.clone())
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                calls.ends_with(" /usr/local/lib/instabox/activity.d/paseo\n"),
+                "{calls}"
+            );
         }
     }
 
