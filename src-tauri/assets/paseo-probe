@@ -19,10 +19,10 @@ import time
 import urllib.request
 
 DAEMON = "127.0.0.1:6767"
-# Paseo's agent statuses are initializing, idle, running, error and closed. An agent in one of
-# these is done. Every other status ("running", "initializing" and any new one) is active, and
-# busy unless the agent waits on a person: a pending permission or question is idle like T3's
-# "waiting", so a forgotten question does not keep the machine up forever.
+# Paseo's agent statuses are initializing, idle, running, error and closed. An agent that is
+# idle, errored or closed is done. Every other status ("running", "initializing" and any new
+# one) is active, and busy unless the agent waits on a person: a pending permission or question
+# is idle like T3's "waiting", so a forgotten question does not keep the machine up forever.
 IDLE_STATUSES = ("idle", "error", "closed")
 # The probe answers within this long, inside the guest's 5 s.
 BUDGET = 4.0
