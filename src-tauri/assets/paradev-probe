@@ -13,6 +13,7 @@
 import glob
 import json
 import os
+import signal
 import sys
 import time
 import urllib.error
@@ -88,6 +89,10 @@ def alive(pid):
     except PermissionError:
         pass
     return True
+
+
+def too_slow(signum, frame):
+    raise TimeoutError("paradev host answered too slowly")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -186,6 +191,9 @@ def main():
         say(False, "no paradev host")
         return
     agents, errors, answered = [], [], False
+    # The socket timeout bounds each read, not the whole answer: a host that sends it a few
+    # bytes at a time would never time out. The alarm bounds the whole request.
+    signal.signal(signal.SIGALRM, too_slow)
     for m in found:
         if not alive(m.get("pid")):
             continue
@@ -193,11 +201,15 @@ def main():
         if left < 0.1:
             errors.append(TimeoutError("no time left to ask another paradev host"))
             continue
+        budget = min(TIMEOUT, left)
         try:
-            listed = agents_of(m, min(TIMEOUT, left))
+            signal.setitimer(signal.ITIMER_REAL, budget)
+            listed = agents_of(m, budget)
         except Exception as e:  # noqa: BLE001: one host's failure, raised below if it matters
             errors.append(e)
             continue
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
         if listed is not None:
             answered = True
             agents.extend(a for a in listed if isinstance(a, dict) and a.get("endedAt") is None)

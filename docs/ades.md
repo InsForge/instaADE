@@ -76,7 +76,7 @@ The probe reads the host's address and token from `~/.paradev/host/<org>/manifes
 - An agent that waits for you (`PermissionRequest`), is done (`Stop`) or failed (`Failed`) does not, unless one of its subagents still runs (a subagent can run in the background after its agent's turn ends). Paradev drops a subagent it has not heard from in 10 minutes.
 - A terminal agent counts for at most 30 minutes after its last hook, or the last hook of one of its running subagents. Claude Code fires no hook when you interrupt it, so its last event stays `Start`. A working agent fires a hook after every tool call.
 - A chat agent counts for at most 6 hours after its turn started, since Paradev records a chat agent's state only when it changes.
-- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count. Nor does an agent whose event has no time.
+- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count. An agent whose event has no time counts only by the hooks of its running subagents.
 - Without a host, or when the host does not run, the probe says idle.
 - When the probe fails, for example when the host turns its token down or answers in a form the probe does not know, it exits with an error. The sandbox server counts that as idle.
 

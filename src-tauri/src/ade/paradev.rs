@@ -808,16 +808,18 @@ exec "$@"
 
     /// Runs the probe as instabox-guest-agent does: python3 with a cleared environment, in the
     /// home directory. Returns the exit code, stdout and stderr, and checks that neither stream
-    /// holds a token. None without python3.
+    /// holds a token. A probe still running after 20 s is killed, and its exit code is None.
+    /// None without python3.
     #[cfg(unix)]
     fn run_probe(home: &Path) -> Option<(Option<i32>, String, String)> {
+        use std::io::Read;
         let Ok(python) = which::which("python3") else {
             eprintln!("python3 not found: skipped");
             return None;
         };
         let probe = home.join("probe");
         std::fs::write(&probe, PROBE.script).unwrap();
-        let out = std::process::Command::new(python)
+        let mut child = std::process::Command::new(python)
             .arg(&probe)
             .env_clear()
             .env("HOME", home)
@@ -825,16 +827,39 @@ exec "$@"
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
             .current_dir(home)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
-        let (stdout, stderr) = (
-            String::from_utf8(out.stdout).unwrap(),
-            String::from_utf8(out.stderr).unwrap(),
-        );
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let code = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status.code();
+            }
+            if std::time::Instant::now() > until {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
         for s in [&stdout, &stderr] {
             assert!(!s.contains(TOKEN) && !s.contains("wrong-token"), "{s}");
         }
-        Some((out.status.code(), stdout, stderr))
+        Some((code, stdout, stderr))
     }
 
     /// The probe's answer: exit 0 and one JSON line of at most 4 KiB, with a reason of at most
@@ -1309,5 +1334,63 @@ exec "$@"
         assert_eq!(code, Some(1));
         assert!(err.starts_with("paradev probe: "), "{err}");
         assert!(!asked(&hung[2]));
+    }
+
+    /// A host that sends its answer a byte at a time never trips a socket timeout. The probe
+    /// still gives up on it within its time for one host, and answers.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_cuts_off_a_host_that_answers_slowly() {
+        use std::io::{Read, Write};
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        host.agents(serde_json::json!([agent("Start", 1_000)]));
+        let me = std::process::id();
+        manifest_of(
+            home.path(),
+            ".paradev",
+            "a-org",
+            &host.endpoint(),
+            TOKEN,
+            me,
+        );
+        let drip = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = drip.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in drip.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\n\r\n[";
+                    if s.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    // A byte every 200 ms, until the probe hangs up.
+                    while s.write_all(b" ").is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                });
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        manifest_of(home.path(), ".paradev", "b-org", &endpoint, TOKEN, me);
+        let start = std::time::Instant::now();
+        let Some((code, out, err)) = run_probe(home.path()) else {
+            return;
+        };
+        assert_eq!(
+            code,
+            Some(0),
+            "still running after {:?}: {err}",
+            start.elapsed()
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["busy"], true, "{v}");
+        // With nothing busy, the slow host makes it a failure (idle).
+        host.agents(serde_json::json!([agent("Stop", 1_000)]));
+        let (code, _, err) = run_probe(home.path()).unwrap();
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("too slowly"), "{err}");
     }
 }
