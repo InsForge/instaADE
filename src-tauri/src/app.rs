@@ -6245,6 +6245,8 @@ mod tests {
 
     /// The links follow the app's version once a release has them: an app from `since` on gets
     /// the link without the env, an older one does not, and with no `since` only the env counts.
+    /// The versions come from macOS bundles here; Windows reads `Orca.exe` (`orca` tests).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn an_app_from_the_links_version_on_takes_it_without_the_env() {
         let (_server, base) = cmux_server(serde_json::json!({})).await;
