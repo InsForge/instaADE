@@ -205,9 +205,9 @@ pub fn view(m: &Machine, now: DateTime<Utc>) -> SandboxView {
     }
 }
 
-/// Linux sandboxes only: no `os` and no `pool`.
+/// Linux sandboxes only: `os` is `linux` (or absent, as the API sent it before) and no `pool`.
 pub fn is_linux_template(t: &Template) -> bool {
-    t.os.is_none() && t.pool.is_none()
+    t.os.as_deref().is_none_or(|os| os == "linux") && t.pool.is_none()
 }
 
 pub fn size_choices(specs: &[MachineSpec]) -> Vec<SizeChoice> {
@@ -500,8 +500,13 @@ mod tests {
             latest: true,
         };
         assert!(is_linux_template(&t(None, None)));
+        // The API names every template's os since Nov 26, 2026: Linux ones say "linux".
+        assert!(is_linux_template(&t(Some("linux"), None)));
         assert!(!is_linux_template(&t(Some("macos"), None)));
+        assert!(!is_linux_template(&t(Some("macos"), Some("mac-m2pro"))));
+        assert!(!is_linux_template(&t(Some("windows"), Some("win"))));
         assert!(!is_linux_template(&t(None, Some("gpu"))));
+        assert!(!is_linux_template(&t(Some("linux"), Some("gpu"))));
     }
 
     #[test]
