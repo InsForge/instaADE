@@ -1654,7 +1654,8 @@ impl Core {
     /// Connects an existing sandbox: wakes it and sets the ADE up. A pairing ADE (T3) is
     /// installed (never an older version) and paired, then its app opens with the pairing
     /// link; a link ADE (cmux) gets its prep command, then its link opens; an SSH host ADE
-    /// (Orca, Paseo) gets its setup (Paseo's daemon), then its host written and its app started.
+    /// (Orca, Paseo) gets its setup (Orca's probe, Paseo's daemon), then its host written and
+    /// its app started.
     /// A host ADE (Paradev) is checked: once its host runs, the sandbox is marked and opens in
     /// it; else the user sets the host up in the app (`open_host`). A terminal ADE (Herdr) is
     /// installed, then opens in a terminal (`open_terminal`).
@@ -6122,7 +6123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_in_orca_of_a_sandbox_without_it_marks_it_with_no_exec() {
+    async fn open_in_orca_of_a_sandbox_without_it_installs_the_probe_then_marks_it() {
         let (server, base) = cmux_server(serde_json::json!({"instabox-bridge": "t3"})).await;
         let o = orca_core(&base, OrcaHere::Real);
         o.core
@@ -6132,11 +6133,22 @@ mod tests {
         assert_eq!(notice.as_deref(), Some(ORCA_NOTICE));
         assert_eq!(*o.opened.lock().unwrap(), [o.app.display().to_string()]);
         let reqs = server.received_requests().await.unwrap();
-        assert!(
-            !reqs.iter().any(|r| r.url.path().ends_with("/exec")),
-            "Orca installs its own server: nothing runs on the sandbox"
-        );
-        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        // Orca installs its own server: the one command is the setup with its activity probe.
+        let execs: Vec<_> = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.url.path().ends_with("/exec"))
+            .collect();
+        assert_eq!(execs.len(), 1, "one exec");
+        let (at, exec) = execs[0];
+        let body: serde_json::Value = serde_json::from_slice(&exec.body).unwrap();
+        assert_eq!(body["cmd"], ade::orca::setup_script("1.4.269"));
+        let mark = reqs
+            .iter()
+            .position(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        assert!(at < mark, "the mark comes after the setup");
+        let patch = &reqs[mark];
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         assert_eq!(body["metadata"]["instabox-bridge"], "t3");
         assert_eq!(body["metadata"]["instabox-ades"], "t3,orca");
