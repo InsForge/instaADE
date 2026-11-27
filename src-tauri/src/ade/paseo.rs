@@ -798,11 +798,17 @@ mod tests {
         /// Runs the probe as the guest does: an empty environment but HOME, a short PATH and
         /// the daemon's address (tests only). Returns the exit code, stdout and stderr.
         fn run(&self, python: &Path) -> (i32, String, String) {
+            self.run_with(python, &[])
+        }
+
+        /// `run`, with `env` added to the environment.
+        fn run_with(&self, python: &Path, env: &[(&str, &Path)]) -> (i32, String, String) {
             let probe = self.home.path().join("paseo-probe");
             std::fs::write(&probe, PROBE.script).unwrap();
             let out = std::process::Command::new(python)
                 .arg(&probe)
                 .env_clear()
+                .envs(env.iter().copied())
                 .env("HOME", self.home.path())
                 .env(
                     "PATH",
@@ -981,6 +987,45 @@ mod tests {
             assert_eq!(out, "", "{body}");
             assert!(err.contains(says), "{body}: {err}");
         }
+    }
+
+    /// A record tree that takes longer to read than the probe has: 200 records whose every
+    /// `stat` takes 50 ms, 10 s in all. The probe still answers within the guest's 5 s, with
+    /// its verdict and without a seq.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_tree_too_slow_to_read_leaves_out_the_seq_but_not_the_verdict() {
+        let Some(python) = python() else { return };
+        let p = ProbeHome::new(healthy_daemon(), true, "");
+        p.answers(
+            &serde_json::json!([agent("a", "running")]).to_string(),
+            "[]",
+        );
+        let records = p.home.path().join(".paseo/agents/-data-home-app");
+        std::fs::create_dir_all(&records).unwrap();
+        for i in 0..200 {
+            std::fs::write(records.join(format!("{i}.json")), "{}").unwrap();
+        }
+        // Python loads sitecustomize from PYTHONPATH at startup: it slows the records' stat.
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(
+            site.path().join("sitecustomize.py"),
+            "import os, time\n_stat = os.stat\n\n\ndef stat(path, *a, **k):\n    \
+             if \"/.paseo/agents/\" in os.fspath(path):\n        time.sleep(0.05)\n    \
+             return _stat(path, *a, **k)\n\n\nos.stat = stat\n",
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let (code, out, err) = p.run_with(&python, &[("PYTHONPATH", site.path())]);
+        let took = start.elapsed();
+        assert_eq!(code, 0, "{err}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["busy"], true, "{out}");
+        assert_eq!(v["reason"], "1 agent working (running)");
+        assert!(v.get("seq").is_none(), "{out}");
+        // Without the slow stat, the same tree gives its seq.
+        assert!(p.answer(&python).1 > 0);
     }
 
     #[cfg(unix)]

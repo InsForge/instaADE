@@ -2,6 +2,8 @@
 # instabox activity probe for Paseo (the instabox idle-suspend contract). instabox-guest-agent
 # runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
 #   {"busy": bool, "seq": <newest write to Paseo's agent records>, "reason": "..."}
+# It finds the verdict first and reads seq last, with what is left of its time, so a large
+# agent record tree cannot use up the 5 s.
 # A failure or a timeout counts as idle on the server, which then goes by tty and cpu.
 #
 # Paseo's daemon runs agents on pipes, not a pty, so once the desktop app quits the tty signal
@@ -29,7 +31,10 @@ BUDGET = 4.0
 
 
 def say(busy, reason, seq):
-    print(json.dumps({"busy": busy, "seq": seq, "reason": reason}))
+    out = {"busy": busy, "reason": reason}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
 
 
 def plural(n, word):
@@ -59,12 +64,17 @@ def cli():
     return found
 
 
-def seq():
+def seq(deadline):
     # The daemon writes an agent's record (~/.paseo/agents/<project>/<id>.json) at every state
     # change, so a turn that starts and ends between two readings still moves the newest write.
+    # None when the walk does not finish by the deadline: the verdict goes out without a seq.
+    # A partial newest write would differ from one reading to the next, and each change
+    # restarts the server's idle clock.
     newest = 0
     for top, _, files in os.walk(os.path.join(os.environ["HOME"], ".paseo/agents")):
         for name in files:
+            if time.monotonic() > deadline:
+                return None
             if name.endswith(".json"):
                 try:
                     newest = max(newest, os.stat(os.path.join(top, name)).st_mtime_ns)
@@ -89,24 +99,25 @@ def ask(paseo, args, deadline):
     return json.loads(out)
 
 
-def main():
-    deadline = time.monotonic() + BUDGET
-    n = seq()
+def verdict(deadline):
     if not daemon_answers(deadline):
-        say(False, "no paseo server", n)
-        return
+        return False, "no paseo server"
     paseo = cli()
     agents = ask(paseo, ["ls", "-g", "--background"], deadline)
     active = [a for a in agents if a["status"] not in IDLE_STATUSES]
     if not active:
-        say(False, "no agents working", n)
-        return
+        return False, "no agents working"
     asking = {p["agentId"] for p in ask(paseo, ["permit", "ls"], deadline)}
     working = [str(a["status"]) for a in active if a["id"] not in asking]
     if working:
-        say(True, f"{plural(len(working), 'agent')} working ({','.join(sorted(set(working)))})", n)
-    else:
-        say(False, f"{plural(len(active), 'agent')} waiting for the user", n)
+        return True, f"{plural(len(working), 'agent')} working ({','.join(sorted(set(working)))})"
+    return False, f"{plural(len(active), 'agent')} waiting for the user"
+
+
+def main():
+    deadline = time.monotonic() + BUDGET
+    busy, reason = verdict(deadline)
+    say(busy, reason, seq(deadline))
 
 
 if __name__ == "__main__":
