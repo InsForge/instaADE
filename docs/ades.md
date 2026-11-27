@@ -56,17 +56,28 @@ Orca has no idle probe, so the sandbox sleeps by its terminals and CPU.
 
 ## Paradev (macOS)
 
-Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaADE installs nothing and hands the setup to Paradev:
+Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the host up by itself over SSH: it installs its CLI and a `superset-host` user service on the sandbox, which then connects out to Paradev's relay. Paradev has no link that adds a host without you, so InstaADE hands the setup to Paradev, and adds only an idle probe once the host runs:
 
 1. **Install Paradev** wakes the sandbox, copies its SSH address, `ssh://<SSH token>@<gateway>:<port>`, and opens Paradev's host settings. A minute later InstaADE clears the address from the clipboard, unless you copied something else since. When InstaADE quits before then, it clears the address on the way out by the same rule.
 2. In Paradev, click **Set up a host over SSH** and paste the address.
-3. Click **Install Paradev** again. InstaADE checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get `paradev` in its mark, and a new workspace on it opens in Paradev.
+3. Click **Install Paradev** again. InstaADE checks with one command on the sandbox that `superset-host` is active. Only then does the sandbox get the idle probe and `paradev` in its mark, and a new workspace on it opens in Paradev.
 
 **Open in Paradev** wakes the sandbox, since Paradev does not wake a sleeping one, reads its machine id, and opens `superset://new-workspace?host=<host id>`, with the host id Paradev derives from that machine id. **Reconnect** checks the host again.
 
 The address holds an SSH token, so InstaADE copies it, and opens Paradev's links, only for the real Paradev app in `/Applications` or `~/Applications`, named `Paradev.app` or, before the rename, `Superset.app`. Its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaADE checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler. A Mac can have both `Paradev.app` and `Superset.app`, with the same identifier. InstaADE then uses the newest, and opens the links in it by its path, never in the copy macOS would pick.
 
-Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+### The Paradev probe
+
+Paradev's host reaches Paradev through its relay, which the sandbox's idle check does not count, and Paradev's chat agents run without a terminal. So, by its terminals and CPU alone, the sandbox could sleep under a working agent. When `superset-host` is active, the command that checks the host also installs an activity probe in `/usr/local/lib/instabox/activity.d/paradev`, or brings it up to date. **Install Paradev**, **Reconnect** and **Open in Paradev** all run that command, so a sandbox set up before the probe existed gets it at its next **Open in Paradev**. When the probe cannot be installed, the check still answers as before.
+
+The probe reads the host's address and token from `~/.paradev/host/<org>/manifest.json`, which the host writes at every start (`~/.superset` before the rename), and asks the host for its agents. It sends the token only to an address on the sandbox, and never prints it.
+
+- An agent keeps the sandbox awake while its last event is `Start` (a turn in progress) or `Attached` (an agent that is starting), or an event the probe does not know.
+- An agent that waits for you (`PermissionRequest`), is done (`Stop`) or failed (`Failed`) does not.
+- A terminal agent counts for at most 30 minutes after its last hook, or the last hook of one of its subagents. Claude Code fires no hook when you interrupt it, so its last event stays `Start`. A working agent fires a hook after every tool call.
+- A chat agent counts for at most 6 hours after its turn started, since Paradev records a chat agent's state only when it changes.
+- An agent still `Attached` after 5 minutes waits for its first prompt, and does not count.
+- Without a host, or when the host does not run, the probe says idle.
 
 ## Paseo
 

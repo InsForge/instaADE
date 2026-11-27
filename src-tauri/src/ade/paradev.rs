@@ -3,7 +3,8 @@
 //! service on the sandbox, which then connects out to Paradev's relay. After that a link opens a
 //! new workspace on the host by its host id. Paradev has no link or CLI that adds a host from
 //! an SSH address without the user, so InstaADE copies the address and opens the app's host
-//! settings, and the user finishes there.
+//! settings, and the user finishes there. Once the host runs, InstaADE's host check installs
+//! an idle probe next to it.
 //! On this computer: find the real Paradev app (its identifier and its signature, not only its
 //! name), the newest when there are several, and read its version from its bundle.
 
@@ -12,7 +13,7 @@ use ring::hmac;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Host, HostState, Platform, SshLogin};
+use crate::ade::{Host, HostState, Platform, Probe, SshLogin};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "paradev";
@@ -147,11 +148,40 @@ pub(crate) fn test_bundle_named(
 
 // ---- the sandbox ----
 
+/// The activity probe, which the host check installs once the host runs. Paradev's host
+/// reaches Paradev over an outbound relay, which the instabox idle loop does not count, and
+/// its chat agents run on pipes, not a terminal. So without the probe a sandbox can sleep
+/// under a working agent.
+pub const PROBE: Probe = Probe {
+    name: "paradev",
+    script: include_str!("../../assets/paradev-probe"),
+};
+
 /// Prints whether the host service Paradev's setup installs is active, and the machine id
 /// Paradev derives the host id from, read as Paradev reads it on Linux (`/etc/machine-id`,
-/// else `/var/lib/dbus/machine-id`). It changes nothing.
-pub const HOST_SCRIPT: &str = r#"echo "service=$(systemctl --user is-active superset-host 2>/dev/null)"
-echo "machineid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null)""#;
+/// else `/var/lib/dbus/machine-id`). When the host is active, it also installs `PROBE`, or
+/// brings it up to date, and changes nothing else. A probe it cannot install changes neither
+/// its output nor its exit code. InstaADE runs it at Install, Reconnect and Open, so a
+/// sandbox set up before the probe existed gets it at its next Open.
+pub const HOST_SCRIPT: &str = concat!(
+    r#"service=$(systemctl --user is-active superset-host 2>/dev/null)
+if [ "$service" = active ]; then
+  probe=/usr/local/lib/instabox/activity.d/paradev
+  new=$(mktemp) && {
+    cat > "$new" <<'INSTABOX_PROBE_EOF'
+"#,
+    include_str!("../../assets/paradev-probe"),
+    r#"INSTABOX_PROBE_EOF
+    if ! cmp -s "$new" "$probe" || [ ! -x "$probe" ]; then
+      { sudo -n install -d -m 0755 /usr/local/lib/instabox/activity.d &&
+        sudo -n install -m 0755 "$new" "$probe"; } || echo "could not install the Paradev probe" >&2
+    fi
+    rm -f "$new"
+  }
+fi
+echo "service=$service"
+echo "machineid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null)""#
+);
 
 /// Opens Paradev's host settings, where the user clicks Set up a host over SSH.
 pub const SETUP_LINK: &str = "superset://settings/hosts";
@@ -507,5 +537,644 @@ mod tests {
             assert_eq!(locate(), None);
             assert!(!codesign_meets_requirement(Path::new("Superset.app")));
         }
+    }
+
+    // ---- the probe and its install ----
+
+    /// Ends the probe's here-document in `HOST_SCRIPT`.
+    const PROBE_EOF: &str = "INSTABOX_PROBE_EOF";
+
+    #[test]
+    fn the_host_check_carries_the_probe_to_activity_d() {
+        assert_eq!(PROBE.path(), "/usr/local/lib/instabox/activity.d/paradev");
+        assert_eq!(
+            PROBE.path(),
+            format!("{}/paradev", crate::ade::ACTIVITY_DIR)
+        );
+        assert!(PROBE.script.starts_with("#!/usr/bin/env python3\n"));
+        // The here-document holds the probe as it is, and its end marker is on its own line.
+        assert!(PROBE.script.ends_with('\n'));
+        assert!(!PROBE.script.contains(PROBE_EOF));
+        assert!(HOST_SCRIPT.contains(&format!("<<'{PROBE_EOF}'\n{}{PROBE_EOF}\n", PROBE.script)));
+        assert!(HOST_SCRIPT.contains(&format!("\n  probe={}\n", PROBE.path())));
+        // A CRLF checkout (Windows) would break the script on the sandbox.
+        assert!(!PROBE.script.contains('\r'));
+        // The probe is written only when the host runs, and with sudo that never asks.
+        let gate = HOST_SCRIPT
+            .find("if [ \"$service\" = active ]; then")
+            .unwrap();
+        let install = HOST_SCRIPT.find("sudo -n install -m 0755").unwrap();
+        assert!(gate < install);
+        assert!(!HOST_SCRIPT.contains("sudo install"));
+        // The output Install, Reconnect and Open read stays the last two lines.
+        assert!(HOST_SCRIPT.ends_with(
+            "echo \"service=$service\"\necho \"machineid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null)\""
+        ));
+    }
+
+    /// Runs `HOST_SCRIPT` with `root` in place of `ACTIVITY_DIR`, a stand-in `systemctl` that
+    /// reports `state`, and a stand-in `sudo` that logs its arguments and runs the command (or
+    /// fails when `sudo_fails`). Returns the exit code, stdout and stderr.
+    #[cfg(unix)]
+    fn run_host_script(
+        bin: &Path,
+        root: &Path,
+        log: &Path,
+        state: &str,
+        sudo_fails: bool,
+    ) -> (Option<i32>, String, String) {
+        let dir = crate::ade::ACTIVITY_DIR;
+        assert_eq!(
+            HOST_SCRIPT.matches(dir).count(),
+            2,
+            "the probe's path and its folder"
+        );
+        let script = HOST_SCRIPT.replace(dir, &root.display().to_string());
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("SERVICE_STATE", state)
+            .env("SUDO_LOG", log)
+            .env("SUDO_FAIL", if sudo_fails { "1" } else { "" })
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_exe(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_host_check_installs_the_probe_only_once_the_host_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let root = dir.path().join("root");
+        let log = dir.path().join("sudo.log");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_exe(
+            &bin.join("systemctl"),
+            "#!/bin/sh\necho \"$SERVICE_STATE\"\n[ \"$SERVICE_STATE\" = active ]\n",
+        );
+        write_exe(
+            &bin.join("sudo"),
+            r#"#!/bin/sh
+echo "$*" >> "$SUDO_LOG"
+[ "$1" = -n ] || exit 1
+shift
+[ -z "$SUDO_FAIL" ] || exit 1
+exec "$@"
+"#,
+        );
+        let installed = root.join("paradev");
+        let sudo_calls = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        // The host does not run (yet): nothing is written, and the output is as before.
+        for state in ["inactive", "activating", "failed"] {
+            let (code, out, _) = run_host_script(&bin, &root, &log, state, false);
+            assert_eq!(code, Some(0));
+            assert!(
+                out.starts_with(&format!("service={state}\nmachineid=")),
+                "{out}"
+            );
+            assert!(!parse_host(&out).running);
+        }
+        assert_eq!(sudo_calls(), "", "no sudo before the host runs");
+        assert!(!installed.exists());
+
+        // It runs: the probe goes in, executable, and the output is the same two lines.
+        let (code, out, err) = run_host_script(&bin, &root, &log, "active", false);
+        assert_eq!(code, Some(0), "{err}");
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.starts_with("service=active\nmachineid="), "{out}");
+        assert!(parse_host(&out).running);
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), PROBE.script);
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let calls = sudo_calls();
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        assert!(
+            calls.lines().all(|l| l.starts_with("-n install ")),
+            "{calls}"
+        );
+
+        // The same probe again: nothing is written.
+        run_host_script(&bin, &root, &log, "active", false);
+        assert_eq!(sudo_calls(), calls, "an unchanged probe is left alone");
+
+        // An older probe, or one that lost its mode, is replaced.
+        std::fs::write(&installed, "#!/bin/sh\necho old\n").unwrap();
+        run_host_script(&bin, &root, &log, "active", false);
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), PROBE.script);
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        run_host_script(&bin, &root, &log, "active", false);
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        // When sudo fails, the host check still answers, and still succeeds.
+        std::fs::remove_file(&installed).unwrap();
+        let (code, out, err) = run_host_script(&bin, &root, &log, "active", true);
+        assert_eq!(code, Some(0));
+        assert!(out.starts_with("service=active\nmachineid="), "{out}");
+        assert!(parse_host(&out).running);
+        assert!(err.contains("could not install the Paradev probe"), "{err}");
+        assert!(!installed.exists());
+    }
+
+    // The probe, run as the guest agent runs it, against a stand-in host service.
+
+    #[cfg(unix)]
+    const TOKEN: &str = "c0ffee-host-secret-0123456789abcdef";
+
+    /// Each request line the stand-in host got, with its Authorization header.
+    #[cfg(unix)]
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A stand-in for Paradev's host service: it answers every request with `answer` when the
+    /// request carries `TOKEN`, else with 401 as the host does, and records each request in
+    /// `seen`.
+    #[cfg(unix)]
+    struct FakeHost {
+        port: u16,
+        answer: std::sync::Arc<std::sync::Mutex<String>>,
+        seen: Requests,
+    }
+
+    #[cfg(unix)]
+    impl FakeHost {
+        fn start() -> FakeHost {
+            use std::io::{BufRead, BufReader, Write};
+            use std::sync::{Arc, Mutex};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let answer = Arc::new(Mutex::new(String::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (a, s) = (answer.clone(), seen.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    let mut auth = None;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':')
+                            && k.eq_ignore_ascii_case("authorization")
+                        {
+                            auth = Some(v.trim().to_string());
+                        }
+                    }
+                    let ok = auth.as_deref() == Some(format!("Bearer {TOKEN}").as_str());
+                    s.lock().unwrap().push((line.trim_end().to_string(), auth));
+                    let (status, body) = if ok {
+                        ("200 OK", a.lock().unwrap().clone())
+                    } else {
+                        (
+                            "401 Unauthorized",
+                            r#"{"error":{"json":{"message":"Invalid or missing authentication token.","code":-32001}}}"#
+                                .to_string(),
+                        )
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            FakeHost { port, answer, seen }
+        }
+
+        /// Answers `terminalAgents.list` with `agents`, in the host's superjson envelope.
+        fn agents(&self, agents: serde_json::Value) {
+            let body = serde_json::json!({"result": {"data": {"json": agents}}});
+            *self.answer.lock().unwrap() = body.to_string();
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+    }
+
+    /// Writes the manifest Paradev's host writes at every start, under `home`.
+    #[cfg(unix)]
+    fn manifest(home: &Path, dir: &str, endpoint: &str, token: &str, pid: u32) {
+        let org = home
+            .join(dir)
+            .join("host")
+            .join("2f8e0c1a-4b7d-4e9a-9c3f-5d6b7a8e9f01");
+        std::fs::create_dir_all(&org).unwrap();
+        let m = serde_json::json!({
+            "pid": pid,
+            "endpoint": endpoint,
+            "authToken": token,
+            "startedAt": 1_764_000_000_000_u64,
+            "organizationId": "2f8e0c1a-4b7d-4e9a-9c3f-5d6b7a8e9f01",
+        });
+        std::fs::write(org.join("manifest.json"), m.to_string()).unwrap();
+    }
+
+    /// Runs the probe as instabox-guest-agent does: python3 with a cleared environment, in the
+    /// home directory. Returns the exit code, stdout and stderr, and checks that neither stream
+    /// holds a token. None without python3.
+    #[cfg(unix)]
+    fn run_probe(home: &Path) -> Option<(Option<i32>, String, String)> {
+        let Ok(python) = which::which("python3") else {
+            eprintln!("python3 not found: skipped");
+            return None;
+        };
+        let probe = home.join("probe");
+        std::fs::write(&probe, PROBE.script).unwrap();
+        let out = std::process::Command::new(python)
+            .arg(&probe)
+            .env_clear()
+            .env("HOME", home)
+            .env("SHELL", "/bin/bash")
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .current_dir(home)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        );
+        for s in [&stdout, &stderr] {
+            assert!(!s.contains(TOKEN) && !s.contains("wrong-token"), "{s}");
+        }
+        Some((out.status.code(), stdout, stderr))
+    }
+
+    /// The probe's answer: exit 0 and one JSON line of at most 4 KiB, with a reason of at most
+    /// 200 characters. Read with the app's own probe reader too.
+    #[cfg(unix)]
+    fn answer(home: &Path) -> Option<serde_json::Value> {
+        let (code, out, err) = run_probe(home)?;
+        assert_eq!(code, Some(0), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.len() <= 4096);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert!(v["reason"].as_str().unwrap().chars().count() <= 200);
+        assert_eq!(
+            crate::ade::parse_probe(&out).busy,
+            v["busy"].as_bool().unwrap()
+        );
+        Some(v)
+    }
+
+    #[cfg(unix)]
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    /// An agent as `terminalAgents.list` returns it, last heard from `ago_ms` ago.
+    #[cfg(unix)]
+    fn agent(event: &str, ago_ms: i64) -> serde_json::Value {
+        let at = now_ms() - ago_ms;
+        serde_json::json!({
+            "terminalId": format!("term-{event}-{ago_ms}"),
+            "workspaceId": "ws-1",
+            "agentId": "claude",
+            "agentSessionId": "5b0e6c3e-1f7a-4d8e-9b2a-3c4d5e6f7a8b",
+            "startedAt": at - 60_000,
+            "lastEventAt": at,
+            "lastEventType": event,
+        })
+    }
+
+    #[cfg(unix)]
+    const MINUTE: i64 = 60_000;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_reads_each_agent_state() {
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        manifest(
+            home.path(),
+            ".paradev",
+            &host.endpoint(),
+            TOKEN,
+            std::process::id(),
+        );
+        let verdict = |agents: serde_json::Value| -> Option<(bool, String)> {
+            host.agents(agents);
+            let v = answer(home.path())?;
+            Some((
+                v["busy"].as_bool().unwrap(),
+                v["reason"].as_str().unwrap().to_string(),
+            ))
+        };
+        let chat = |event: &str, ago: i64| {
+            let mut a = agent(event, ago);
+            a["chatSessionId"] = "chat-1".into();
+            a
+        };
+        let Some(none) = verdict(serde_json::json!([])) else {
+            return;
+        };
+        assert_eq!(none, (false, "no paradev agents".to_string()));
+        let cases: Vec<(serde_json::Value, bool, &str)> = vec![
+            // Working, and starting: busy.
+            (agent("Start", 1_000), true, "1 agent busy (1 working)"),
+            (agent("Attached", 1_000), true, "1 agent busy (1 starting)"),
+            // Waiting on the user, or done: idle.
+            (
+                agent("PermissionRequest", 1_000),
+                false,
+                "no busy agents (1 waiting)",
+            ),
+            (agent("Stop", 1_000), false, "no busy agents (1 done)"),
+            (agent("Failed", 1_000), false, "no busy agents (1 failed)"),
+            // A state this probe does not know: busy.
+            (agent("Compacting", 1_000), true, "1 agent busy (1 other)"),
+            // A Start whose Stop hook was lost (an interrupt fires none) ends after 30 minutes.
+            (
+                agent("Start", 29 * MINUTE),
+                true,
+                "1 agent busy (1 working)",
+            ),
+            (
+                agent("Start", 31 * MINUTE),
+                false,
+                "no busy agents (1 stale)",
+            ),
+            (
+                agent("Compacting", 31 * MINUTE),
+                false,
+                "no busy agents (1 stale)",
+            ),
+            // An agent that never got a prompt waits for the user after 5 minutes.
+            (
+                agent("Attached", 4 * MINUTE),
+                true,
+                "1 agent busy (1 starting)",
+            ),
+            (
+                agent("Attached", 6 * MINUTE),
+                false,
+                "no busy agents (1 stale)",
+            ),
+            (
+                chat("Attached", 6 * MINUTE),
+                false,
+                "no busy agents (1 stale)",
+            ),
+            // Waiting is idle however recent or old.
+            (
+                agent("PermissionRequest", 7 * 60 * MINUTE),
+                false,
+                "no busy agents (1 waiting)",
+            ),
+            // A chat turn is stamped once, at its start: a long one stays busy.
+            (chat("Start", 31 * MINUTE), true, "1 agent busy (1 working)"),
+            (
+                chat("Start", 5 * 60 * MINUTE),
+                true,
+                "1 agent busy (1 working)",
+            ),
+            (
+                chat("Start", 7 * 60 * MINUTE),
+                false,
+                "no busy agents (1 stale)",
+            ),
+            (chat("Stop", 1_000), false, "no busy agents (1 done)"),
+        ];
+        for (a, busy, reason) in cases {
+            let got = verdict(serde_json::json!([a.clone()])).unwrap();
+            assert_eq!(got, (busy, reason.to_string()), "{a}");
+        }
+
+        // A subagent's hooks keep its parent's turn alive; an ended one does not.
+        let mut parent = agent("Start", 40 * MINUTE);
+        let sub = |ago: i64, ended: bool| {
+            let at = now_ms() - ago;
+            let mut s =
+                serde_json::json!({"id": "sub-1", "startedAt": at - MINUTE, "lastEventAt": at});
+            if ended {
+                s["endedAt"] = at.into();
+            }
+            s
+        };
+        parent["subagents"] = serde_json::json!([sub(MINUTE, false)]);
+        assert!(verdict(serde_json::json!([parent.clone()])).unwrap().0);
+        parent["subagents"] = serde_json::json!([sub(MINUTE, true)]);
+        assert!(!verdict(serde_json::json!([parent.clone()])).unwrap().0);
+        parent["subagents"] = serde_json::json!([sub(35 * MINUTE, false)]);
+        assert!(!verdict(serde_json::json!([parent])).unwrap().0);
+
+        // An ended agent does not count.
+        let mut ended = agent("Start", 1_000);
+        ended["endedAt"] = now_ms().into();
+        assert_eq!(
+            verdict(serde_json::json!([ended])).unwrap(),
+            (false, "no paradev agents".to_string())
+        );
+
+        // Several agents: busy when one is, and each state is counted.
+        let all = serde_json::json!([
+            agent("Stop", 1_000),
+            agent("Start", 2_000),
+            agent("PermissionRequest", 3_000),
+            agent("Start", 4_000),
+        ]);
+        assert_eq!(
+            verdict(all).unwrap(),
+            (
+                true,
+                "2 agents busy (2 working, 1 waiting, 1 done)".to_string()
+            )
+        );
+
+        // Every request asked for the agent list, with the manifest's token.
+        let seen = host.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for (line, auth) in seen.iter() {
+            assert_eq!(line, "GET /trpc/terminalAgents.list HTTP/1.1");
+            assert_eq!(auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        }
+    }
+
+    /// `seq` is the newest event's time: it moves when a turn starts or ends, also between two
+    /// readings that are both idle.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_seq_moves_when_an_agent_starts_or_stops() {
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        manifest(
+            home.path(),
+            ".paradev",
+            &host.endpoint(),
+            TOKEN,
+            std::process::id(),
+        );
+        let seq = |agents: serde_json::Value| -> Option<i64> {
+            host.agents(agents);
+            Some(answer(home.path())?["seq"].as_i64().unwrap())
+        };
+        let Some(empty) = seq(serde_json::json!([])) else {
+            return;
+        };
+        assert_eq!(empty, 0);
+        let mut a = agent("Stop", 10 * MINUTE);
+        let before = seq(serde_json::json!([a.clone()])).unwrap();
+        assert_eq!(Some(before), a["lastEventAt"].as_i64());
+        // A turn started and stopped since: idle again, with a new seq.
+        a["lastEventAt"] = (now_ms() - 1_000).into();
+        let after = seq(serde_json::json!([a.clone(), agent("Stop", 20 * MINUTE)])).unwrap();
+        assert_eq!(Some(after), a["lastEventAt"].as_i64());
+        assert_ne!(before, after);
+        // Busy answers carry it too.
+        let busy = agent("Start", 500);
+        assert_eq!(
+            seq(serde_json::json!([a, busy.clone()])),
+            busy["lastEventAt"].as_i64()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_is_idle_without_a_running_host() {
+        let home = tempfile::tempdir().unwrap();
+        let idle = |reason: &str| {
+            let Some(v) = answer(home.path()) else {
+                return;
+            };
+            assert_eq!(v, serde_json::json!({"busy": false, "reason": reason}));
+        };
+        // Paradev never set this sandbox up.
+        idle("no paradev host");
+        // A manifest whose host process is gone.
+        let mut gone = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        manifest(home.path(), ".paradev", "http://127.0.0.1:9", TOKEN, pid);
+        idle("paradev host not running");
+        // A host process, but nothing listens at the endpoint.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        manifest(
+            home.path(),
+            ".paradev",
+            &format!("http://127.0.0.1:{port}"),
+            TOKEN,
+            std::process::id(),
+        );
+        idle("paradev host not running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_finds_the_host_under_the_old_folder_once() {
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        host.agents(serde_json::json!([agent("Start", 1_000)]));
+        // Before the rename the folder was ~/.superset.
+        manifest(
+            home.path(),
+            ".superset",
+            &host.endpoint(),
+            TOKEN,
+            std::process::id(),
+        );
+        let Some(v) = answer(home.path()) else {
+            return;
+        };
+        assert_eq!(v["busy"], true);
+        // Paradev moves it to ~/.paradev and leaves a link: the host is asked once.
+        std::fs::rename(home.path().join(".superset"), home.path().join(".paradev")).unwrap();
+        std::os::unix::fs::symlink(home.path().join(".paradev"), home.path().join(".superset"))
+            .unwrap();
+        host.seen.lock().unwrap().clear();
+        assert_eq!(answer(home.path()).unwrap()["busy"], true);
+        assert_eq!(host.seen.lock().unwrap().len(), 1);
+    }
+
+    /// A probe that cannot read the host fails, which the server counts as idle, and never
+    /// prints the token: not on stdout, not in its error.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_fails_without_printing_the_token() {
+        let home = tempfile::tempdir().unwrap();
+        let host = FakeHost::start();
+        let fails = |what: &str| {
+            let Some((code, out, err)) = run_probe(home.path()) else {
+                return;
+            };
+            assert_eq!(code, Some(1), "{what}: {out}{err}");
+            assert_eq!(out, "", "{what}");
+            assert!(err.starts_with("paradev probe: "), "{what}: {err}");
+        };
+        // The host turns down a token that is not its own.
+        manifest(
+            home.path(),
+            ".paradev",
+            &host.endpoint(),
+            "wrong-token",
+            std::process::id(),
+        );
+        host.agents(serde_json::json!([agent("Start", 1_000)]));
+        fails("a wrong token");
+        assert_eq!(
+            host.seen.lock().unwrap().last().unwrap().1.as_deref(),
+            Some("Bearer wrong-token")
+        );
+        manifest(
+            home.path(),
+            ".paradev",
+            &host.endpoint(),
+            TOKEN,
+            std::process::id(),
+        );
+        // An answer the probe does not know.
+        *host.answer.lock().unwrap() = "<html>not trpc</html>".to_string();
+        fails("not JSON");
+        *host.answer.lock().unwrap() = r#"{"result":{"data":{"json":{"agents":[]}}}}"#.to_string();
+        fails("not a list");
+        host.agents(serde_json::json!([{"lastEventType": "Start"}]));
+        fails("an agent without lastEventAt");
+        // The token goes only to this machine: an endpoint elsewhere is never called.
+        let asked = host.seen.lock().unwrap().len();
+        for endpoint in [
+            "https://127.0.0.1:1".to_string(),
+            "http://relay.example.com:4879".to_string(),
+            format!("http://127.0.0.1.example.com:{}", host.port),
+            "http://127.0.0.1".to_string(),
+        ] {
+            manifest(
+                home.path(),
+                ".paradev",
+                &endpoint,
+                TOKEN,
+                std::process::id(),
+            );
+            fails(&endpoint);
+        }
+        assert_eq!(host.seen.lock().unwrap().len(), asked);
     }
 }

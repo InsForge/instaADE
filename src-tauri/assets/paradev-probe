@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# instabox activity probe for Paradev (the instabox idle-suspend contract). instabox-guest-agent
+# runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
+#   {"busy": bool, "seq": <newest agent event, ms>, "reason": "..."}
+# A failure, a timeout or anything else on stdout counts as idle on the server.
+#
+# Paradev's host service (`superset-host`) talks to Paradev through an outbound relay, which
+# the idle loop does not count, and its chat agents run on pipes, not a pty. So the probe asks
+# the host service. Each org's host writes its loopback endpoint and its token to
+# ~/.paradev/host/<org>/manifest.json at every start, and `terminalAgents.list` answers with
+# the live agents of its terminals and chats, each with its last lifecycle event. The token
+# goes only into the request's Authorization header: the probe never prints it.
+import glob
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# Paradev's lifecycle events (host-service events/map-event-type.ts). These wait on a person
+# or end a turn, so they are idle. Every other event is busy: "Start" (a turn in progress),
+# "Attached" (an agent that is starting) and any event this probe does not know.
+IDLE_EVENTS = {"PermissionRequest": "waiting", "Stop": "done", "Failed": "failed"}
+BUSY_LABELS = {"Start": "working", "Attached": "starting"}
+
+# A busy event counts only while it is this recent (ms). After that the agent is "stale",
+# which is idle.
+# - "Attached" is an agent's launch. One launched with a prompt starts its turn within seconds;
+#   one still at "Attached" after this waits for its first prompt.
+STARTING_MS = 5 * 60_000
+# - A terminal agent reports through hooks, and some ends fire none: Claude Code fires no Stop
+#   hook on an interrupt, so a "Start" can outlive its turn. A working agent fires a hook after
+#   every tool call (Claude Code's longest shell call is 10 minutes by default), and the hooks
+#   of its subagents count too.
+TERMINAL_MS = 30 * 60_000
+# - A chat agent's state comes from Paradev's chat runtime, interrupts included, but is stamped
+#   only when it changes, so its time is the start of the turn. This only bounds a stuck one.
+CHAT_MS = 6 * 60 * 60_000
+
+APP_DIRS = (".paradev", ".superset")  # .superset: Paradev's folder before the rename
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+TIMEOUT = 2  # seconds for each host; the probe has 5
+MAX_BODY = 8 << 20
+
+secrets = []  # the tokens read, kept out of anything the probe prints
+
+
+def say(busy, reason, seq=None):
+    out = {"busy": busy, "reason": reason[:200]}
+    if seq is not None:
+        out["seq"] = seq
+    print(json.dumps(out))
+
+
+def manifests():
+    home = os.environ["HOME"]
+    seen, found = set(), []
+    for d in APP_DIRS:
+        for path in sorted(glob.glob(os.path.join(home, d, "host", "*", "manifest.json"))):
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            try:
+                with open(path) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(m, dict):
+                if isinstance(m.get("authToken"), str):
+                    secrets.append(m["authToken"])
+                found.append(m)
+    return found
+
+
+def alive(pid):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return True  # no pid to check: the request tells
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def agents_of(manifest):
+    """The host's live agents, or None when nothing listens at its endpoint."""
+    endpoint, token = manifest.get("endpoint"), manifest.get("authToken")
+    if not isinstance(endpoint, str) or not isinstance(token, str) or not token:
+        raise ValueError("manifest without endpoint or token")
+    url = urllib.parse.urlsplit(endpoint)
+    if url.scheme != "http" or url.hostname not in LOOPBACK or url.port is None:
+        raise ValueError("manifest endpoint is not on this machine")
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/trpc/terminalAgents.list",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+    )
+    # No proxy: the token goes to the loopback endpoint only.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=TIMEOUT) as r:
+            body = json.loads(r.read(MAX_BODY))
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ConnectionRefusedError):
+            return None
+        raise
+    # A tRPC query's answer. The host serializes with superjson:
+    # {"result": {"data": {"json": [...]}}}
+    data = body["result"]["data"]
+    if isinstance(data, dict) and "json" in data:
+        data = data["json"]
+    if not isinstance(data, list):
+        raise ValueError("unexpected terminalAgents.list answer")
+    return data
+
+
+def stamp(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("agent without lastEventAt")
+    return int(value)
+
+
+def label(agent, now):
+    """What the agent does: a label, and whether that is busy."""
+    event = agent.get("lastEventType")
+    if event in IDLE_EVENTS:
+        return IDLE_EVENTS[event], False
+    last = stamp(agent.get("lastEventAt"))
+    for sub in agent.get("subagents") or []:
+        if isinstance(sub, dict) and sub.get("endedAt") is None:
+            last = max(last, stamp(sub.get("lastEventAt")))
+    if event == "Attached":
+        limit = STARTING_MS
+    elif agent.get("chatSessionId"):
+        limit = CHAT_MS
+    else:
+        limit = TERMINAL_MS
+    if now - last >= limit:
+        return "stale", False
+    return BUSY_LABELS.get(event, "other"), True
+
+
+def tally(labels):
+    order = ("working", "starting", "other", "waiting", "done", "failed", "stale")
+    return ", ".join(f"{labels.count(k)} {k}" for k in order if k in labels)
+
+
+def main():
+    found = manifests()
+    if not found:
+        say(False, "no paradev host")
+        return
+    agents, errors, answered = [], [], False
+    for m in found:
+        if not alive(m.get("pid")):
+            continue
+        try:
+            listed = agents_of(m)
+        except Exception as e:  # noqa: BLE001: one host's failure, raised below if it matters
+            errors.append(e)
+            continue
+        if listed is not None:
+            answered = True
+            agents.extend(a for a in listed if isinstance(a, dict) and a.get("endedAt") is None)
+    now = int(time.time() * 1000)
+    labels = [label(a, now) for a in agents]
+    names = [n for n, _ in labels]
+    # Changes whenever an agent's state does: a turn that starts and ends between two
+    # readings still moves it.
+    seq = max((stamp(a.get("lastEventAt")) for a in agents), default=0)
+    busy = sum(1 for _, b in labels if b)
+    if busy:
+        say(True, f"{busy} agent{'s' if busy != 1 else ''} busy ({tally(names)})", seq)
+    elif errors:
+        raise errors[0]
+    elif not answered:
+        say(False, "paradev host not running")
+    elif not agents:
+        say(False, "no paradev agents", seq)
+    else:
+        say(False, f"no busy agents ({tally(names)})", seq)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001: any failure is the probe's failure
+        msg = f"{type(e).__name__}: {e}"
+        for s in secrets:
+            if s:
+                msg = msg.replace(s, "***")
+        print(f"paradev probe: {msg}", file=sys.stderr)
+        sys.exit(1)
