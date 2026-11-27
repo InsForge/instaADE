@@ -1014,22 +1014,19 @@ mod tests {
         }
     }
 
-    /// A process whose command line is the relay's, `node relay.js <args>` with the relay
-    /// directory of `home` (as Orca 1.4.217 starts it there), so the process list shows it.
+    /// A process whose command line is the relay's, `node relay.js <args>` with the socket
+    /// `sock` in the relay directory of `home` (as Orca 1.4.217 starts it there), so the
+    /// process list shows it. It is a shell waiting on its input, with no child of its own.
     #[cfg(unix)]
-    fn relay_process(home: &Path, args: &[&str]) -> std::process::Child {
+    fn relay_process(home: &Path, sock: &str, args: &[&str]) -> std::process::Child {
         let dir = home.join(".orca-remote").join("relay-0.1.0+2f74d1118794");
-        let sock = dir
-            .join("relay-205b5dfead917383.sock")
-            .display()
-            .to_string();
+        let sock = dir.join(sock).display().to_string();
         let credential = format!("{sock}.credential");
-        // Two commands, so the shell does not replace itself with `sleep` and keeps its
-        // arguments.
         std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30; :", "/usr/local/bin/node", "relay.js"])
+            .args(["-c", "read x", "/usr/local/bin/node", "relay.js"])
             .args(args)
             .args(["--sock-path", &sock, "--credential-file", &credential])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap()
     }
@@ -1055,18 +1052,26 @@ mod tests {
     fn the_probe_names_the_relay_of_an_older_orca_instead_of_no_server() {
         let home = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
+        if which::which("ps").is_err() {
+            eprintln!("ps not found: skipped");
+            return;
+        }
         if run_probe(home.path()).is_none() {
             return;
         }
+        let sock = "relay-205b5dfead917383.sock";
         let connected = "orca relay, no orcad (Orca 1.4.224 or older, app connected): its agents \
                          run in terminals, which the tty signal counts";
         let alone = connected.replace("app connected", "app not connected");
         let mut running = Running(Vec::new());
-        // Another user's relay, or a CLI call through the relay, is not this home's relay.
-        running.0.push(relay_process(other.path(), &["--detached"]));
+        // Another home's relay, and a command through the relay's CLI bridge (its shape in
+        // `~/.orca-relay/bin/orca`), are not this home's relay.
         running
             .0
-            .push(relay_process(home.path(), &["--orca-cli", "status"]));
+            .push(relay_process(other.path(), sock, &["--detached"]));
+        running
+            .0
+            .push(relay_process(home.path(), sock, &["--orca-cli", "status"]));
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
             run_probe(home.path()).unwrap().answer(),
@@ -1075,14 +1080,28 @@ mod tests {
         // The relay Orca leaves running: its terminals outlive the app.
         running.0.push(relay_process(
             home.path(),
+            sock,
             &["--detached", "--grace-time", "0", "--log-file", "relay.log"],
         ));
         assert_eq!(
             answer_with_relay(home.path(), "app not connected").unwrap(),
             serde_json::json!({"busy": false, "reason": alone})
         );
-        // While the app is connected, its SSH session runs the relay's client.
-        running.0.push(relay_process(home.path(), &["--connect"]));
+        // A client of another relay's socket, one that no longer runs, is not this app.
+        running.0.push(relay_process(
+            home.path(),
+            "relay-0000000000000000.sock",
+            &["--connect"],
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            run_probe(home.path()).unwrap().answer()["reason"],
+            alone.as_str()
+        );
+        // While the app is connected, its SSH session runs a client on the relay's socket.
+        running
+            .0
+            .push(relay_process(home.path(), sock, &["--connect"]));
         assert_eq!(
             answer_with_relay(home.path(), "app connected").unwrap(),
             serde_json::json!({"busy": false, "reason": connected})

@@ -99,6 +99,15 @@ def answer(call, deadline):
     return result["agents"], bool(result.get("truncated"))
 
 
+def sock_path(args):
+    # The value of `--sock-path` among the words of a relay's command line. The shell that
+    # starts a client quotes it.
+    for flag, value in zip(args, args[1:]):
+        if flag == "--sock-path":
+            return value.strip("'\"")
+    return None
+
+
 def relay():
     # Orca 1.4.224 and older run no orcad on an SSH host. They deploy a relay there instead,
     # `node relay.js --detached --sock-path ~/.orca-remote/relay-<version>/relay-<id>.sock`,
@@ -106,11 +115,11 @@ def relay():
     # session runs `relay.js --connect` with the same socket. A relay has no `agent list`, and
     # its own CLI bridge asks the app on the user's computer, not the sandbox, so the probe
     # never calls it. Its agents run in its terminals, which the tty signal counts. So this
-    # only names it, from the process list, without touching its socket: a connection would
-    # restart the relay's own idle timer. None: no relay of this user runs.
-    home = os.path.join(os.environ["HOME"], ".orca-remote", "relay-")
+    # only names it, from this user's processes, without touching its socket: a connection
+    # would restart the relay's own idle timer. None: no relay of this user's home runs.
+    prefix = os.path.join(os.environ["HOME"], ".orca-remote", "relay-")
     lines = subprocess.run(
-        ["ps", "-A", "-ww", "-o", "args="],
+        ["ps", "-ww", "-U", str(os.getuid()), "-o", "args="],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -118,13 +127,23 @@ def relay():
         check=True,
         text=True,
     ).stdout.splitlines()
-    mine = [line for line in lines if "relay.js" in line.split() and home in line]
-    if not any("--detached" in line.split() for line in mine):
+    detached = set()
+    clients = set()
+    for line in lines:
+        args = line.split()
+        if "relay.js" not in args:
+            continue
+        sock = sock_path(args)
+        if not sock or not sock.startswith(prefix):
+            continue
+        if "--detached" in args:
+            detached.add(sock)
+        elif "--connect" in args:
+            clients.add(sock)
+    if not detached:
         return None
-    connected = any(
-        "--connect" in line.split() and "--orca-cli" not in line.split() for line in mine
-    )
-    app = "app connected" if connected else "app not connected"
+    # The app is connected when a client runs on the socket of a relay that runs.
+    app = "app connected" if detached & clients else "app not connected"
     return (
         f"orca relay, no orcad (Orca 1.4.224 or older, {app}): "
         "its agents run in terminals, which the tty signal counts"
