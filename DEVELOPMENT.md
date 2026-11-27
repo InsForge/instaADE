@@ -26,6 +26,7 @@ The UI never calls the instabox API itself. Every action on a sandbox, the accou
 
 - On a Mac with a notch, a full menu bar hides the icon behind the notch. Make room in the menu bar, or use the popover that opens on launch.
 - `INSTABOX_API_URL` points the app at another API. `INSTABOX_API_KEY` signs in with an API key instead of the browser.
+- `INSTAADE_ADD_HOST_LINKS=1` opens the add-host links of Orca, Paseo and Paradev whatever the app's version, to try builds of those apps that have them (see [Add-host links](docs/ades.md#add-host-links)).
 
 ## Before a pull request
 
@@ -68,7 +69,7 @@ Pull requests that add an ADE are welcome. Read [How InstaADE works with each AD
 - UI: `src/ades.tsx` holds what the app does with each ADE (its badge, names and text), `src/mode.ts` the ADE the user picked, and `src/ade.ts` with `src/hero/` each ADE's look (logo and background). The switcher is `src/AdeSwitcher.tsx`.
 - Docs: add the ADE to the README's Supported ADEs and give it a section in `docs/ades.md`.
 
-A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. If the user adds the host by hand, it also needs the address to copy, and if its app needs a server on the sandbox, a setup that runs it (Paseo's daemon). A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host. A terminal ADE needs an install script that prints its version, a version check, and the command the SSH session runs.
+A pairing ADE needs an install script, a version check, a pairing step, and an idle probe that prints `{"busy": true}` or `{"busy": false}`. A link ADE needs a link and, if the sandbox needs one, a prep command. An SSH host ADE needs the text that tells the user how to connect the host. If the user adds the host by hand, it also needs the address to copy, and if its app needs a server on the sandbox, a setup that runs it (Paseo's daemon). When its app has a link that opens it on the host, give it an `AddHostLink` with the first version that takes it, and a host ADE the same. A host ADE needs a check that the host runs, the link to its host setup, the text that tells the user what to do there, and a link to the sandbox's host. A terminal ADE needs an install script that prints its version, a version check, and the command the SSH session runs.
 
 An ADE whose app gets an SSH token (in a link, a host or the clipboard) must check in `Ade::verify` that the app is the real one, as cmux, Orca, Paradev and Paseo do. A terminal ADE gives the token to the OpenSSH client only, on its command line, as Open in Terminal does, so it has no app to check. It runs the client `locate` found, by its path, and builds the arguments with `ssh::terminal_args`, which refuses a host or token with anything a shell could run. `ssh::open_in_terminal` checks every argument again before any of it reaches a terminal.
 

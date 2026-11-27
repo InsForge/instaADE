@@ -4,8 +4,9 @@
 //! run there: Paseo installs and starts nothing on the host. So InstaADE installs the Paseo CLI
 //! on the sandbox and runs its daemon as a service on 127.0.0.1:6767. On this computer it
 //! writes the sandbox as a host in the SSH config (`ssh_config`, as for Orca), copies
-//! `ssh://<alias>` and starts Paseo. Paseo has no link that adds a host, so the user adds it
-//! once, under Settings, Switch host, Add host, Remote SSH.
+//! `ssh://<alias>` and starts Paseo, and the user adds the host once, under Settings, Switch
+//! host, Add host, Remote SSH. A Paseo that takes `paseo://hosts/add` links (none released yet)
+//! gets that link instead, which opens the Remote SSH form filled in.
 //! On this computer: find the real Paseo app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Paseo.exe` and the
 //! version in its file header, read as for Orca.
@@ -14,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Platform, SshHost, orca, t3};
+use crate::ade::{AddHostLink, Platform, SshHost, orca, percent_encode, t3};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "paseo";
@@ -23,14 +24,38 @@ pub const SHORT_NAME: &str = "Paseo";
 /// Paseo also ships for Linux, where InstaADE does not run.
 pub const PLATFORMS: &[Platform] = &[Platform::MacOs, Platform::Windows];
 pub const DOWNLOAD_URL: &str = "https://github.com/getpaseo/paseo/releases/latest";
-/// Paseo's `paseo://` links open agents, not hosts, so the app opens none.
-pub const URL_SCHEME: &str = "";
+/// The scheme of Paseo's links. The app opens one only in the Paseo it checked
+/// (`ADD_HOST_LINK`).
+pub const URL_SCHEME: &str = "paseo";
 
 pub const SSH_HOST: SshHost = SshHost {
     notice,
     address: Some(address),
     setup: Some(setup_script),
+    add_link: Some(ADD_HOST_LINK),
 };
+
+/// Paseo's link that opens Add host, Remote SSH with the host's address filled in
+/// (getpaseo/paseo discussion 10970). No Paseo release takes it yet.
+pub const ADD_HOST_LINK: AddHostLink = AddHostLink {
+    link: add_host_link,
+    notice: LINK_NOTICE,
+    since: None,
+};
+
+/// What the user does in Paseo once the link opened it. On its first start, Paseo shows its
+/// setup (Welcome to Paseo) before the form.
+pub const LINK_NOTICE: &str =
+    "In Paseo, finish or skip its setup if it shows one, then click Connect.";
+
+/// `paseo://hosts/add?ssh=<ssh://alias>`: Paseo opens Add host, Remote SSH with the address
+/// filled in, and adds the host once the user clicks Connect. The address holds no token.
+pub fn add_host_link(alias: &str) -> String {
+    format!(
+        "{URL_SCHEME}://hosts/add?ssh={}",
+        percent_encode(&address(alias))
+    )
+}
 
 /// The port the daemon listens on, on the sandbox's loopback only. Paseo's SSH transport
 /// reaches it there by default.
@@ -283,6 +308,22 @@ mod tests {
             SSH_HOST.setup.map(|s| s("0.17.4")),
             Some(setup_script("0.17.4"))
         );
+    }
+
+    #[test]
+    fn the_add_host_link_holds_the_address_and_nothing_else() {
+        assert_eq!(
+            add_host_link("instabox-dev-1"),
+            "paseo://hosts/add?ssh=ssh%3A%2F%2Finstabox-dev-1"
+        );
+        // Nothing in the alias can add a parameter or leave the value.
+        assert_eq!(
+            add_host_link("a&b=c#d"),
+            "paseo://hosts/add?ssh=ssh%3A%2F%2Fa%26b%3Dc%23d"
+        );
+        let l = SSH_HOST.add_link.unwrap();
+        assert_eq!((l.link)("x"), add_host_link("x"));
+        assert_eq!((l.notice, l.since), (LINK_NOTICE, None));
     }
 
     #[test]

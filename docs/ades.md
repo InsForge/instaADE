@@ -52,6 +52,8 @@ Host instabox-dev-1
 - On macOS, InstaADE starts only the real Orca app in `/Applications` or `~/Applications`. Its bundle identifier must be `com.stablyai.orca`, and `codesign` must find it signed with the Developer ID of team `6CX3WHS9HZ`. InstaADE checks this when it looks for Orca, again before it wakes, creates or marks a sandbox for Orca, and again after the wake, right before it makes or loads the token.
 - On Windows, InstaADE starts `Orca.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Orca` or `%ProgramFiles%\Orca`). It starts it only when the file's version resource names the product Orca and holds a version, read from the file each time. There is no signature check on Windows yet.
 
+A change to Orca ([stablyai/orca#48035](https://github.com/stablyai/orca/pull/48035)) adds the link `orca://ssh/connect?alias=<alias>`. It shows "Connect to <alias>?", and Connect connects the host. No Orca release has it yet. Once one does, InstaADE writes the host as above, then opens that link in the checked Orca instead of only starting it. The link names the alias only: the token stays in the host. See [Add-host links](#add-host-links).
+
 Orca has no idle probe, so the sandbox sleeps by its terminals and CPU.
 
 ## Paradev (macOS)
@@ -65,6 +67,8 @@ Paradev (formerly Superset) runs a sandbox as one of its hosts, and sets the hos
 **Open in Paradev** wakes the sandbox, since Paradev does not wake a sleeping one, reads its machine id, and opens `superset://new-workspace?host=<host id>`, with the host id Paradev derives from that machine id. **Reconnect** checks the host again.
 
 The address holds an SSH token, so InstaADE copies it, and opens Paradev's links, only for the real Paradev app in `/Applications` or `~/Applications`, named `Paradev.app` or, before the rename, `Superset.app`. Its bundle identifier must be `com.superset.desktop` (the Canary build is not supported), and `codesign` must find it signed with Paradev's Developer ID (team `2HVBK29S3C`). InstaADE checks this when it looks for Paradev, again before it wakes, creates or marks a sandbox for Paradev, and again right before it makes or loads the token or opens a link. It never opens a `superset://` link in another handler. A Mac can have both `Paradev.app` and `Superset.app`, with the same identifier. InstaADE then uses the newest, and opens the links in it by its path, never in the copy macOS would pick.
+
+A proposed change to Paradev ([ParadevAI/Paradev#10245](https://github.com/ParadevAI/Paradev/issues/10245)) adds the link `superset://settings/hosts?ssh=<address>`. It opens **Set up a host over SSH** with the address filled in, and **Set up** sets the host up. No Paradev release has it yet. Once one does, step 1 puts the address in that link, opened only in the checked Paradev, and nothing goes on the clipboard. In step 2 you click **Set up**. See [Add-host links](#add-host-links).
 
 Paradev has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
@@ -87,6 +91,8 @@ Paseo reads the host, which holds an SSH token, so InstaADE starts only the real
 
 - On macOS, Paseo in `/Applications` or `~/Applications`. Its bundle identifier must be `sh.paseo.desktop`, and `codesign` must find it signed with Paseo's Developer ID (team `99ZMJMKU9Y`). InstaADE checks this when it looks for Paseo, again before it wakes, creates or marks a sandbox for Paseo, and again after the wake, right before it makes or loads the token.
 - On Windows, `Paseo.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Paseo` or `%ProgramFiles%\Paseo`). InstaADE starts it only when the file's version resource names the product Paseo and holds a version, read from the file each time. Paseo's Windows app is not signed, so there is no signature to check.
+
+A proposed change to Paseo ([getpaseo/paseo discussion #10970](https://github.com/getpaseo/paseo/discussions/10970)) adds the link `paseo://hosts/add?ssh=<address>`. It opens **Add host**, **Remote SSH** with the address filled in, and **Connect** adds the host. No Paseo release has it yet. Once one does, step 3 opens that link with `ssh://instabox-<name>` in the checked Paseo, instead of copying the address and starting Paseo. Step 4 is then one click on **Connect**. See [Add-host links](#add-host-links).
 
 Paseo has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
 
@@ -119,6 +125,14 @@ InstaADE never updates Herdr on the sandbox. Run `herdr update` there to update 
 On your computer, InstaADE needs only the OpenSSH client: `/usr/bin/ssh` on macOS, and on Windows `ssh.exe` on the PATH, else in `System32\OpenSSH`. Settings shows its version next to Herdr. Without it, nothing wakes or changes, and InstaADE asks you to install the OpenSSH client.
 
 Herdr has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+
+## Add-host links
+
+Orca, Paseo and Paradev each get a link that opens the app on its own add-host step, filled in for the sandbox. You then confirm with one click there. None of these apps has released its link yet, so InstaADE keeps the steps above for every released version.
+
+- Each ADE module names the first app version that takes its link (`ADD_HOST_LINK.since` in `orca.rs`, `paseo.rs` and `paradev.rs`). It is unset until a release has the link. From that version on, InstaADE reads the app's version right before it opens the link.
+- `INSTAADE_ADD_HOST_LINKS=1` makes InstaADE open the links whatever the app's version, to try builds of these apps that have them.
+- A link opens only in the app InstaADE checked, as the other links do, never in another handler of its scheme. With no app, or one that fails the check, nothing opens.
 
 ## Several ADEs on one sandbox
 

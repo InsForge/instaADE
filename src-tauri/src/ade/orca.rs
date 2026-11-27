@@ -1,9 +1,10 @@
 //! Orca, a desktop app for coding agents. It reaches a sandbox over SSH by itself and installs
 //! its own server there under `~/.orca-remote` on the first connect, so InstaADE installs
-//! nothing and no versions must match. Orca has no link or command that adds an SSH host, but
-//! it imports the `Host` blocks of `~/.ssh/config`. So InstaADE writes the sandbox as a host
-//! there (`ssh_config`), starts Orca, and the user connects the host under Orca's Settings, SSH
-//! Hosts, after Import when Orca was already running.
+//! nothing and no versions must match. Orca imports the `Host` blocks of `~/.ssh/config`. So
+//! InstaADE writes the sandbox as a host there (`ssh_config`), starts Orca, and the user
+//! connects the host under Orca's Settings, SSH Hosts, after Import when Orca was already
+//! running. An Orca that takes `orca://ssh/connect` links (none released yet) gets that link
+//! instead, and asks the user to connect the host.
 //! On this computer: find the real Orca app and read its version. On macOS that is its bundle
 //! identifier, its signature and its `Info.plist`; on Windows the installed `Orca.exe` and the
 //! version in its file header.
@@ -14,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::ade::{Platform, SshHost};
+use crate::ade::{AddHostLink, Platform, SshHost, percent_encode};
 use crate::process::{command, run_bounded};
 
 pub const ID: &str = "orca";
@@ -22,14 +23,33 @@ pub const NAME: &str = "Orca";
 pub const SHORT_NAME: &str = "Orca";
 pub const PLATFORMS: &[Platform] = &[Platform::MacOs, Platform::Windows];
 pub const DOWNLOAD_URL: &str = "https://github.com/stablyai/orca/releases/latest";
-/// Orca takes no links, so the app opens none for it.
-pub const URL_SCHEME: &str = "";
+/// The scheme of Orca's links. The app opens one only in the Orca it checked (`ADD_HOST_LINK`).
+pub const URL_SCHEME: &str = "orca";
 
 pub const SSH_HOST: SshHost = SshHost {
     notice,
     address: None,
     setup: None,
+    add_link: Some(ADD_HOST_LINK),
 };
+
+/// Orca's link that asks the user to connect a host of the SSH config
+/// (stablyai/orca#48035). No Orca release takes it yet.
+pub const ADD_HOST_LINK: AddHostLink = AddHostLink {
+    link: connect_link,
+    notice: LINK_NOTICE,
+    since: None,
+};
+
+/// What the user does in Orca once the link opened it.
+pub const LINK_NOTICE: &str = "In Orca, click Connect, then open /data/home.";
+
+/// `orca://ssh/connect?alias=<alias>`: Orca shows "Connect to <alias>?" and connects the host
+/// of the SSH config with that alias once the user clicks Connect. It names the alias only: the
+/// token stays in the host's `User`.
+pub fn connect_link(alias: &str) -> String {
+    format!("{URL_SCHEME}://ssh/connect?alias={}", percent_encode(alias))
+}
 
 /// The sandbox's home, which the user opens in Orca once the host is connected.
 const SANDBOX_HOME: &str = "/data/home";
@@ -549,6 +569,23 @@ mod tests {
              listed, then connect it and open /data/home."
         );
         assert_eq!((SSH_HOST.notice)("x"), notice("x"));
+    }
+
+    #[test]
+    fn the_connect_link_names_only_the_alias() {
+        assert_eq!(
+            connect_link("instabox-dev-1"),
+            "orca://ssh/connect?alias=instabox-dev-1"
+        );
+        // Nothing in the alias can add a parameter or leave the value.
+        assert_eq!(
+            connect_link("a&b=c#d"),
+            "orca://ssh/connect?alias=a%26b%3Dc%23d"
+        );
+        assert!(LINK_NOTICE.contains(SANDBOX_HOME));
+        let l = SSH_HOST.add_link.unwrap();
+        assert_eq!((l.link)("x"), connect_link("x"));
+        assert_eq!((l.notice, l.since), (LINK_NOTICE, None));
     }
 
     #[test]
