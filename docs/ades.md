@@ -4,6 +4,8 @@ The README's [Supported ADEs](../README.md#supported-ades) says what you need an
 
 When an ADE's app is installed more than once, such as in both `/Applications` and `~/Applications`, InstaADE uses the real copy with the newest version. The version it shows is the copy it opens.
 
+Some ADEs get an activity probe in `/usr/local/lib/instabox/activity.d`, which tells instabox when the ADE is busy, so the sandbox sleeps only when it is idle. The ADE's setup installs it. When an ADE's Open runs nothing else on the sandbox (Paseo), Open also installs or updates its probe in the background, once per sandbox and probe version while InstaADE runs. Open never waits for it, and a failure only goes to the log: the next Open tries again. It does not run while a setup of the same sandbox runs.
+
 ## T3 Code
 
 InstaADE installs T3 at the same version as your T3 Code desktop app, then pairs them. On the sandbox it adds:
@@ -89,7 +91,7 @@ Paseo runs a daemon on every machine it works on, and its desktop app connects t
 3. InstaADE writes the sandbox as a host in `~/.ssh/instabox/config`, the same host as for [Orca](#orca), with the same `Include` line, token renewal and cleanup. Then it copies `ssh://instabox-<name>` and starts Paseo. The address holds no token: ssh reads the login from the host.
 4. In Paseo, open **Settings**, click **Switch host**, then **Add host** and **Remote SSH**. Paste the address as the **SSH host** and click **Connect**. Paseo keeps the host. The first time Paseo starts, it shows its setup (**Welcome to Paseo**) before its window: finish it or click **Skip setup**.
 
-**Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. It runs nothing on the sandbox. **Reconnect** runs the setup again, which starts a stopped daemon.
+**Open in Paseo** wakes the sandbox, writes the host, copies the address and starts Paseo. On the sandbox it only brings the probe up to date, in the background. **Reconnect** runs the setup again, which starts a stopped daemon and brings the probe up to date.
 
 InstaADE never updates or restarts a Paseo the sandbox already has: the daemon may be running agents, and Paseo's app and daemon work across versions. To update it, run `npm install -g @getpaseo/cli` on the sandbox, then `sudo systemctl restart paseo-instabox`.
 
@@ -100,7 +102,15 @@ Paseo reads the host, which holds an SSH token, so InstaADE starts only the real
 - On macOS, Paseo in `/Applications` or `~/Applications`. Its bundle identifier must be `sh.paseo.desktop`, and `codesign` must find it signed with Paseo's Developer ID (team `99ZMJMKU9Y`). InstaADE checks this when it looks for Paseo, again before it wakes, creates or marks a sandbox for Paseo, and again after the wake, right before it makes or loads the token.
 - On Windows, `Paseo.exe` where the installer puts it (`%LOCALAPPDATA%\Programs\Paseo` or `%ProgramFiles%\Paseo`). InstaADE starts it only when the file's version resource names the product Paseo and holds a version, read from the file each time. Paseo's Windows app is not signed, so there is no signature to check.
 
-Paseo has no idle probe yet, so the sandbox sleeps by its terminals and CPU.
+### The Paseo probe
+
+Paseo's daemon runs its agents without a terminal. Once you quit Paseo, the sandbox's terminals and CPU can look idle under a working agent, so the sandbox could sleep under it. The setup, which **Install Paseo** and **Reconnect** run, also installs an activity probe in `/usr/local/lib/instabox/activity.d/paseo`, or brings it up to date. **Open in Paseo** installs or updates the probe and the CLI link (below) in the background, so a sandbox set up before the probe existed gets it at its next Open.
+
+The probe asks the daemon on `127.0.0.1:6767` with the Paseo CLI: `paseo ls` for the agents, and `paseo permit ls` for the permissions and questions that wait for you. It runs with a short PATH, so the setup links the CLI as `~/.local/share/paseo-instabox/paseo`.
+
+- An agent keeps the sandbox awake while it runs or starts, or has a status the probe does not know.
+- An agent that waits for your permission or answer does not, so a question you forgot does not keep the sandbox awake.
+- Without a daemon, or with no agent at work, the probe says idle.
 
 ## Herdr
 
