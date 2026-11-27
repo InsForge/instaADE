@@ -225,6 +225,10 @@ pub struct SshToken {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
+    /// A background token (`ssh::Kind::Background`). False in the reply of a server that does
+    /// not know background tokens, which made an ordinary one.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

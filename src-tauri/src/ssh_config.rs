@@ -5,10 +5,10 @@
 //! the blocks it marked and that one `Include` line. Every other line stays as it is, with its
 //! own line end, and new blocks go after the last line InstaADE wrote.
 //!
-//! A block keeps its alias once written: the ADE knows the host by it. A new token of the
-//! sandbox rewrites the block's `User`, and deleting the sandbox in InstaADE removes it. The
-//! app renews the token of every sandbox with a block before it runs out
-//! (`Core::renew_ssh_hosts`).
+//! A block keeps its alias once written: the ADE knows the host by it. Its `User` is the
+//! sandbox's background token (`ssh::Kind::Background`): a new one rewrites it, and deleting
+//! the sandbox in InstaADE removes the block. The app renews the background token of every
+//! sandbox with a block before it runs out (`Core::renew_ssh_hosts`).
 
 use std::fs;
 use std::io::Write;
@@ -18,7 +18,7 @@ use std::sync::{Mutex, PoisonError};
 use anyhow::{Context, Result, bail};
 
 use crate::api::SshToken;
-use crate::ssh::SshTokenStore;
+use crate::ssh::{Kind, SshTokenStore};
 
 /// The line InstaADE puts first in `~/.ssh/config`.
 pub const INCLUDE: &str = "Include ~/.ssh/instabox/config";
@@ -511,9 +511,11 @@ fn split_option(line: &str) -> (&str, &str) {
     (&line[..end], rest)
 }
 
-/// A token store that keeps the hosts in step: a new token of a sandbox that has a host
-/// becomes the host's `User`, and clearing every token (an account boundary) removes every
-/// host InstaADE wrote.
+/// A token store that keeps the hosts in step: a new background token of a sandbox that has a
+/// host becomes the host's `User`, and clearing every token (an account boundary) removes every
+/// host InstaADE wrote. An ordinary token (the SSH command, Herdr, an agent sign-in) never
+/// goes into a host: the apps that use the hosts stay connected, so they get the background
+/// one.
 pub struct SyncedStore<S> {
     inner: S,
     home: PathBuf,
@@ -526,16 +528,18 @@ impl<S> SyncedStore<S> {
 }
 
 impl<S: SshTokenStore> SshTokenStore for SyncedStore<S> {
-    fn load(&self, id: &str) -> std::result::Result<Option<SshToken>, String> {
-        self.inner.load(id)
+    fn load(&self, id: &str, kind: Kind) -> std::result::Result<Option<SshToken>, String> {
+        self.inner.load(id, kind)
     }
 
-    /// A host that cannot take the new token keeps the stored token behind too, so the next
-    /// renewal makes another and tries the host again. The token in hand still works.
-    fn save(&self, id: &str, token: &SshToken) -> std::result::Result<(), String> {
-        update_login(&self.home, id, token)
-            .map_err(|e| format!("could not update the SSH host of sandbox {id}: {e:#}"))?;
-        self.inner.save(id, token)
+    /// A host that cannot take the new background token keeps the stored token behind too, so
+    /// the next renewal makes another and tries the host again. The token in hand still works.
+    fn save(&self, id: &str, kind: Kind, token: &SshToken) -> std::result::Result<(), String> {
+        if kind == Kind::Background {
+            update_login(&self.home, id, token)
+                .map_err(|e| format!("could not update the SSH host of sandbox {id}: {e:#}"))?;
+        }
+        self.inner.save(id, kind, token)
     }
 
     fn clear_all(&self) -> std::result::Result<(), String> {
@@ -558,6 +562,7 @@ mod tests {
             command: format!("ssh -p 2222 {token}@ssh.instabox.sh"),
             expires_at: None,
             host_key_fingerprint: None,
+            background: true,
         }
     }
 
@@ -951,34 +956,37 @@ Host instabox-dev-1
     fn a_failed_host_update_keeps_the_stored_token_behind() {
         let home = tempfile::tempdir().unwrap();
         let store = SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
+        let bg = Kind::Background;
         write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
-        store.save("m1", &tok("ibssh_a")).unwrap();
+        store.save("m1", bg, &tok("ibssh_a")).unwrap();
         // The hosts file cannot be read for a while: it is a folder.
         let path = hosts_path(home.path());
         let aside = path.with_extension("aside");
         fs::rename(&path, &aside).unwrap();
         fs::create_dir(&path).unwrap();
-        let e = store.save("m1", &tok("ibssh_b")).unwrap_err();
+        let e = store.save("m1", bg, &tok("ibssh_b")).unwrap_err();
         assert!(
             e.contains("could not update the SSH host of sandbox m1"),
             "{e}"
         );
         assert_eq!(
-            store.load("m1").unwrap().unwrap().token,
+            store.load("m1", bg).unwrap().unwrap().token,
             "ibssh_a",
             "not advanced"
         );
+        // An ordinary token never goes into the host, so the broken file does not stop it.
+        store.save("m1", Kind::Ordinary, &tok("ibssh_o")).unwrap();
         // A token the host cannot hold is refused the same way.
         fs::remove_dir(&path).unwrap();
         fs::rename(&aside, &path).unwrap();
-        assert!(store.save("m1", &tok("ibssh_b c")).is_err());
-        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_a");
+        assert!(store.save("m1", bg, &tok("ibssh_b c")).is_err());
+        assert_eq!(store.load("m1", bg).unwrap().unwrap().token, "ibssh_a");
         // Once the file is back, the next token goes into both.
-        store.save("m1", &tok("ibssh_b")).unwrap();
-        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_b");
+        store.save("m1", bg, &tok("ibssh_b")).unwrap();
+        assert_eq!(store.load("m1", bg).unwrap().unwrap().token, "ibssh_b");
         assert!(read(&path).contains("  User ibssh_b\n"));
         // A sandbox with no host saves any token: there is no host to keep in step.
-        store.save("m2", &tok("ibssh_x y")).unwrap();
+        store.save("m2", bg, &tok("ibssh_x y")).unwrap();
     }
 
     #[test]
@@ -993,23 +1001,49 @@ Host instabox-dev-1
     fn the_synced_store_moves_the_host_with_the_token_and_clears_it_on_sign_out() {
         let home = tempfile::tempdir().unwrap();
         let store = SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
+        let bg = Kind::Background;
         write_host(home.path(), "m1", "dev 1", &tok("ibssh_a")).unwrap();
-        store.save("m1", &tok("ibssh_new")).unwrap();
-        assert_eq!(store.load("m1").unwrap().unwrap().token, "ibssh_new");
+        store.save("m1", bg, &tok("ibssh_new")).unwrap();
+        assert_eq!(store.load("m1", bg).unwrap().unwrap().token, "ibssh_new");
         assert!(read(&hosts_path(home.path())).contains("  User ibssh_new\n"));
         // A token of a sandbox without a host writes no host.
-        store.save("m2", &tok("ibssh_b")).unwrap();
+        store.save("m2", bg, &tok("ibssh_b")).unwrap();
         assert_eq!(aliases(home.path()).unwrap().len(), 1);
+        store.save("m1", Kind::Ordinary, &tok("ibssh_o")).unwrap();
         store.clear_all().unwrap();
-        assert_eq!(store.load("m1").unwrap(), None);
+        assert_eq!(store.load("m1", bg).unwrap(), None);
+        assert_eq!(store.load("m1", Kind::Ordinary).unwrap(), None);
         assert!(aliases(home.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_token_never_goes_into_the_host() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
+        write_host(home.path(), "m1", "dev 1", &tok("ibssh_bg")).unwrap();
+        store
+            .save("m1", Kind::Background, &tok("ibssh_bg"))
+            .unwrap();
+        let before = read(&hosts_path(home.path()));
+        // The SSH command, Herdr or an agent sign-in gets a new ordinary token.
+        store
+            .save("m1", Kind::Ordinary, &tok("ibssh_plain"))
+            .unwrap();
+        assert_eq!(read(&hosts_path(home.path())), before);
+        assert!(before.contains("Host instabox-dev-1\n"), "{before}");
+        assert!(before.contains("  User ibssh_bg\n"), "{before}");
+        let stored = |kind| store.load("m1", kind).unwrap().unwrap().token;
+        assert_eq!(stored(Kind::Ordinary), "ibssh_plain");
+        assert_eq!(stored(Kind::Background), "ibssh_bg");
     }
 
     #[test]
     fn the_synced_store_with_no_hosts_file_touches_no_file() {
         let home = tempfile::tempdir().unwrap();
         let store = SyncedStore::new(MemorySshStore::default(), home.path().to_path_buf());
-        store.save("m1", &tok("ibssh_a")).unwrap();
+        for kind in [Kind::Ordinary, Kind::Background] {
+            store.save("m1", kind, &tok("ibssh_a")).unwrap();
+        }
         store.clear_all().unwrap();
         assert!(!home.path().join(".ssh").exists());
     }

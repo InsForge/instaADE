@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::ssh::Kind;
+
 /// Every ADE the app knows, in the order the app lists them.
 pub const ALL: &[Ade] = &[
     Ade::T3,
@@ -520,6 +522,22 @@ impl Ade {
             Ade::Paradev => Open::Host(paradev::HOST),
             Ade::Paseo => Open::SshHost(paseo::SSH_HOST),
             Ade::Herdr => Open::Terminal(herdr::TERMINAL),
+        }
+    }
+
+    /// Which SSH token of the sandbox the ADE gets. Background for an app that stays connected
+    /// on its own and sends heartbeats (cmux, Orca, Paseo), so an idle app does not keep the
+    /// sandbox awake. Ordinary for a login the user starts in a terminal (Herdr) and for
+    /// Paradev, whose host reaches Paradev through its relay and uses the SSH address only to
+    /// be set up. None: the ADE pairs and gets no token (T3).
+    pub fn ssh_token(self) -> Option<Kind> {
+        match self {
+            Ade::T3 => None,
+            Ade::Cmux => Some(Kind::Background),
+            Ade::Orca => Some(Kind::Background),
+            Ade::Paradev => Some(Kind::Ordinary),
+            Ade::Paseo => Some(Kind::Background),
+            Ade::Herdr => Some(Kind::Ordinary),
         }
     }
 
@@ -1055,6 +1073,31 @@ mod tests {
             // The probe its setup installs, for an ADE whose Open runs nothing on the sandbox.
             assert_eq!(a.probe_on_open().map(|o| o.probe), a.probe());
             assert!(matches!(a.open(), Open::SshHost(_) | Open::Host(_)));
+        }
+    }
+
+    #[test]
+    fn apps_that_stay_connected_get_the_background_token_and_logins_the_ordinary_one() {
+        let of = |kind: Option<Kind>| -> Vec<Ade> {
+            ALL.iter()
+                .copied()
+                .filter(|a| a.ssh_token() == kind)
+                .collect()
+        };
+        assert_eq!(
+            of(Some(Kind::Background)),
+            [Ade::Cmux, Ade::Orca, Ade::Paseo]
+        );
+        assert_eq!(of(Some(Kind::Ordinary)), [Ade::Paradev, Ade::Herdr]);
+        assert_eq!(of(None), [Ade::T3]);
+        for a in ALL {
+            let want = match a.open() {
+                // The app connects by itself, from a link or a host in the SSH config.
+                Open::Link(_) | Open::SshHost(_) => Some(Kind::Background),
+                Open::Host(_) | Open::Terminal(_) => Some(Kind::Ordinary),
+                Open::Pair(_) => None,
+            };
+            assert_eq!(a.ssh_token(), want, "{a:?}");
         }
     }
 
