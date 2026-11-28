@@ -2,7 +2,8 @@
 # instabox activity probe for T3 Code (the instabox idle-suspend contract). instabox-guest-agent
 # runs it as the machine user (UID 1000) with a 5 s timeout and reads one JSON line:
 #   {"busy": bool, "seq": <last orchestration event>, "reason": "..."}
-# A failure, a timeout or anything else on stdout counts as busy.
+# A failure, a timeout or anything else on stdout counts as idle on the server, which then goes
+# by tty and cpu: the guest agent reports such a probe busy, and the server ignores a failed probe.
 #
 # It reads the T3 server's own database read-only instead of running
 # `t3 thread list`: that command covers one project per call (T3 0.1.2 has no
@@ -29,6 +30,10 @@ def say(busy, reason, seq=None):
     if seq is not None:
         out["seq"] = seq
     print(json.dumps(out))
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def base_dir():
@@ -90,7 +95,7 @@ def main():
     if n == 0:
         say(False, "no active runs", seq)
     else:
-        say(True, f"{n} runs active ({','.join(s for s, _ in busy)})", seq)
+        say(True, f"{plural(n, 'run')} active ({','.join(s for s, _ in busy)})", seq)
 
 
 if __name__ == "__main__":
