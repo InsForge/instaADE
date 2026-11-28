@@ -1067,9 +1067,18 @@ impl Runtime {
         quiet(&self.last_use) && quiet(&self.last_state_move)
     }
 
+    /// When the last user action and the last orchestration event came: what `idle` reads.
+    fn activity(&self) -> (Instant, Instant) {
+        (
+            *self.last_use.lock().unwrap(),
+            *self.last_state_move.lock().unwrap(),
+        )
+    }
+
     /// Releases the sandbox once it is idle and no agent works: captures its state, then
-    /// publishes `Stopped`, so every session closes its upstream socket. A user action during
-    /// the capture calls it off. `last_check`: when a capture last found an agent working.
+    /// publishes `Stopped`, so every session closes its upstream socket. A user action or an
+    /// orchestration event during the capture calls it off. `last_check`: when a capture last
+    /// found an agent working.
     pub async fn maybe_release(&self, last_check: &mut Option<Instant>) {
         if self.power() != Power::Running || self.released() || !self.idle() {
             return;
@@ -1077,7 +1086,7 @@ impl Runtime {
         if last_check.is_some_and(|t| t.elapsed() < self.tuning.busy_recheck) {
             return;
         }
-        let mark = *self.last_use.lock().unwrap();
+        let mark = self.activity();
         match self.capture().await {
             Ok(Captured::Done) => {}
             Ok(Captured::Busy(n)) => {
@@ -1091,7 +1100,7 @@ impl Runtime {
         let Ok(_wake) = self.waking.try_lock() else {
             return;
         };
-        if *self.last_use.lock().unwrap() != mark || self.power() != Power::Running {
+        if self.activity() != mark || self.power() != Power::Running {
             return;
         }
         self.released.store(true, Ordering::SeqCst);

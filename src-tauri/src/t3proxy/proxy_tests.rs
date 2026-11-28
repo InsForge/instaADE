@@ -61,6 +61,9 @@ struct FakeT3 {
     refuse_renewal: AtomicBool,
     /// Requests that came with a bearer token although DPoP was in use.
     bearer_seen: AtomicUsize,
+    /// Reads of the shell over HTTP (the capture's), and a gate a test holds to keep one open.
+    shell_reads: AtomicUsize,
+    shell_gate: tokio::sync::Mutex<()>,
 }
 
 impl FakeT3 {
@@ -81,6 +84,8 @@ impl FakeT3 {
             renewals: AtomicUsize::new(0),
             refuse_renewal: AtomicBool::new(false),
             bearer_seen: AtomicUsize::new(0),
+            shell_reads: AtomicUsize::new(0),
+            shell_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -264,6 +269,8 @@ async fn up_shell(State(t3): State<Arc<FakeT3>>, headers: HeaderMap) -> Response
     if !t3.authorized("GET", "/api/orchestration/shell", &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    t3.shell_reads.fetch_add(1, Ordering::SeqCst);
+    drop(t3.shell_gate.lock().await);
     let threads = if t3.working.load(Ordering::SeqCst) {
         json!([{"id": "t1", "activeRunId": "r1"}])
     } else {
@@ -607,6 +614,44 @@ async fn an_idle_sandbox_is_released_and_the_next_action_takes_it_back() {
     assert_eq!(count(&p.t3.connections), 2);
     assert!(!p.rt.released());
     assert_eq!(count(&p.t3.bearer_seen), 0, "DPoP all the way");
+}
+
+#[tokio::test]
+async fn an_orchestration_event_during_the_capture_calls_off_the_release() {
+    let p = proxy("running", true, Duration::from_millis(400)).await;
+    // The capture starts once the sandbox is idle; its shell read is held open.
+    let gate = p.t3.shell_gate.lock().await;
+    let mut ws = t3_code(p.port).await;
+    send(
+        &mut ws,
+        request("1", "orchestration.subscribeShell", json!({})),
+    )
+    .await;
+    assert_eq!(next(&mut ws).await["requestId"], "1");
+    assert_eq!(count(&p.t3.open), 1);
+    eventually("the capture reads the shell", || {
+        count(&p.t3.shell_reads) == 1
+    })
+    .await;
+    // An agent starts meanwhile: T3 sends an orchestration event.
+    p.rt.state_moved();
+    drop(gate);
+    eventually("the capture ends", || {
+        p.rt.cache.lock().unwrap().capture.is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !p.rt.released(),
+        "released on a capture older than the event"
+    );
+    assert_eq!(p.rt.power(), Power::Running);
+    assert_eq!(count(&p.t3.open), 1, "the upstream stays open");
+
+    // Quiet for `idle_after` again: the next capture lets it go.
+    eventually("released later", || p.rt.released()).await;
+    assert_eq!(count(&p.t3.shell_reads), 2);
+    eventually("the upstream socket closes", || count(&p.t3.open) == 0).await;
 }
 
 #[tokio::test]
