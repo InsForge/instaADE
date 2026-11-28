@@ -712,8 +712,9 @@ pub struct Core {
     renewing: std::sync::atomic::AtomicBool,
     /// The sandboxes and ADEs whose probe an Open installs now (`refresh_probe`).
     probing: Mutex<HashSet<(String, Ade)>>,
-    /// The T3 local proxy (prototype). Set at startup only with `INSTAADE_T3_PROXY`.
-    t3_proxy: OnceLock<Arc<t3proxy::Hub>>,
+    /// The T3 local proxy (prototype), with the `INSTAADE_T3_PROXY` it was started with. Set at
+    /// startup only when that is on.
+    t3_proxy: OnceLock<(Arc<t3proxy::Hub>, t3proxy::Gate)>,
     /// Test only: the probe installs Opens started, so a test can wait for them.
     #[cfg(test)]
     probe_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -960,10 +961,10 @@ impl Core {
         self.client().ok()
     }
 
-    /// Turns the T3 local proxy on (prototype, `INSTAADE_T3_PROXY`): Open in T3 Code and Pair
-    /// again pair T3 Code with it from here on.
-    pub fn set_t3_proxy(&self, hub: Arc<t3proxy::Hub>) {
-        let _ = self.t3_proxy.set(hub);
+    /// Turns the T3 local proxy on (prototype, `INSTAADE_T3_PROXY` as `gate`): Open in T3 Code
+    /// and Pair again pair T3 Code with it from here on.
+    pub fn set_t3_proxy(&self, hub: Arc<t3proxy::Hub>, gate: t3proxy::Gate) {
+        let _ = self.t3_proxy.set((hub, gate));
     }
 
     /// The T3 proxy when it pairs `ade` with T3 Code at `desktop`: only T3, only with the flag,
@@ -972,8 +973,8 @@ impl Core {
         if ade != Ade::T3 {
             return None;
         }
-        let hub = self.t3_proxy.get()?;
-        if !t3proxy::Gate::from_env().takes(desktop) {
+        let (hub, gate) = self.t3_proxy.get()?;
+        if !gate.takes(desktop) {
             self.log(format!(
                 "t3 proxy: T3 Code {} is not a version the proxy was tried with; pairing directly",
                 desktop.unwrap_or("(unknown)")
@@ -2154,11 +2155,14 @@ impl Core {
             // and gets no link when that could not bring its setup up to date.
             let desktop = self.read_in(account, |i| i.sync_version(ade)).flatten();
             let link = if let Some(hub) = self.t3_proxy_for(ade, desktop.as_deref()) {
-                // Prototype: T3 Code pairs with the sandbox's local proxy, which talks to T3 with
-                // a bearer session: no sync is needed for the pairing.
-                sandbox::ensure_running(&client, id)
-                    .await
-                    .map_err(ErrorView::from)?;
+                // Prototype: T3 Code pairs with the sandbox's local proxy. The proxy pairs with
+                // T3 there with DPoP, which needs the current setup just as T3 Code would: the
+                // same sync first, the same errors.
+                connect::ready_for_pairing_again(&client, ade, id, desktop.as_deref(), |v, out| {
+                    self.record_sync(id, v, out, account)
+                })
+                .await
+                .map_err(ErrorView::from)?;
                 self.proxy_pair_link(&hub, &client, id, account).await?
             } else {
                 connect::pair_again(&client, ade, id, desktop.as_deref(), |v, out| {
@@ -5016,6 +5020,94 @@ mod tests {
             open_after_refresh("0.1.10", "t3 v0.1.10\n", 3, "T3 is busy, update deferred").await;
         assert_eq!(core.pair_again("m1", None).await, Ok(()));
         assert_eq!(pairs(&server.received_requests().await.unwrap()), 2);
+    }
+
+    /// Pair again through the T3 proxy (`INSTAADE_T3_PROXY=1`, T3 Code 0.1.13) on a sandbox
+    /// with T3 0.1.13 and an older setup, whose refresh exits `code` with `stderr`. The proxy's
+    /// own pairing fails here (the sandbox's descriptor answers 404): what matters is whether
+    /// the refresh came first. The core's result and the API requests, in order.
+    async fn pair_again_through_the_proxy(
+        code: i32,
+        stderr: &str,
+    ) -> (Arc<Core>, Res<()>, Vec<wiremock::Request>) {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (server, base) =
+            cmux_server(serde_json::json!({"instabox-bridge": "t3", "instabox-ades": "t3"})).await;
+        for (cmd, stdout, code, stderr) in [
+            ("t3 --version", "t3 v0.1.13\n", 0, ""),
+            (r#""cmd":"set -eu\nprobe="#, "", code, stderr),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/machines/m1/exec"))
+                .and(body_string_contains(cmd))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"stdout": stdout, "stderr": stderr, "exitCode": code}),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/machines/m1/ports"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"id": "p1", "port": 3774, "url": server.uri(), "access": "public"}
+            )))
+            .mount(&server)
+            .await;
+        let (core, _opened) = core_full(
+            base.clone(),
+            Arc::new(MemoryKeyStore::default()),
+            Arc::new(MemorySshStore::default()),
+            PathBuf::from("/nonexistent"),
+        );
+        sign_in_as(&core, &base, 7);
+        core.update(|i| {
+            i.state.set_desktop(Ade::T3, Some("0.1.13".into()));
+            i.data.connected.insert("m1".into());
+        });
+        core.refresh(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let hub = t3proxy::Hub::new(
+            dir.path().to_path_buf(),
+            Arc::new(t3proxy::hub::Instabox::new(Arc::new(|| None::<Client>))),
+            Arc::new(t3proxy::hub::MemoryTokenStore::default()),
+            t3proxy::runtime::Tuning::default(),
+            false,
+        );
+        core.set_t3_proxy(hub, t3proxy::Gate::Tested);
+        let r = core.pair_again("m1", None).await;
+        (core, r, server.received_requests().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn pair_again_through_the_t3_proxy_brings_an_old_setup_up_to_date_first() {
+        let refresh = |r: &wiremock::Request| {
+            String::from_utf8_lossy(&r.body).contains(r#""cmd":"set -eu\nprobe="#)
+        };
+        let publish = |r: &wiremock::Request| r.url.path().ends_with("/ports");
+        // T3 busy: the established busy error, and the proxy is not asked to pair.
+        let (core, r, requests) =
+            pair_again_through_the_proxy(3, "T3 is busy, update deferred").await;
+        let e = r.unwrap_err();
+        assert_eq!(
+            (e.kind, e.message.as_str()),
+            (crate::errors::ErrorKind::AdeBusy, BUSY)
+        );
+        assert_eq!(core.state().error.map(|e| e.message).as_deref(), Some(BUSY));
+        assert!(requests.iter().any(refresh), "the refresh ran");
+        assert!(!requests.iter().any(publish), "no pairing");
+        // T3 idle: the setup is refreshed, then the proxy pairs.
+        let (_core, r, requests) = pair_again_through_the_proxy(0, "").await;
+        let refreshed = requests.iter().position(refresh).expect("the refresh ran");
+        let published = requests.iter().position(publish).expect("the proxy paired");
+        assert!(refreshed < published, "refreshed before the pairing");
+        assert!(
+            r.unwrap_err()
+                .message
+                .starts_with("The T3 proxy could not pair"),
+            "the proxy's own pairing, against a fake descriptor"
+        );
     }
 
     #[tokio::test]

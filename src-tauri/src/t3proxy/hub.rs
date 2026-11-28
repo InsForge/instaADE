@@ -443,7 +443,7 @@ impl Hub {
         }
         if !self.allow_bearer {
             bail!(
-                "T3 on this sandbox has no DPoP sessions (T3 older than 0.1.11). Update T3 Code, or start InstaADE with INSTAADE_T3_PROXY=any to use a bearer session."
+                "T3 on this sandbox has no DPoP sessions (T3 older than 0.1.11). Use Open in T3 Code, which updates it to this T3 Code's version while its agent is idle, or start InstaADE with INSTAADE_T3_PROXY=any to use a bearer session."
             );
         }
         match saved {
