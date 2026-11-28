@@ -490,6 +490,19 @@ pub async fn pair_again(
     desktop: Option<&str>,
     synced: impl FnOnce(&str, Option<&SyncOutcome>),
 ) -> Result<String, SandboxError> {
+    ready_for_pairing_again(client, ade, id, desktop, synced).await?;
+    pair_link(client, ade, id).await
+}
+
+/// What Pair again does before it makes a link, whoever makes it (`pair_again`, or the T3
+/// proxy): wakes the sandbox and syncs it when the pairing needs it. An error: no link.
+pub async fn ready_for_pairing_again(
+    client: &Client,
+    ade: Ade,
+    id: &str,
+    desktop: Option<&str>,
+    synced: impl FnOnce(&str, Option<&SyncOutcome>),
+) -> Result<(), SandboxError> {
     ensure_running(client, id).await?;
     if let Some(v) = desktop
         && let Some((out, pairing)) = sync_if_pairing_needs_it(client, ade, id, v).await
@@ -497,7 +510,7 @@ pub async fn pair_again(
         synced(v, out.as_ref().ok());
         pairing?;
     }
-    pair_link(client, ade, id).await
+    Ok(())
 }
 
 #[cfg(test)]

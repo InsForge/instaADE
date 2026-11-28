@@ -259,6 +259,8 @@ mod tests {
             id: "m1".into(),
             name: "box".into(),
             state: state.into(),
+            desired_state: None,
+            revision: None,
             template: TemplateRef { id: "t".into() },
             spec: MachineSpec {
                 vcpus: 4,
@@ -268,6 +270,7 @@ mod tests {
             max_run_minutes: -1,
             run_started_at: None,
             cooldown_until: None,
+            auto_suspended_at: None,
             metadata: Default::default(),
             org_id: String::new(),
             free: false,
