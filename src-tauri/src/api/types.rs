@@ -24,6 +24,10 @@ pub struct Machine {
     pub id: String,
     pub name: String,
     pub state: String,
+    /// What the sandbox is headed for: `suspended` or `stopped` while a pause or stop is queued
+    /// or under way.
+    #[serde(default)]
+    pub desired_state: Option<String>,
     /// Moves on with every lifecycle change (a pause, a resume).
     #[serde(default)]
     pub revision: Option<i64>,

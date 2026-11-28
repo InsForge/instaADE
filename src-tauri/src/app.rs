@@ -2652,6 +2652,7 @@ mod tests {
             id: id.into(),
             name: format!("name-{id}"),
             state: state.into(),
+            desired_state: None,
             revision: None,
             template: TemplateRef { id: tpl.into() },
             spec: spec(4, 8192),

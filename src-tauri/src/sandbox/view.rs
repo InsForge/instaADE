@@ -259,6 +259,7 @@ mod tests {
             id: "m1".into(),
             name: "box".into(),
             state: state.into(),
+            desired_state: None,
             revision: None,
             template: TemplateRef { id: "t".into() },
             spec: MachineSpec {

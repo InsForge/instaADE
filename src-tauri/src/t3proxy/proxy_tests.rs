@@ -669,16 +669,11 @@ async fn a_sleeping_sandbox_answers_upkeep_here_and_wakes_for_the_unknown() {
     );
 }
 
-#[tokio::test]
-async fn a_refused_tunnel_reaches_t3_code_with_its_headers_and_body() {
-    let p = proxy("running", true, Duration::from_secs(60)).await;
-    // T3 Code's locality probe: a WebSocket upgrade, which T3 refuses for a port where nothing
-    // listens. A plain client reads the whole answer.
-    let res = reqwest::Client::new()
-        .get(format!(
-            "http://127.0.0.1:{}/api/preview/tunnel?port=9",
-            p.port
-        ))
+/// T3 Code's locality probe: a WebSocket upgrade of `/api/preview/tunnel`, which T3 refuses for
+/// a port where nothing listens. A plain client reads the whole answer.
+async fn tunnel_probe(port: u16) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/api/preview/tunnel?port=9"))
         .header("authorization", format!("Bearer {CLIENT_TOKEN}"))
         .header("connection", "upgrade")
         .header("upgrade", "websocket")
@@ -686,7 +681,13 @@ async fn a_refused_tunnel_reaches_t3_code_with_its_headers_and_body() {
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_refused_tunnel_reaches_t3_code_with_its_headers_and_body() {
+    let p = proxy("running", true, Duration::from_secs(60)).await;
+    let res = tunnel_probe(p.port).await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         res.headers()
@@ -702,9 +703,36 @@ async fn a_refused_tunnel_reaches_t3_code_with_its_headers_and_body() {
     assert_eq!(p.control.wakes(), 0);
 }
 
+/// A person's action: archiving a chat.
+fn archive(id: &str) -> Value {
+    request(
+        id,
+        "orchestration.dispatchCommand",
+        json!({"type": "thread.archive", "commandId": "c1", "threadId": "t1"}),
+    )
+}
+
 #[tokio::test]
-async fn a_sandbox_its_owner_paused_wakes_only_for_a_person() {
-    let p = proxy("suspended", false, Duration::from_secs(60)).await;
+async fn a_sandbox_that_paused_itself_wakes_for_an_action_and_for_the_tunnel() {
+    let p = proxy("suspended", true, Duration::from_secs(60)).await;
+    let mut ws = t3_code(p.port).await;
+    send(&mut ws, archive("1")).await;
+    let answer = next(&mut ws).await;
+    assert_eq!(answer["requestId"], "1");
+    assert_eq!(answer["exit"]["_tag"], "Success");
+    assert_eq!(p.control.wakes(), 1);
+
+    let p = proxy("suspended", true, Duration::from_secs(60)).await;
+    let res = tunnel_probe(p.port).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(res.headers().contains_key("x-t3-tunnel-port-refused"));
+    assert_eq!(p.control.wakes(), 1);
+}
+
+/// instabox's rule for any use: a sandbox its owner paused or stopped is not woken, and an
+/// action gets "Sandbox offline" with what to do. `state` is how it was left.
+async fn an_owner_s_pause_holds(state: &str, says: &str) {
+    let p = proxy(state, false, Duration::from_secs(60)).await;
     let mut ws = t3_code(p.port).await;
     // What T3 Code asks on its own as it connects waits, unanswered.
     send(
@@ -713,26 +741,46 @@ async fn a_sandbox_its_owner_paused_wakes_only_for_a_person() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(p.control.wakes(), 0);
-    // A person's action wakes it; what waited goes upstream too.
-    let archive = json!({"type": "thread.archive", "commandId": "c1", "threadId": "t1"});
+    // A person's action fails with what to do; what waited still waits.
+    send(&mut ws, archive("2")).await;
+    let answer = next(&mut ws).await;
+    assert_eq!(answer["requestId"], "2");
+    let text = answer["exit"]["cause"][0]["defect"].as_str().unwrap();
+    assert!(text.starts_with("Sandbox offline: qa "), "{text}");
+    assert!(text.contains(says), "{text}");
+    // So does a message, which a sandbox that paused itself takes in to send after its wake.
+    let message = json!({"type": "message.dispatch", "commandId": "c2", "threadId": "t1"});
     send(
         &mut ws,
-        request("2", "orchestration.dispatchCommand", archive),
+        request("3", "orchestration.dispatchCommand", message),
     )
     .await;
-    let mut seen = Vec::new();
-    for _ in 0..2 {
-        seen.push(
-            next(&mut ws).await["requestId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        );
-    }
-    seen.sort();
-    assert_eq!(seen, vec!["1", "2"]);
+    let answer = next(&mut ws).await;
+    assert_eq!(answer["requestId"], "3");
+    assert_eq!(answer["exit"]["cause"][0]["defect"].as_str(), Some(text));
+    assert!(p.rt.cache.lock().unwrap().deferred_commands.is_empty());
+    // The tunnel answers as instabox does for such a sandbox's public port.
+    let res = tunnel_probe(p.port).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.text().await.unwrap(), text);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(p.control.wakes(), 0);
+    assert_eq!(count(&p.t3.connections), 0);
+
+    // Open in T3 Code is its owner's start: it resumes it, and what waited goes upstream.
+    p.rt.ensure_awake_for_open().await.unwrap();
     assert_eq!(p.control.wakes(), 1);
+    assert_eq!(next(&mut ws).await["requestId"], "1");
+}
+
+#[tokio::test]
+async fn a_sandbox_its_owner_paused_stays_paused() {
+    an_owner_s_pause_holds("suspended", "Resume it first: instabox resume qa").await;
+}
+
+#[tokio::test]
+async fn a_sandbox_its_owner_stopped_stays_stopped() {
+    an_owner_s_pause_holds("stopped", "Start it first: instabox start qa").await;
 }
 
 #[tokio::test]

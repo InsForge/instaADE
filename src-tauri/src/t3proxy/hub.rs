@@ -492,9 +492,10 @@ impl Hub {
                 self.start(record, credential.clone()).await?
             }
         };
-        // Open is a person: the sandbox is held again, released or not.
+        // Open is its owner: the sandbox is held again, released or not, and resumed or started
+        // whatever paused it.
         rt.user_action();
-        if let Err(e) = rt.ensure_awake().await {
+        if let Err(e) = rt.ensure_awake_for_open().await {
             log_warn!("{id}: {e:#}");
         }
         // T3 refuses a session whose data was reset: one new session, then give up.

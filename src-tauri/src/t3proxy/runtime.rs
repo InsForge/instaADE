@@ -5,7 +5,11 @@
 //!
 //! - Power comes from instabox: a read of the sandbox (`GET /v1/machines/{id}`), which
 //!   instabox does not count as use, every `Tuning::poll`.
-//! - A wake is `sandbox::ensure_running` (resume or start), then the T3 server answering.
+//! - A wake is `sandbox::ensure_running` (resume or start), then the T3 server answering. The
+//!   proxy wakes a sandbox only as instabox wakes one for any use (SSH, a public port request,
+//!   raw TCP): one that paused itself (`autoSuspendedAt`) resumes; one its owner paused or
+//!   stopped, or with a pause or stop on the way, stays offline (`Offline`) until its owner
+//!   resumes or starts it. InstaADE's Open in T3 Code is such a start (`ensure_awake_for_open`).
 //! - Upstream the proxy uses a DPoP session of its own (`dpop`): every request and WebSocket
 //!   upgrade gets a fresh proof, and the one-hour token is renewed before it runs out while the
 //!   proxy holds the sandbox, never while it is released or asleep (that request would wake it;
@@ -60,7 +64,7 @@ pub enum Power {
     Running,
     Stopping,
     /// Paused or stopped, or released by the proxy while it still runs: sessions answer
-    /// locally and wake it for a person.
+    /// locally and wake it for a person, unless its owner paused or stopped it (`Offline`).
     Stopped,
     /// The sandbox is gone. Final.
     Missing,
@@ -190,10 +194,74 @@ impl UpstreamAuth {
 #[derive(Clone, Debug, Default)]
 struct Seen {
     state: String,
+    /// `suspended` or `stopped` while a pause or stop is queued or under way.
+    desired: Option<String>,
     revision: Option<i64>,
     /// instabox paused it for idleness, so any use wakes it. A sandbox its owner paused has
     /// none.
     auto_suspended: bool,
+}
+
+/// Why the proxy does not bring a sandbox up: its owner paused or stopped it (or a pause or stop
+/// is on the way), and instabox wakes such a sandbox for no use, only for a resume or a start.
+/// T3 Code gets this text, so it names what to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offline {
+    pub name: String,
+    pub why: OfflineWhy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfflineWhy {
+    /// Paused by its owner, or pausing.
+    Paused,
+    /// Stopped by its owner, or stopping.
+    Stopped,
+    /// Any other state (archived, say).
+    Other(String),
+}
+
+impl std::fmt::Display for Offline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = &self.name;
+        match &self.why {
+            OfflineWhy::Paused => write!(
+                f,
+                "Sandbox offline: {name} was paused by hand, so T3 Code does not wake it. Resume it first: instabox resume {name}, or Open in T3 Code in InstaADE."
+            ),
+            OfflineWhy::Stopped => write!(
+                f,
+                "Sandbox offline: {name} was stopped by hand, so T3 Code does not start it. Start it first: instabox start {name}, or Open in T3 Code in InstaADE."
+            ),
+            OfflineWhy::Other(state) => write!(
+                f,
+                "Sandbox offline: {name} is {state}, so T3 Code does not wake it. Open in T3 Code in InstaADE brings it back."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Offline {}
+
+/// instabox's wake-on-use rule for a sandbox in `state`, headed for `desired`: `None` when a
+/// use may bring it up (it runs or is coming up, or it paused itself), else why not.
+pub fn wake_refusal(
+    state: &str,
+    desired: Option<&str>,
+    auto_suspended: bool,
+) -> Option<OfflineWhy> {
+    match (state, desired) {
+        // A resume or a start is on its way already: a use joins it.
+        (_, Some("running")) => None,
+        ("stopped" | "stopping", _) | (_, Some("stopped")) => Some(OfflineWhy::Stopped),
+        (_, Some("archived")) => Some(OfflineWhy::Other("being archived".into())),
+        ("suspended" | "suspending", _) | (_, Some("suspended")) if !auto_suspended => {
+            Some(OfflineWhy::Paused)
+        }
+        ("suspended" | "suspending", _) => None,
+        ("running" | "creating" | "starting" | "resuming" | "restarting", _) => None,
+        (other, _) => Some(OfflineWhy::Other(other.to_owned())),
+    }
 }
 
 /// What a capture found.
@@ -465,16 +533,21 @@ impl Runtime {
             .is_some_and(|s| matches!(s.state.as_str(), "suspending" | "stopping"))
     }
 
-    /// False for a sandbox its owner paused or stopped: only a person's action wakes it then,
-    /// never what T3 Code asks on its own. Unknown counts as true.
-    pub fn wakes_for_background(&self) -> bool {
+    /// Why a use may not bring the sandbox up, by what was last read of it (`wake_refusal`).
+    /// `None` also when nothing was read yet: `ensure_awake` reads it before it decides.
+    pub fn refusal(&self) -> Option<Offline> {
         let seen = self.seen.lock().unwrap();
-        let Some(s) = seen.as_ref() else { return true };
-        let paused = matches!(
-            s.state.as_str(),
-            "suspended" | "suspending" | "stopped" | "stopping"
-        );
-        !paused || s.auto_suspended
+        let s = seen.as_ref()?;
+        wake_refusal(&s.state, s.desired.as_deref(), s.auto_suspended).map(|why| Offline {
+            name: self.record().name,
+            why,
+        })
+    }
+
+    /// False for a sandbox its owner paused or stopped: nothing wakes it then, neither what
+    /// T3 Code asks on its own nor a person's action. Unknown counts as true.
+    pub fn wakes_for_background(&self) -> bool {
+        self.refusal().is_none()
     }
 
     pub fn save_cache(&self) {
@@ -495,6 +568,7 @@ impl Runtime {
     fn note(&self, m: &Machine) {
         *self.seen.lock().unwrap() = Some(Seen {
             state: m.state.clone(),
+            desired: m.desired_state.clone(),
             revision: m.revision,
             auto_suspended: m.auto_suspended_at.is_some(),
         });
@@ -561,9 +635,20 @@ impl Runtime {
         Some(v)
     }
 
-    /// Brings the sandbox up if needed and returns once its T3 server answers. Concurrent
-    /// callers share one wake.
+    /// Brings the sandbox up if needed, for a use through the proxy, and returns once its T3
+    /// server answers. Concurrent callers share one wake. A sandbox its owner paused or stopped
+    /// stays as it is: the error is an `Offline`, read fresh, and not held against later uses.
     pub async fn ensure_awake(&self) -> Result<()> {
+        self.ensure_awake_as(false).await
+    }
+
+    /// Like `ensure_awake`, for InstaADE's Open in T3 Code: its owner's start, which resumes or
+    /// starts the sandbox whatever paused it.
+    pub async fn ensure_awake_for_open(&self) -> Result<()> {
+        self.ensure_awake_as(true).await
+    }
+
+    async fn ensure_awake_as(&self, owner: bool) -> Result<()> {
         let _guard = self.waking.lock().await;
         if self.power() == Power::Missing {
             bail!("the sandbox no longer exists");
@@ -581,6 +666,18 @@ impl Runtime {
             // A message accepted while another caller's wake was finishing.
             self.flush_deferred_commands().await;
             return Ok(());
+        }
+        // instabox's rule for any use, on a fresh read: a sandbox its owner paused or stopped
+        // stays offline. Not a failed wake: once its owner resumes it, the next use goes through.
+        if !owner {
+            self.refresh_power().await.context("reading the sandbox")?;
+            if self.power() == Power::Missing {
+                bail!("the sandbox no longer exists");
+            }
+            if let Some(offline) = self.refusal() {
+                log_info!("{}: paused or stopped by its owner, not woken", self.id);
+                return Err(offline.into());
+            }
         }
         let result = self.wake_locked().await;
         match &result {
@@ -1107,6 +1204,57 @@ fn waits_on_person(thread: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_sandbox_that_paused_itself_wakes_on_use() {
+        use OfflineWhy::{Other, Paused, Stopped};
+        let cases = [
+            // (state, desired, autoSuspendedAt set) -> refusal
+            ("running", None, false, None),
+            ("running", Some("running"), false, None),
+            ("starting", None, false, None),
+            // Its owner's resume or start, on its way.
+            ("suspended", Some("running"), false, None),
+            ("stopped", Some("running"), false, None),
+            ("resuming", None, false, None),
+            ("suspended", None, true, None),
+            ("suspending", Some("suspended"), true, None),
+            ("suspended", None, false, Some(Paused)),
+            ("suspending", Some("suspended"), false, Some(Paused)),
+            // A pause or stop its owner queued while it still runs.
+            ("running", Some("suspended"), false, Some(Paused)),
+            ("running", Some("stopped"), false, Some(Stopped)),
+            ("stopped", None, false, Some(Stopped)),
+            ("stopping", Some("stopped"), false, Some(Stopped)),
+            // A stop is never an idle pause.
+            ("stopped", None, true, Some(Stopped)),
+            ("archived", None, false, Some(Other("archived".into()))),
+            (
+                "running",
+                Some("archived"),
+                false,
+                Some(Other("being archived".into())),
+            ),
+        ];
+        for (state, desired, auto, want) in cases {
+            assert_eq!(
+                wake_refusal(state, desired, auto),
+                want,
+                "{state} {desired:?} {auto}"
+            );
+        }
+        let say = |why| {
+            Offline {
+                name: "qa".into(),
+                why,
+            }
+            .to_string()
+        };
+        assert!(say(Paused).starts_with("Sandbox offline: qa was paused by hand"));
+        assert!(say(Paused).contains("instabox resume qa"));
+        assert!(say(Stopped).contains("instabox start qa"));
+        assert!(say(Other("archived".into())).contains("qa is archived"));
+    }
 
     #[test]
     fn power_follows_the_sandbox_until_released() {

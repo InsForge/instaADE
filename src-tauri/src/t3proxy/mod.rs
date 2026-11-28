@@ -465,9 +465,10 @@ struct Relay {
 }
 
 /// Everything without a route of its own. Its sockets (dictation, and whatever T3 adds) are
-/// opened by a person, so they wake the sandbox. `/api/preview/tunnel` too: the in-app browser's
-/// pages and forwarded ports reach the sandbox only through it, with no RPC before them. T3
-/// Code's own locality probe uses it as well; it wakes a sleeping sandbox once, gets its answer
+/// opened by a person, so they wake a sandbox that paused itself (one its owner paused or
+/// stopped answers 503 with what to do). `/api/preview/tunnel` too: the in-app browser's pages
+/// and forwarded ports reach the sandbox only through it, with no RPC before them. T3 Code's own
+/// locality probe uses it as well; it wakes a sandbox that paused itself once, gets its answer
 /// (`x-t3-tunnel-port-refused`, passed on by `media::socket`) and stops.
 async fn fallback(
     State(m): M,
@@ -484,7 +485,8 @@ async fn fallback(
 /// in the upstream token. URL-token requests without a bearer may come from any web page: they
 /// reach a running sandbox but never wake it or keep it awake. The assets a recorded answer
 /// points to are kept as they pass, and answered from what was kept while the sandbox does not
-/// run. A sandbox its owner paused wakes only for a POST, the requests a person makes.
+/// run. An authorized request wakes a sandbox that paused itself; one its owner paused or
+/// stopped gets 503 and what to do (`runtime::Offline`), as from instabox itself.
 async fn forward(State(m): M, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let url_token = URL_TOKEN_ROUTES
@@ -595,11 +597,16 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-/// Wakes the sandbox for a request that may, and answers 503 for one that may not.
-/// `why`: what woke it, logged (by route only), as every wake must be explainable.
+/// Wakes the sandbox for a request that may, and answers 503 for one that may not, with what
+/// to do when its owner paused or stopped it (instabox answers such a sandbox's public port
+/// with 503 "Sandbox offline" too). `why`: what woke it, logged (by route only), as every wake
+/// must be explainable.
 async fn wake(m: &Runtime, allowed: bool, why: &str) -> Result<(), Box<Response>> {
     if !allowed {
-        return Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()));
+        let offline = m.refusal().map(|o| o.to_string()).unwrap_or_default();
+        return Err(Box::new(
+            (StatusCode::SERVICE_UNAVAILABLE, offline).into_response(),
+        ));
     }
     log_info!("waking {} for {}", m.id(), route_name(why));
     m.ensure_awake()

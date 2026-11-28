@@ -16,7 +16,7 @@
 use super::cache::{Shell, refresh_server_time, request_key, sanitize_server_config};
 use super::classify::{self, recorded_stream, recorded_unary};
 use super::dpop::Refused;
-use super::runtime::{Power, Runtime};
+use super::runtime::{Offline, Power, Runtime};
 use super::threads::ThreadFlags;
 use super::{assets, upstream};
 use anyhow::Result;
@@ -269,8 +269,9 @@ impl Session {
         }
         let tag = req["tag"].as_str().unwrap_or_default();
         let payload = &req["payload"];
-        // A sandbox its owner paused wakes only for a person, never for what T3 Code asks on
-        // its own (a reconnect's subscriptions): those wait.
+        // A sandbox its owner paused or stopped never wakes for what T3 Code asks on its own (a
+        // reconnect's subscriptions): those wait. A person's action asks, and the runtime
+        // refuses it with what to do (`Offline`).
         if !classify::is_side_info(tag, payload)
             && (self.m.wakes_for_background() || classify::is_user_action(tag, payload))
         {
@@ -406,6 +407,11 @@ impl Session {
                 if !wakes && !classify::DEFERRABLE_COMMANDS.contains(&kind) {
                     return None;
                 }
+                // A message to a sandbox its owner paused is not taken in to wait: it goes the
+                // way of any action, which reads the sandbox and fails with what to do.
+                if wakes && self.m.refusal().is_some() {
+                    return None;
+                }
                 self.m
                     .cache
                     .lock()
@@ -492,8 +498,18 @@ impl Session {
             Internal::Settled(_) => self.go_asleep().await?,
             Internal::Woke(Ok(())) => self.connect(),
             Internal::Woke(Err(e)) => {
-                let msg = format!("The sandbox could not wake: {e:#}");
+                // Its owner paused or stopped it: each action of a person fails with what to
+                // do, and what T3 Code asked on its own waits for the wake its owner starts.
+                let offline = e.downcast_ref::<Offline>().map(ToString::to_string);
+                let msg = offline
+                    .clone()
+                    .unwrap_or_else(|| format!("The sandbox could not wake: {e:#}"));
                 for req in std::mem::take(&mut self.held) {
+                    let tag = req["tag"].as_str().unwrap_or_default();
+                    if offline.is_some() && !classify::is_user_action(tag, &req["payload"]) {
+                        self.held.push(req);
+                        continue;
+                    }
                     self.send(&exit_die(&req["id"], &msg)).await?;
                 }
                 self.phase = Phase::Asleep;
