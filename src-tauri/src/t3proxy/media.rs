@@ -8,8 +8,9 @@
 //! exist only while it runs. T3 Code keeps retrying one while it is on screen, so they never wake
 //! the sandbox: a sleeping one answers 503. Any other socket (dictation, and whatever T3 adds) is
 //! opened by a person and wakes a sandbox that paused itself; one its owner paused or stopped
-//! answers 503 with what to do. Every relayed socket holds an instabox port lease, so it ends
-//! when the proxy releases the sandbox.
+//! answers 503 with what to do. Every relayed socket and plain stream (MJPEG, events) holds an
+//! instabox port lease, so it ends when the proxy releases the sandbox (`super::relay` ends a
+//! plain one).
 
 use super::auth::TicketUse;
 use super::runtime::{Power, Runtime};

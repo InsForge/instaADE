@@ -238,7 +238,8 @@ impl Hub {
     }
 
     /// Starts the proxies of the sandboxes paired through it before, so T3 Code finds them
-    /// after InstaADE restarts. One whose token or port is gone is skipped and logged.
+    /// after InstaADE restarts. One whose token or port is gone, or whose bearer session this
+    /// start does not allow, is skipped and logged.
     pub async fn start_saved(self: &Arc<Self>) {
         for record in self.records() {
             let id = record.id.clone();
@@ -255,6 +256,16 @@ impl Hub {
                     continue;
                 }
             };
+            // A bearer session is for INSTAADE_T3_PROXY=any only, here as at pairing. It stays
+            // in the keychain for a later start with `any`: removing it would not end the
+            // session on the sandbox, and Open in T3 Code replaces it with a DPoP session once
+            // T3 there has them.
+            if !credential.is_dpop() && !self.allow_bearer {
+                log_warn!(
+                    "{id}: saved with a bearer session, which needs INSTAADE_T3_PROXY=any; not started"
+                );
+                continue;
+            }
             if let Err(e) = self.start(record, credential).await {
                 log_warn!("{id}: {e:#}");
             }

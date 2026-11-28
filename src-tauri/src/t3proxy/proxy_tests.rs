@@ -64,6 +64,8 @@ struct FakeT3 {
     /// Reads of the shell over HTTP (the capture's), and a gate a test holds to keep one open.
     shell_reads: AtomicUsize,
     shell_gate: tokio::sync::Mutex<()>,
+    /// Device hub streams (MJPEG, events) still sending.
+    streams_open: Arc<AtomicUsize>,
 }
 
 impl FakeT3 {
@@ -86,6 +88,7 @@ impl FakeT3 {
             bearer_seen: AtomicUsize::new(0),
             shell_reads: AtomicUsize::new(0),
             shell_gate: tokio::sync::Mutex::new(()),
+            streams_open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -279,6 +282,40 @@ async fn up_shell(State(t3): State<Arc<FakeT3>>, headers: HeaderMap) -> Response
     Json(json!({"snapshotSequence": 5, "threads": threads})).into_response()
 }
 
+/// Counts a device hub stream as open until its body is dropped.
+struct OpenStream(Arc<AtomicUsize>);
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// `/api/device-hub/*`: a stream that never ends, as the hub's MJPEG and events do.
+async fn up_device_stream(
+    State(t3): State<Arc<FakeT3>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    if !t3.authorized("GET", uri.path(), &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    t3.streams_open.fetch_add(1, Ordering::SeqCst);
+    let open = OpenStream(t3.streams_open.clone());
+    let frames = futures_util::stream::unfold(open, |open| async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Some((
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"--frame\r\n")),
+            open,
+        ))
+    });
+    (
+        [("content-type", "multipart/x-mixed-replace; boundary=frame")],
+        axum::body::Body::from_stream(frames),
+    )
+        .into_response()
+}
+
 /// `/api/preview/tunnel` to a port where nothing listens, as T3 0.1.13 answers it.
 async fn up_tunnel(
     State(t3): State<Arc<FakeT3>>,
@@ -348,6 +385,7 @@ async fn fake_t3(dpop: bool) -> (Arc<FakeT3>, String) {
         .route("/api/orchestration/shell", get(up_shell))
         .route("/ws", get(up_ws))
         .route("/api/preview/tunnel", get(up_tunnel))
+        .route("/api/device-hub/{*path}", get(up_device_stream))
         .with_state(t3.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -652,6 +690,117 @@ async fn an_orchestration_event_during_the_capture_calls_off_the_release() {
     eventually("released later", || p.rt.released()).await;
     assert_eq!(count(&p.t3.shell_reads), 2);
     eventually("the upstream socket closes", || count(&p.t3.open) == 0).await;
+}
+
+#[tokio::test]
+async fn a_long_http_stream_ends_when_the_sandbox_is_released() {
+    let p = proxy("running", true, Duration::from_millis(400)).await;
+    // T3 Code's device view: an MJPEG stream over plain HTTP, which never ends by itself.
+    let mut res = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/api/device-hub/helper/d1/stream.mjpeg",
+            p.port
+        ))
+        .header("authorization", format!("Bearer {CLIENT_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.chunk().await.unwrap().is_some());
+    assert_eq!(count(&p.t3.streams_open), 1);
+
+    // Watching is not using: the sandbox is released, and the stream to it ends with that.
+    eventually("released", || p.rt.released()).await;
+    eventually("the upstream stream ends", || {
+        count(&p.t3.streams_open) == 0
+    })
+    .await;
+    let rest = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(_)) = res.chunk().await {}
+    })
+    .await;
+    assert!(rest.is_ok(), "T3 Code's end of the stream closes too");
+    assert_eq!(p.control.wakes(), 0);
+}
+
+#[tokio::test]
+async fn a_saved_bearer_session_starts_only_when_bearer_is_allowed() {
+    let (t3, upstream_url) = fake_t3(false).await;
+    let control = FakeControl::new("running", true, t3.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let save = |id: &str, port: u16, upstream_url: &str| {
+        let record = Record {
+            id: id.into(),
+            name: "qa".into(),
+            port,
+            environment_id: "env-1".into(),
+            upstream_url: upstream_url.into(),
+            client_tokens: vec![],
+        };
+        let at = dir.path().join(id);
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(
+            super::runtime::record_path(&at),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    };
+    let port = free_port();
+    save("m_test", port, &upstream_url);
+    let tokens = Arc::new(MemoryTokenStore::default());
+    let bearer = Credential::Bearer {
+        token: UP_TOKEN.into(),
+    };
+    tokens.save("m_test", &bearer.to_stored()).unwrap();
+    let hub = |allow_bearer| {
+        Hub::new(
+            dir.path().to_path_buf(),
+            control.clone(),
+            tokens.clone(),
+            tuning(Duration::from_secs(60)),
+            allow_bearer,
+        )
+    };
+
+    // Paired with INSTAADE_T3_PROXY=any, started again with =1: not served, kept for `any`.
+    let strict = hub(false);
+    strict.start_saved().await;
+    assert!(strict.runtime("m_test").await.is_none());
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokens
+            .load("m_test")
+            .unwrap()
+            .map(|s| Credential::parse(&s)),
+        Some(bearer)
+    );
+
+    // A DPoP session still comes back with =1.
+    let (dpop_t3, dpop_url) = fake_t3(true).await;
+    save("m_dpop", free_port(), &dpop_url);
+    tokens
+        .save("m_dpop", &paired(&dpop_t3, &dpop_url).await.to_stored())
+        .unwrap();
+    let strict = hub(false);
+    strict.start_saved().await;
+    assert!(strict.runtime("m_dpop").await.is_some());
+    assert!(strict.runtime("m_test").await.is_none());
+
+    // With =any the bearer session comes back too.
+    let any = hub(true);
+    any.start_saved().await;
+    assert!(any.runtime("m_test").await.is_some());
 }
 
 #[tokio::test]

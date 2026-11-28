@@ -593,8 +593,23 @@ async fn relay(m: &Runtime, parts: Parts, body: Body, route: Relay) -> Response 
             out = out.header(k, v);
         }
     }
-    out.body(Body::from_stream(res.bytes_stream()))
+    out.body(until_released(m, res))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// The sandbox's answer as a body that ends once the power leaves `Running`. A long stream (the
+/// device hub's MJPEG and events, say) holds its published-port connection, and with it the
+/// port lease, for as long as it runs; like the sockets, it must end when the proxy releases the
+/// sandbox or it pauses. An answer that ends before that is passed on whole.
+fn until_released(m: &Runtime, res: reqwest::Response) -> Body {
+    let mut power = m.subscribe_power();
+    let released = async move {
+        let _ = power.wait_for(|p| *p != Power::Running).await;
+    };
+    Body::from_stream(futures_util::StreamExt::take_until(
+        res.bytes_stream(),
+        released,
+    ))
 }
 
 /// Wakes the sandbox for a request that may, and answers 503 for one that may not, with what
