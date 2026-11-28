@@ -465,7 +465,10 @@ struct Relay {
 }
 
 /// Everything without a route of its own. Its sockets (dictation, and whatever T3 adds) are
-/// opened by a person, so they wake the sandbox.
+/// opened by a person, so they wake the sandbox. `/api/preview/tunnel` too: the in-app browser's
+/// pages and forwarded ports reach the sandbox only through it, with no RPC before them. T3
+/// Code's own locality probe uses it as well; it wakes a sleeping sandbox once, gets its answer
+/// (`x-t3-tunnel-port-refused`, passed on by `media::socket`) and stops.
 async fn fallback(
     State(m): M,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,

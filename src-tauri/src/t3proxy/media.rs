@@ -13,13 +13,15 @@
 use super::auth::TicketUse;
 use super::runtime::{Power, Runtime};
 use super::{
-    M, Relay, client_authorized, query_param, query_without, relay, unauthorized, upstream, wake,
+    HOP_BY_HOP, M, Relay, client_authorized, query_param, query_without, relay, unauthorized,
+    upstream, wake,
 };
+use axum::body::Body;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame as DownClose, Message as DownMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -76,10 +78,25 @@ pub(super) async fn socket(
         Ok(up) => upgrade.on_upgrade(move |down| pump(m, down, up)),
         // The machine's own refusal (no device hub, say) reaches T3 Code as it was.
         Err(e) => match e.downcast_ref() {
-            Some(UpError::Http(res)) => res.status().into_response(),
+            Some(UpError::Http(res)) => refusal(res),
             _ => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
         },
     }
+}
+
+/// A refused upgrade with its status, headers and body. T3 Code reads the headers: a
+/// `/api/preview/tunnel` refused with `x-t3-tunnel-port-refused` tells its locality probe that
+/// the sandbox is another machine; with the status alone, the probe retries every 30 s.
+fn refusal(res: &axum::http::Response<Option<Vec<u8>>>) -> Response {
+    let mut out = Response::builder().status(res.status());
+    for (k, v) in res.headers() {
+        // The body here may be only what came with the head, so its length is counted anew.
+        if k != header::CONTENT_LENGTH && !HOP_BY_HOP.contains(&k.as_str()) {
+            out = out.header(k, v);
+        }
+    }
+    out.body(Body::from(res.body().clone().unwrap_or_default()))
+        .unwrap_or_else(|_| res.status().into_response())
 }
 
 /// Path and query on the machine, minus the proxy's ticket; `None` if the caller holds neither a

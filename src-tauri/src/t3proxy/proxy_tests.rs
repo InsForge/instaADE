@@ -272,6 +272,24 @@ async fn up_shell(State(t3): State<Arc<FakeT3>>, headers: HeaderMap) -> Response
     Json(json!({"snapshotSequence": 5, "threads": threads})).into_response()
 }
 
+/// `/api/preview/tunnel` to a port where nothing listens, as T3 0.1.13 answers it.
+async fn up_tunnel(
+    State(t3): State<Arc<FakeT3>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if !t3.authorized("GET", "/api/preview/tunnel", &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    t3.queries.lock().unwrap().push(query.unwrap_or_default());
+    (
+        StatusCode::FORBIDDEN,
+        [("x-t3-tunnel-port-refused", "1")],
+        "Nothing accepted a connection on loopback port 9.",
+    )
+        .into_response()
+}
+
 async fn up_ws(
     State(t3): State<Arc<FakeT3>>,
     RawQuery(query): RawQuery,
@@ -322,6 +340,7 @@ async fn fake_t3(dpop: bool) -> (Arc<FakeT3>, String) {
         .route("/oauth/token", post(up_token))
         .route("/api/orchestration/shell", get(up_shell))
         .route("/ws", get(up_ws))
+        .route("/api/preview/tunnel", get(up_tunnel))
         .with_state(t3.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -648,6 +667,39 @@ async fn a_sleeping_sandbox_answers_upkeep_here_and_wakes_for_the_unknown() {
             .unwrap()
             .contains(&"something.new".to_string())
     );
+}
+
+#[tokio::test]
+async fn a_refused_tunnel_reaches_t3_code_with_its_headers_and_body() {
+    let p = proxy("running", true, Duration::from_secs(60)).await;
+    // T3 Code's locality probe: a WebSocket upgrade, which T3 refuses for a port where nothing
+    // listens. A plain client reads the whole answer.
+    let res = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/api/preview/tunnel?port=9",
+            p.port
+        ))
+        .header("authorization", format!("Bearer {CLIENT_TOKEN}"))
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        res.headers()
+            .get("x-t3-tunnel-port-refused")
+            .map(|v| v.as_bytes()),
+        Some(&b"1"[..])
+    );
+    assert_eq!(
+        res.text().await.unwrap(),
+        "Nothing accepted a connection on loopback port 9."
+    );
+    assert!(p.t3.queries.lock().unwrap().contains(&"port=9".to_string()));
+    assert_eq!(p.control.wakes(), 0);
 }
 
 #[tokio::test]
