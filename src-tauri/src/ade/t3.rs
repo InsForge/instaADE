@@ -840,6 +840,115 @@ s.listen(0, "127.0.0.1", () => console.log(s.address().port));
         assert!(!PROBE.script.contains('\r'));
     }
 
+    // ---- the probe, run with python3 on a T3 database ----
+
+    /// A T3 base directory with a live server (this test's pid) and a database holding `runs`
+    /// (thread, status) and `events` orchestration events, in the tables the probe reads.
+    #[cfg(unix)]
+    fn t3_base(
+        python: &std::path::Path,
+        runs: &[(&str, &str)],
+        events: usize,
+    ) -> tempfile::TempDir {
+        let base = tempfile::tempdir().unwrap();
+        let userdata = base.path().join("userdata");
+        std::fs::create_dir_all(&userdata).unwrap();
+        std::fs::write(
+            userdata.join("server-runtime.json"),
+            serde_json::json!({ "pid": std::process::id() }).to_string(),
+        )
+        .unwrap();
+        let fill = "import json, sqlite3, sys\n\
+            con = sqlite3.connect(sys.argv[1])\n\
+            con.executescript('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, deleted_at TEXT);\
+            CREATE TABLE orchestration_v2_projection_runs (run_id INTEGER PRIMARY KEY, thread_id TEXT, status TEXT);\
+            CREATE TABLE orchestration_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);')\n\
+            runs = json.loads(sys.argv[2])\n\
+            con.executemany('INSERT OR IGNORE INTO orchestration_v2_projection_threads VALUES (?, NULL)', [(t,) for t, _ in runs])\n\
+            con.executemany('INSERT INTO orchestration_v2_projection_runs (thread_id, status) VALUES (?, ?)', runs)\n\
+            con.executemany('INSERT INTO orchestration_events (body) VALUES (?)', [('-',)] * int(sys.argv[3]))\n\
+            con.commit()\n";
+        let out = std::process::Command::new(python)
+            .args(["-c", fill])
+            .arg(userdata.join("statev2.sqlite"))
+            .arg(serde_json::json!(runs).to_string())
+            .arg(events.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        base
+    }
+
+    /// The probe's answer on `base`, run as the guest does (an empty environment but HOME and
+    /// a short PATH), which must be one JSON line with `busy`, `seq` and `reason`.
+    #[cfg(unix)]
+    fn t3_probe(python: &std::path::Path, base: &std::path::Path) -> (bool, i64, String) {
+        let probe = base.join("t3-probe");
+        std::fs::write(&probe, PROBE.script).unwrap();
+        let out = std::process::Command::new(python)
+            .arg(&probe)
+            .env_clear()
+            .env("HOME", base)
+            .env("PATH", "/usr/bin:/bin")
+            .env("INSTABOX_T3_BASE_DIR", base)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            v["busy"].as_bool(),
+            Some(crate::ade::parse_probe(&stdout).busy)
+        );
+        (
+            v["busy"].as_bool().unwrap(),
+            v["seq"].as_i64().unwrap(),
+            v["reason"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_counts_the_active_runs_in_its_reason() {
+        let Ok(python) = which::which("python3") else {
+            eprintln!("python3 not found: skipped");
+            return;
+        };
+        for (runs, want) in [
+            (vec![], (false, "no active runs")),
+            (
+                vec![("t1", "completed"), ("t2", "waiting")],
+                (false, "no active runs"),
+            ),
+            (
+                vec![("t1", "completed"), ("t1", "running")],
+                (true, "1 run active (running)"),
+            ),
+            (
+                vec![("t1", "running"), ("t2", "running")],
+                (true, "2 runs active (running)"),
+            ),
+            (
+                vec![("t1", "running"), ("t2", "queued")],
+                (true, "2 runs active (queued,running)"),
+            ),
+        ] {
+            let base = t3_base(&python, &runs, 3);
+            let (busy, seq, reason) = t3_probe(&python, base.path());
+            assert_eq!((busy, reason.as_str()), want, "{runs:?}");
+            assert_eq!(seq, 3);
+        }
+    }
+
     #[test]
     fn pair_code_and_link() {
         assert_eq!(
